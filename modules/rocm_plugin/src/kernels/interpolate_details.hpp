@@ -1,0 +1,88 @@
+// Copyright (C) 2022-2023 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#pragma once
+
+#include <assert.h>
+
+#include <vector>
+
+//#include "convert.hpp"
+#include "interpolate_base.hpp"
+
+namespace ov {
+namespace rocm_gpu {
+namespace kernel {
+
+class InterpolateBase::details {
+public:
+    class ShapeIterator {
+        std::vector<int> shape_;
+        std::vector<int> value_;
+
+    public:
+        ShapeIterator(const std::vector<int>& shape) : shape_{shape}, value_(shape.size(), 0) {}
+
+        const std::vector<int>& value() const { return value_; }
+
+        void advance() {
+            for (int i = value_.size() - 1; i >= 0; --i) {
+                ++value_[i];
+                if (value_[i] < shape_[i]) break;
+
+                if (i == 0) {
+                    value_.clear();
+                    break;
+                }
+
+                value_[i] = 0;
+            }
+        }
+
+        bool end() const { return value_.empty(); }
+    };
+
+    static inline __device__ float get_original_coordinate(const CoordinateTransformMode mode,
+                                                        const unsigned output_coordinate,
+                                                        const float scale,
+                                                        const unsigned output_dim,
+                                                        const unsigned input_dim) {
+        float input_coord{};
+        switch (mode) {
+            case CoordinateTransformMode::half_pixel:
+                input_coord = ((static_cast<float>(output_coordinate) + float{0.5f}) / scale) - float{0.5f};
+                break;
+            case CoordinateTransformMode::pytorch_half_pixel:
+                if (output_dim > 1)
+                    input_coord = ((static_cast<float>(output_coordinate) + float{0.5f}) / scale) - float{0.5f};
+                else
+                    input_coord = float{};
+                break;
+            case CoordinateTransformMode::asymmetric:
+                input_coord = static_cast<float>(output_coordinate) / scale;
+                break;
+            case CoordinateTransformMode::tf_half_pixel_for_nn:
+                input_coord = (static_cast<float>(output_coordinate) + float{0.5f}) / scale;
+                break;
+            case CoordinateTransformMode::align_corners:
+                if (output_dim == 1)
+                    input_coord = float{};
+                else
+                    input_coord = static_cast<float>(output_coordinate) * static_cast<float>(input_dim - 1) / static_cast<float>(output_dim - 1);
+                break;
+            default:
+                assert(false);
+        }
+        return input_coord;
+    }
+
+    template <typename SRCT, typename DSTT, unsigned N>
+    static inline __device__ void shape_copy(const Shape<SRCT, N>& src, Shape<DSTT, N>& dst) {
+        for (int i = 0; i < N; ++i) dst[i] = static_cast<DSTT>(src[i]);
+    }
+};
+
+}  // namespace kernel
+}  // namespace rocm_gpu
+}  // namespace ov

@@ -1,0 +1,40 @@
+// Copyright (C) 2018-2021 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#pragma once
+
+#include <rocm_operation_base.hpp>
+
+#include "rnn_components/rnn_components.hpp"
+#include "rnn_components/rnn_miopen_components.hpp"
+
+namespace ov {
+namespace rocm_gpu {
+
+/**
+ * @brief Implements `ov::op::v4::LSTMCell` using miopen API
+ */
+class LSTMCellOp : public Operationmiopen {
+public:
+    LSTMCellOp(const CreationContext& context,
+               const ov::Node& node,
+               IndexCollection&& inputIds,
+               IndexCollection&& outputIds);
+
+    void Execute(const InferenceRequestContext& context,
+                 Inputs inputTensors,
+                 Outputs outputTensors,
+                 const Workbuffers&) const override;
+
+    rocmGraphCompatibility GetrocmGraphCompatibility() const override;
+    void InitSharedImmutableWorkbuffers(const IOperationExec::Buffers&) override;
+    WorkbufferRequest GetWorkBufferRequest() const override;
+
+private:
+    RNN::Details::LSTMCellParams params_;
+    RNN::Details::LSTMCellDescriptorsmiopen descs_;
+};
+
+}  // namespace rocm_gpu
+}  // namespace ov

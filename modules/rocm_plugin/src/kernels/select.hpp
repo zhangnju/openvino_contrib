@@ -1,0 +1,67 @@
+// Copyright (C) 2018-2021 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#pragma once
+
+#include <hip/hip_runtime.h>
+
+#include <vector>
+#include <hip/hip_runtime.h>
+#include <fmt/format.h>
+#include "rocm/float16.hpp"
+#include "details/rocm_type_traits.hpp"
+#include "details/tensor_helpers.hpp"
+#include "details/error.hpp"
+#include "details/numpy_broadcast_mapper.hpp" 
+#include "details/error.hpp"
+
+#include "details/rocm_type_traits.hpp"
+#include "details/error.hpp"
+
+namespace ov {
+namespace rocm_gpu {
+namespace kernel {
+
+class SelectKernelOp {
+public:
+    using BrcstOffsetType = size_t;
+
+public:
+    SelectKernelOp(const size_t max_size,
+                   const unsigned blocks_number,
+                   const unsigned threads_per_block,
+                   const Type_t operation_type);
+
+    void operator()(const hipStream_t stream,
+                    const bool* condition,
+                    const void* then_node,
+                    const void* else_node,
+                    const BrcstOffsetType* cond_brcst_offsets,
+                    const BrcstOffsetType* then_brcst_offsets,
+                    const BrcstOffsetType* else_brcst_offsets,
+                    const BrcstOffsetType* output_sizes,
+                    void* buffer) const;
+
+private:
+    void callKernel(const hipStream_t stream,
+                    const bool* condition,
+                    const float* then_node,
+                    const float* else_node,
+                    const BrcstOffsetType* cond_brcst_offsets,
+                    const BrcstOffsetType* then_brcst_offsets,
+                    const BrcstOffsetType* else_brcst_offsets,
+                    const BrcstOffsetType* output_sizes,
+                    float* buffer) const;
+
+private:
+    size_t max_size_;
+    unsigned blocks_number_;
+    unsigned threads_per_block_;
+    Type_t operation_type_;
+};
+
+}  // namespace kernel
+
+}  // namespace rocm_gpu
+}  // namespace ov

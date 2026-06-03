@@ -1,0 +1,46 @@
+// Copyright (C) 2022-2023 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#pragma once
+#include <hip/hip_runtime.h>
+#include <fmt/format.h>
+#include "rocm/float16.hpp"
+#include "details/rocm_type_traits.hpp"
+#include "details/tensor_helpers.hpp"
+#include "details/error.hpp"
+#include "details/numpy_broadcast_mapper.hpp" 
+#include "details/rocm_type_traits.hpp"
+#include "details/tensor_helpers.hpp"
+
+namespace ov {
+namespace rocm_gpu {
+namespace kernel {
+
+class InterpolateBase {
+public:
+    enum class CoordinateTransformMode {
+        half_pixel,
+        pytorch_half_pixel,
+        asymmetric,
+        tf_half_pixel_for_nn,
+        align_corners
+    };
+
+    static constexpr unsigned MAX_SHAPE_RANK = 5;
+    using UIntShape = Shape<unsigned, MAX_SHAPE_RANK>;
+    using FloatShape = Shape<float, MAX_SHAPE_RANK>;
+    using IntShape = Shape<int, MAX_SHAPE_RANK>;
+
+    struct Index {
+        IntShape v{};
+    };
+
+    class details;
+
+    explicit InterpolateBase(Type_t elemenent_type);
+};
+
+}  // namespace kernel
+}  // namespace rocm_gpu
+}  // namespace ov

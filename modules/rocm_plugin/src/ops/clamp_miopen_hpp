@@ -1,0 +1,57 @@
+// Copyright (C) 2021-2023 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#pragma once
+
+#if defined(_WIN32)
+#include <miopen/miopen.h>
+#else
+#include <miopen/miopen.h>
+#endif
+
+#include <rocm/dnn.hpp>
+#include <rocm_operation_base.hpp>
+#include <openvino/op/clamp.hpp>
+
+namespace ov {
+namespace rocm_gpu {
+
+class ClampmiopenOp : public Operationmiopen {
+public:
+    using NodeOp = ov::op::v0::Clamp;
+
+    static constexpr std::size_t max_shape_size = 5;
+
+    ClampmiopenOp(const CreationContext& context,
+                 const NodeOp& node,
+                 IndexCollection&& inputIds,
+                 IndexCollection&& outputIds);
+
+    void Execute(const InferenceRequestContext& context,
+                 Inputs inputTensors,
+                 Outputs outputTensors,
+                 const Workbuffers& workbuffers) const override;
+
+    rocmGraphCompatibility GetrocmGraphCompatibility() const override;
+    void InitSharedImmutableWorkbuffers(const Buffers& buffers) override;
+    WorkbufferRequest GetWorkBufferRequest() const override;
+
+private:
+    static constexpr int max_index = 0;
+    static constexpr int min_index = 1;
+
+    template <typename T>
+    void initBuffers(const Buffers& buffers) const;
+
+    const miopenDataType_t data_type_;
+    const miopenDataType_t op_type_;
+    const rocm::DnnOpTensorDescriptor max_op_desc_;
+    const rocm::DnnOpTensorDescriptor min_op_desc_;
+    const rocm::DnnTensorDescriptor io_desc_;
+    const rocm::DnnTensorDescriptor max_min_desc_;
+    const double max_;
+    const double min_;
+};
+}  // namespace rocm_gpu
+}  // namespace ov

@@ -1,0 +1,20 @@
+// Copyright (C) 2021-2023 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#pragma once
+
+#include "elementwise_binary.hpp"
+#include "kernels/maximum.hpp"
+#include "openvino/op/maximum.hpp"
+
+namespace ov {
+namespace rocm_gpu {
+
+class MaximumOp : public ElementwiseBinaryOp<ov::op::v1::Maximum, kernel::Maximum> {
+public:
+    using ElementwiseBinaryOp::ElementwiseBinaryOp;
+};
+
+}  // namespace rocm_gpu
+}  // namespace ov
