@@ -51,17 +51,45 @@ void FusedConvolutionmiopenDecomposed::Execute(const InferenceRequestContext& co
     const auto& outDesc = conv_descs_->Output();
     auto outTensor = outputs[ArgIndices::output].get();
  
-    throwIfError(::miopenConvolutionForwardImmediate(dnnHandle.get(),
-                                                    conv_descs_->Filter().get(),
-                                                    inputs[ArgIndices::filter].get(),
-                                                    conv_descs_->Input().get(),
-                                                    inputs[ArgIndices::input].get(),
-                                                    conv_descs_->Conv().get(),
-                                                    outDesc.get(),
-                                                    outTensor,
-                                                    workbuffer,
-                                                    conv_descs_->WorkspaceSize(),
-                                                    conv_descs_->SolutionId()));
+    // Use LazyFindAlgo on first call to get a real algo via miopenFindConvolutionForwardAlgorithm.
+    // This lets MIOpen test each solver with actual data and pick one that works on gfx950.
+    // GemmFwd1x1_0_1 (which causes GPU memory faults) will be rejected during testing.
+    constexpr size_t findWsSize = 256ULL * 1024 * 1024;
+    conv_descs_->LazyFindAlgo(dnnHandle,
+                               inputs[ArgIndices::input].get(),
+                               inputs[ArgIndices::filter].get(),
+                               outTensor,
+                               workbuffer, findWsSize);
+
+    if (conv_descs_->IsAlgoFound()) {
+        // Use old-style algorithm-based API (stable across DB updates)
+        throwIfError(::miopenConvolutionForward(dnnHandle.get(),
+                                                onePtr,
+                                                conv_descs_->Input().get(),
+                                                inputs[ArgIndices::input].get(),
+                                                conv_descs_->Filter().get(),
+                                                inputs[ArgIndices::filter].get(),
+                                                conv_descs_->Conv().get(),
+                                                conv_descs_->Algo().fwd_algo,
+                                                zeroPtr,
+                                                outDesc.get(),
+                                                outTensor,
+                                                workbuffer,
+                                                conv_descs_->Algo().memory));
+    } else {
+        // Fallback to Immediate if Find didn't succeed (shouldn't happen normally)
+        throwIfError(::miopenConvolutionForwardImmediate(dnnHandle.get(),
+                                                        conv_descs_->Filter().get(),
+                                                        inputs[ArgIndices::filter].get(),
+                                                        conv_descs_->Input().get(),
+                                                        inputs[ArgIndices::input].get(),
+                                                        conv_descs_->Conv().get(),
+                                                        outDesc.get(),
+                                                        outTensor,
+                                                        workbuffer,
+                                                        conv_descs_->WorkspaceSize(),
+                                                        conv_descs_->SolutionId()));
+    }
     throwIfError(::miopenConvolutionForwardBias(dnnHandle.get(),
                                                onePtr,
                                                bias_desc_->get(),
@@ -89,11 +117,9 @@ rocmGraphCompatibility FusedConvolutionmiopenDecomposed::GetrocmGraphCompatibili
 }
 
 WorkbufferRequest FusedConvolutionmiopenDecomposed::GetWorkBufferRequest() const {
-    if (conv_descs_->WorkspaceSize() != 0) {
-        return {{}, {conv_descs_->WorkspaceSize()}};
-    } else {
-        return {{}, {}};
-    }
+    // Allocate generous workspace: LazyFindAlgo needs room to test all solvers
+    const size_t ws = std::max(conv_descs_->WorkspaceSize(), (size_t)(256 * 1024 * 1024));
+    return {{}, {ws}};
 }
 
 // miopenConvolutionBiasActivationForward() doesn't work properly with miopen_ACTIVATION_IDENTITY and any algorithm

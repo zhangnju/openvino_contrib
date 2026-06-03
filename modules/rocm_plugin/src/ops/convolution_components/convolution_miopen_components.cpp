@@ -123,22 +123,43 @@ void ConvolutionDescriptorsmiopen::LazyFindAlgo(const rocm::DnnHandle& dnnHandle
                                                  const void* in, const void* filter, void* out,
                                                  void* workspace, std::size_t workspaceSize) {
     if (algo_found_) return;
-    const int requestedAlgoCount = 1;
-    int returnedAlgoCount = 0;
+
+    // Request multiple candidates so we can skip broken ones.
+    // GemmFwd1x1_0_1 causes GPU memory faults on gfx950 (MIOpen 7.2 bug).
+    // We detect it as: algorithm==GEMM AND workspace==0 (no im2col buffer).
+    // GemmFwdRest always needs workspace>0 for the im2col intermediate buffer.
+    constexpr int maxCandidates = 4;
+    std::array<miopenConvAlgoPerf_t, maxCandidates> perf_results{};
+    int returnedCount = 0;
+
     auto status = ::miopenFindConvolutionForwardAlgorithm(dnnHandle.get(),
                                                           input_.get(), in,
                                                           filter_.get(), filter,
                                                           conv_.get(),
                                                           output_.get(), out,
-                                                          requestedAlgoCount,
-                                                          &returnedAlgoCount,
-                                                          &algo_perf_,
+                                                          maxCandidates,
+                                                          &returnedCount,
+                                                          perf_results.data(),
                                                           workspace, workspaceSize,
-                                                          false);
-    if (status == miopenStatusSuccess && returnedAlgoCount > 0) {
-        workspace_size_ = algo_perf_.memory;
-        algo_found_ = true;
+                                                          false);  // heuristic mode
+    if (status != miopenStatusSuccess || returnedCount <= 0) return;
+
+    // Select best candidate that is not GemmFwd1x1 (GEMM+workspace=0 pattern)
+    for (int i = 0; i < returnedCount; ++i) {
+        const auto& p = perf_results[i];
+        const bool is_zero_workspace_gemm =
+            (p.fwd_algo == miopenConvolutionAlgoGEMM) && (p.memory == 0);
+        if (!is_zero_workspace_gemm) {
+            algo_perf_      = p;
+            workspace_size_ = p.memory;
+            algo_found_     = true;
+            return;
+        }
     }
+    // All candidates were zero-workspace GEMM — fall back to first (less safe)
+    algo_perf_      = perf_results[0];
+    workspace_size_ = perf_results[0].memory;
+    algo_found_     = true;
 }
 
 void ConvolutionDescriptorsmiopen::GetAlgo(const rocm::DnnHandle& dnnHandle) {
