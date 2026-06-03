@@ -43,6 +43,7 @@
 #include "transformations/op_conversions/mvn6_decomposition.hpp"
 #include "transformations/op_conversions/hswish_decomposition.hpp"
 #include "transformations/common_optimizations/reshape_prelu.hpp"
+#include "transformer/rocmlir_conv_decompose_transformation.hpp"
 
 using namespace ov::rocm_gpu;
 
@@ -143,6 +144,16 @@ void GraphTransformer::transform(const rocm::Device& device,
             [is_sequence_primitive_supported](const std::shared_ptr<const ov::Node> &node) -> bool {
                 return is_sequence_primitive_supported(node);
             });
+
+    // rocMLIR K×C group decomposition: converts non-1×1 Convolution into an
+    // equivalent GroupConvolution with G=K*C groups. This avoids a rocMLIR 7.2
+    // bug on gfx950 where large-kernel convolutions with non-zero data produce
+    // GPU memory faults (mirrors MIGraphX's fuse_mlir rock.conv strategy).
+    // Run BEFORE AsymPadding and ConvFusion so those passes see the rewritten ops.
+#ifdef ENABLE_ROCMLIR
+    pass_manager.register_pass<ov::rocm_gpu::pass::RocMLIRConvDecompose>();
+    pass_manager.register_pass<ov::rocm_gpu::pass::RocMLIRGroupConvDecompose>();
+#endif
 
     pass_manager.register_pass<ov::rocm_gpu::pass::ConvolutionAsymPaddingTransformation>();
     pass_manager.register_pass<ov::rocm_gpu::pass::GroupConvolutionAsymPaddingTransformation>();
