@@ -89,7 +89,7 @@ inline int max_concurrent_streams(rocm::Device d) {
 }
 
 inline bool isHalfSupported(rocm::Device d) {
-    return true;
+    return false;  // half_float::half is CPU-only; use f32 path
 }
 
 inline bool isInt8Supported(rocm::Device d) {

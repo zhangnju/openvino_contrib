@@ -46,6 +46,8 @@ private:
 
     //template <typename DataType, typename IndexType>
     void Call(const hipStream_t stream, const float* src_dict, const int* src_index, float* dst_data) const;
+    void CallGeneric(const hipStream_t stream, const void* src_dict, const int32_t* src_index,
+                     void* dst_data, size_t elem_bytes) const;
 
     Type_t element_type_;
     Type_t indices_type_;

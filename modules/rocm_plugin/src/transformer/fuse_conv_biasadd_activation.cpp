@@ -14,6 +14,7 @@
 #include "openvino/core/rt_info.hpp"
 #include "openvino/core/shape.hpp"
 #include "openvino/core/type/element_type.hpp"
+#include "openvino/op/variadic_split.hpp"
 #include "openvino/opsets/opset1.hpp"
 #include "openvino/pass/pattern/matcher.hpp"
 #include "openvino/pass/pattern/op/or.hpp"
@@ -141,6 +142,12 @@ struct FusedConvCallbacks {
         }
 
         if (fused_conv->has_add_node() || fused_conv->get_activation() != ActivationMode::NO_ACTIVATION) {
+            return false;
+        }
+
+        // VariadicSplit has no default output index; fusing it would trigger a validation
+        // exception during graph rewrite. Skip this pattern to keep the graph valid.
+        if (ov::is_type<ov::op::v1::VariadicSplit>(node)) {
             return false;
         }
 

@@ -59,21 +59,6 @@ struct rocm_type_traits<Type_t::boolean> {
     using value_type = char;
 };
 
-/*
-#ifdef __rocmCC__
-#ifdef rocm_HAS_BF16_TYPE
-template <>
-struct rocm_type_traits<Type_t::bf16> {
-    using value_type = __nv_bfloat16;  // 8bit exponent, 7bit mantissa
-};
-#endif
-
-template <>
-struct rocm_type_traits<Type_t::f16> {
-    using value_type = __half;  // 1 sign bit, 5 exponent bits, and 10 mantissa bits.
-};
-#endif
-*/
 template <>
 struct rocm_type_traits<Type_t::f32> {
     using value_type = float;

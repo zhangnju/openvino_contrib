@@ -1,4 +1,5 @@
 #include "hip/hip_runtime.h"
+#include <vector>
 // Copyright (C) 2018-2021 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -143,10 +144,22 @@ Gather::Gather(Type_t element_type,
 
 void Gather::operator()(const hipStream_t stream, const void* src_dict, const void* src_index, void* dst_data) const {
     switch (indices_type_) {
-        /*
-        case Type_t::i64:
-            return CallByDataType<int64_t>(stream, src_dict, src_index, dst_data);
-        */
+        case Type_t::i64: {
+            // Cast i64 indices to i32 temporarily — safe as long as index values fit in int32
+            size_t n = indices_size_;
+            std::vector<int32_t> idx32(n);
+            hipStream_t s = const_cast<hipStream_t>(stream);
+            std::vector<int64_t> host_idx(n);
+            hipMemcpyAsync(host_idx.data(), src_index, n * sizeof(int64_t), hipMemcpyDeviceToHost, s);
+            hipStreamSynchronize(s);
+            for (size_t k = 0; k < n; ++k) idx32[k] = static_cast<int32_t>(host_idx[k]);
+            int32_t* d_idx32 = nullptr;
+            hipMalloc(&d_idx32, n * sizeof(int32_t));
+            hipMemcpyAsync(d_idx32, idx32.data(), n * sizeof(int32_t), hipMemcpyHostToDevice, s);
+            CallByDataType(stream, src_dict, d_idx32, dst_data);
+            hipFreeAsync(d_idx32, s);
+            return;
+        }
         case Type_t::u32:
         case Type_t::i32:
             return CallByDataType(stream, src_dict, src_index, dst_data);
@@ -176,33 +189,16 @@ void Gather::CallByDataType(const hipStream_t stream,
             return Call<__half, IndexType>(stream, src_dict, src_index, dst_data);
         */
         case Type_t::f32:
-            src_dict_fp32 = (const float*) src_dict;
-            src_index_int = (const int*) src_index;
-            dst_data_fp32 = (float*) dst_data;
-            return Call(stream, src_dict_fp32, src_index_int, dst_data_fp32);
-        /*
-        case Type_t::f64:
-            return Call<double, IndexType>(stream, src_dict, src_index, dst_data);
-        case Type_t::i8:
-            return Call<int8_t, IndexType>(stream, src_dict, src_index, dst_data);
-        case Type_t::i16:
-            return Call<int16_t, IndexType>(stream, src_dict, src_index, dst_data);
-        case Type_t::i32:
-            return Call<int32_t, IndexType>(stream, src_dict, src_index, dst_data);
+            return Call(stream, (const float*)src_dict, (const int*)src_index, (float*)dst_data);
         case Type_t::i64:
-            return Call<int64_t, IndexType>(stream, src_dict, src_index, dst_data);
+            return CallGeneric(stream, src_dict, (const int32_t*)src_index, dst_data, sizeof(int64_t));
+        case Type_t::i32:
+            return CallGeneric(stream, src_dict, (const int32_t*)src_index, dst_data, sizeof(int32_t));
         case Type_t::u8:
-            return Call<uint8_t, IndexType>(stream, src_dict, src_index, dst_data);
-        case Type_t::u16:
-            return Call<uint16_t, IndexType>(stream, src_dict, src_index, dst_data);
-        case Type_t::u32:
-            return Call<uint32_t, IndexType>(stream, src_dict, src_index, dst_data);
-        case Type_t::u64:
-            return Call<uint64_t, IndexType>(stream, src_dict, src_index, dst_data);
-        */
+            return CallGeneric(stream, src_dict, (const int32_t*)src_index, dst_data, sizeof(uint8_t));
         default:
             throw_ov_exception(
-                fmt::format("Index element type = {} is not supported by Gather operation !!", indices_type_));
+                fmt::format("Data element type = {} is not supported by Gather operation !!", element_type_));
     }
 }
 
@@ -242,6 +238,40 @@ void Gather::Call(const hipStream_t stream, const float* src_dict, const int* sr
     if (err != hipSuccess) {
         throw_ov_exception(hipGetErrorString(err));
     }
+}
+
+// Generic byte-level gather for any data type with int32 indices
+static __global__ void generic_gather(const char* __restrict__ src_dict,
+                                       const int32_t* __restrict__ src_index,
+                                       char* __restrict__ dst_data,
+                                       unsigned data_length_bytes,
+                                       size_t index_range,
+                                       unsigned indices_size,
+                                       unsigned dicts_batch_stride_elems,
+                                       unsigned indices_batch_stride,
+                                       unsigned out_batch_stride_elems,
+                                       size_t elem_bytes) {
+    const auto idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= indices_size) return;
+    const auto batch = blockIdx.y;
+    int32_t dict_idx = src_index[batch * indices_batch_stride + idx];
+    if (dict_idx < 0) dict_idx += (int32_t)index_range;
+    const char* src = src_dict + batch * dicts_batch_stride_elems * elem_bytes + dict_idx * data_length_bytes;
+    char* dst = dst_data + (batch * out_batch_stride_elems + idx * (data_length_bytes / elem_bytes)) * elem_bytes;
+    for (unsigned b = threadIdx.y; b < data_length_bytes; b += blockDim.y) {
+        dst[b] = (dict_idx >= 0 && (size_t)dict_idx < index_range) ? src[b] : 0;
+    }
+}
+
+void Gather::CallGeneric(const hipStream_t stream, const void* src_dict, const int32_t* src_index,
+                          void* dst_data, size_t elem_bytes) const {
+    dim3 block(std::min((unsigned)256u, (unsigned)indices_size_), 1, 1);
+    dim3 grid((indices_size_ + block.x - 1) / block.x, 1, 1);
+    hipLaunchKernelGGL(generic_gather, grid, block, 0, stream,
+                       (const char*)src_dict, src_index, (char*)dst_data,
+                       (unsigned)(data_length_ * elem_bytes), (size_t)index_range_,
+                       indices_size_, dicts_batch_stride_, indices_batch_stride_, out_batch_stride_,
+                       elem_bytes);
 }
 
 }  // namespace kernel

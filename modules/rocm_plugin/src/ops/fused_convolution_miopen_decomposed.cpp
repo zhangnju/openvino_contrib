@@ -51,37 +51,32 @@ void FusedConvolutionmiopenDecomposed::Execute(const InferenceRequestContext& co
     const auto& outDesc = conv_descs_->Output();
     auto outTensor = outputs[ArgIndices::output].get();
  
-    throwIfError(::miopenConvolutionForward(dnnHandle.get(),
-                                           onePtr,
-                                           conv_descs_->Input().get(),
-                                           inputs[ArgIndices::input].get(),
-                                           conv_descs_->Filter().get(),
-                                           inputs[ArgIndices::filter].get(),
-                                           conv_descs_->Conv().get(),
-                                           conv_descs_->Algo().fwd_algo,
-                                           zeroPtr,
-                                           outDesc.get(),
-                                           outTensor,
-                                           workbuffer,
-                                           conv_descs_->Algo().memory));
-    /*
-    throwIfError(::miopenAddTensor(
-        dnnHandle.get(), onePtr, bias_desc_->get(), inputs[ArgIndices::bias].get(), onePtr, outDesc.get(), outTensor));
+    throwIfError(::miopenConvolutionForwardImmediate(dnnHandle.get(),
+                                                    conv_descs_->Filter().get(),
+                                                    inputs[ArgIndices::filter].get(),
+                                                    conv_descs_->Input().get(),
+                                                    inputs[ArgIndices::input].get(),
+                                                    conv_descs_->Conv().get(),
+                                                    outDesc.get(),
+                                                    outTensor,
+                                                    workbuffer,
+                                                    conv_descs_->WorkspaceSize(),
+                                                    conv_descs_->SolutionId()));
+    throwIfError(::miopenOpTensor(dnnHandle.get(),
+                                   miopenTensorOpAdd,
+                                   onePtr, outDesc.get(), outTensor,
+                                   onePtr, bias_desc_->get(), inputs[ArgIndices::bias].get(),
+                                   zeroPtr, outDesc.get(), outTensor));
     if (includesSecondAddition) {
-        throwIfError(::miopenAddTensor(dnnHandle.get(),
-                                      onePtr,
-                                      add_desc_->get(),
-                                      inputs[ArgIndices::add].get(),
-                                      onePtr,
-                                      outDesc.get(),
-                                      outTensor));
+        throwIfError(::miopenOpTensor(dnnHandle.get(),
+                                       miopenTensorOpAdd,
+                                       onePtr, outDesc.get(), outTensor,
+                                       onePtr, add_desc_->get(), inputs[ArgIndices::add].get(),
+                                       zeroPtr, outDesc.get(), outTensor));
     }
-    */
-    std::cout<<"fix me FusedConvolutionmiopenDecomposed::Execute" <<std::endl;
     miopenActivationMode_t mode;
-    //miopenNanPropagation_t prop;
-    double alpha,beta,gamma;
-    throwIfError(::miopenGetActivationDescriptor(activation_desc_->get(), &mode, &alpha, &beta, &gamma));
+    double aAlpha, aBeta, aGamma;
+    throwIfError(::miopenGetActivationDescriptor(activation_desc_->get(), &mode, &aAlpha, &aBeta, &aGamma));
     if (mode != miopenActivationPASTHRU) {
         dnnHandle.activationForward(*activation_desc_, onePtr, outDesc, outTensor, zeroPtr, outDesc, outTensor);
     }
@@ -92,8 +87,8 @@ rocmGraphCompatibility FusedConvolutionmiopenDecomposed::GetrocmGraphCompatibili
 }
 
 WorkbufferRequest FusedConvolutionmiopenDecomposed::GetWorkBufferRequest() const {
-    if (conv_descs_->Algo().memory != 0) {
-        return {{}, {conv_descs_->Algo().memory}};
+    if (conv_descs_->WorkspaceSize() != 0) {
+        return {{}, {conv_descs_->WorkspaceSize()}};
     } else {
         return {{}, {}};
     }

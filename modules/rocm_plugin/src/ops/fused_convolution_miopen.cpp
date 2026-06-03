@@ -73,32 +73,54 @@ void FusedConvolutionmiopen::Execute(const InferenceRequestContext& context,
         zTensorDesc = add_desc_->get();
         zTensorIn = inputs[ArgIndices::add].get();
     }
-    throwIfError(
-        ::miopenConvolutionBiasActivationForward(dnnHandle.get(),
-                                                &rocm::NumericConst<rocm::constants::one>(conv_descs_->DescType()),
-                                                conv_descs_->Input().get(),
-                                                inputs[ArgIndices::input].get(),
-                                                conv_descs_->Filter().get(),
-                                                inputs[ArgIndices::filter].get(),
-                                                conv_descs_->Conv().get(),
-                                                conv_descs_->Algo().fwd_algo,
-                                                workbuffer,
-                                                conv_descs_->Algo().memory,
-                                                alpha2,
-                                                zTensorDesc,
-                                                zTensorIn,
-                                                bias_desc_->get(),
-                                                inputs[ArgIndices::bias].get(),
-                                                activation_desc_->get(),
-                                                conv_descs_->Output().get(),
-                                                outputs[ArgIndices::output].get()));
+    const auto& outDesc = conv_descs_->Output();
+    const void* onePtr = &rocm::NumericConst<rocm::constants::one>(conv_descs_->DescType());
+    const void* zeroPtr = &rocm::NumericConst<rocm::constants::zero>(conv_descs_->DescType());
+    auto outTensor = outputs[ArgIndices::output].get();
+
+    // Step 1: convolution via immediate (solution) API
+    throwIfError(::miopenConvolutionForwardImmediate(dnnHandle.get(),
+                                                     conv_descs_->Filter().get(),
+                                                     inputs[ArgIndices::filter].get(),
+                                                     conv_descs_->Input().get(),
+                                                     inputs[ArgIndices::input].get(),
+                                                     conv_descs_->Conv().get(),
+                                                     outDesc.get(),
+                                                     outTensor,
+                                                     workbuffer,
+                                                     conv_descs_->WorkspaceSize(),
+                                                     conv_descs_->SolutionId()));
+
+    // Step 2: bias add (C = 1*bias + 1*out -> out)
+    throwIfError(::miopenOpTensor(dnnHandle.get(),
+                                   miopenTensorOpAdd,
+                                   onePtr, outDesc.get(), outTensor,
+                                   onePtr, bias_desc_->get(), inputs[ArgIndices::bias].get(),
+                                   zeroPtr, outDesc.get(), outTensor));
+
+    // Step 3: optional second add (skip connection)
+    if (includesSecondAddition) {
+        throwIfError(::miopenOpTensor(dnnHandle.get(),
+                                       miopenTensorOpAdd,
+                                       onePtr, outDesc.get(), outTensor,
+                                       onePtr, add_desc_->get(), inputs[ArgIndices::add].get(),
+                                       zeroPtr, outDesc.get(), outTensor));
+    }
+
+    // Step 4: optional activation
+    miopenActivationMode_t mode;
+    double aAlpha, aBeta, aGamma;
+    throwIfError(::miopenGetActivationDescriptor(activation_desc_->get(), &mode, &aAlpha, &aBeta, &aGamma));
+    if (mode != miopenActivationPASTHRU) {
+        dnnHandle.activationForward(*activation_desc_, onePtr, outDesc, outTensor, zeroPtr, outDesc, outTensor);
+    }
 }
 
 rocmGraphCompatibility FusedConvolutionmiopen::GetrocmGraphCompatibility() const { return rocmGraphCompatibility::FULL; }
 
 WorkbufferRequest FusedConvolutionmiopen::GetWorkBufferRequest() const {
-    if (conv_descs_->Algo().memory != 0)
-        return {{}, {conv_descs_->Algo().memory}};
+    if (conv_descs_->WorkspaceSize() != 0)
+        return {{}, {conv_descs_->WorkspaceSize()}};
     else
         return {{}, {}};
 }

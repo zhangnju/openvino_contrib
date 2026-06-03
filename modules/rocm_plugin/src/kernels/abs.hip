@@ -13,7 +13,7 @@ namespace kernel {
 template <typename T>
 struct AbsOpImpl {
     __device__ static inline T op(T x) {
-        return abs(x);
+        return x < T{0} ? -x : x;
     }
 };
 /*

@@ -35,7 +35,16 @@ struct ElementTypesSwitch {
     }
 };
 
-using AllElementTypesSwitch = ElementTypesSwitch<Type_t::f32, Type_t::u8>;
+using AllElementTypesSwitch = ElementTypesSwitch<
+    Type_t::f32,
+    Type_t::i8,
+    Type_t::i16,
+    Type_t::i32,
+    Type_t::i64,
+    Type_t::u8,
+    Type_t::u16,
+    Type_t::u32,
+    Type_t::u64>;
 
 using FloatElementTypesSwitch = ElementTypesSwitch<Type_t::f32>;
 }  // namespace kernel

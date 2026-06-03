@@ -62,7 +62,8 @@ void GraphTransformer::transform(const rocm::Device& device,
     };
 
     precisions_map fp_convert_precision_map = {
-        {ov::element::f64, ov::element::f32}
+        {ov::element::f64, ov::element::f32},
+        {ov::element::i64, ov::element::i32},  // Most ROCm kernels only support i32 for integer ops
     };
     type_to_fuse_map empty_fuse_map = {};
     if (upscale_precision()) {

@@ -178,22 +178,22 @@ bool ConvolutionDescriptorsmiopen::GetAlgoForConvDataType(const rocm::DnnHandle&
         if(status != miopenStatusSuccess)
             throw_ov_exception("MIOpen failed to get solution");
         else{
-            solution_id_ = solutions.front().solution_id;
-            workspace_size_ = solutions.front().workspace_size;
-            /*
-            int i= -1;
-            for(i=0; i< actual_count; i++)
-            {
-                if(solutions[i].workspace_size > 0)
-                {
-                   solution_id_ = solutions[i].solution_id;
-                   workspace_size_ = solutions[i].workspace_size;
-                   break;
+            // Prefer the solution with the smallest non-zero workspace, falling back to the first
+            solution_id_ = solutions[0].solution_id;
+            workspace_size_ = solutions[0].workspace_size;
+            for (size_t i = 0; i < actual_count; ++i) {
+                if (solutions[i].workspace_size > 0 && solutions[i].workspace_size < workspace_size_) {
+                    solution_id_ = solutions[i].solution_id;
+                    workspace_size_ = solutions[i].workspace_size;
                 }
             }
-            if(i==actual_count)
-                throw_ov_exception("MIOpen failed to get valid solution");
-                */
+            // Compile the chosen solution so miopenConvolutionForwardImmediate can execute it
+            ::miopenConvolutionForwardCompileSolution(dnnHandle.get(),
+                                                      filter_.get(),
+                                                      input_.get(),
+                                                      conv_.get(),
+                                                      output_.get(),
+                                                      solution_id_);
         } 
 
         /*
@@ -575,16 +575,12 @@ std::shared_ptr<rocm::DnnTensorDescriptor> MakeFusedAddDescriptor(const ov::Shap
               convertDataType<miopenDataType_t>(element_type),
               static_cast<int>(shape.size()),
               int_shape.data());
-    std::cout<<"MakeFusedAddDescriptor"<<std::endl;
     return desc;
 }
 
 std::shared_ptr<rocm::DnnActivationDescriptor> MakeFusedActivationDescriptor(nodes::ActivationMode mode) {
     auto desc = std::make_shared<rocm::DnnActivationDescriptor>();
-    std::cout<<"MakeFusedActivationDescriptor"<<std::endl;
-    #if 0
-    desc->set(convertActivationMode(mode), miopenNanPropagation_t::MIOPEN_PROPAGATE_NAN, 0);
-    #endif
+    desc->set(convertActivationMode(mode), 0.0, 0.0, 0.0);
     return desc;
 }
 

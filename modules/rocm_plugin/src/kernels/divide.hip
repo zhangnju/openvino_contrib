@@ -34,8 +34,26 @@ __device__ static inline T div(T x, T y) {
 static __global__ void DivOpImpl_fp32(const float* in0,const float* in1,float* out)
 {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
-
     out[i] = fdividef(in0[i], in1[i]);
+}
+
+static __global__ void DivOpImpl_i64(const int64_t* in0,const int64_t* in1, int64_t* out)
+{
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    out[i] = in1[i] != 0 ? in0[i] / in1[i] : (in0[i] > 0 ? INT64_MAX : INT64_MIN);
+}
+
+static __global__ void PythonDivOpImpl_i64(const int64_t* in0,const int64_t* in1, int64_t* out)
+{
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (in1[i] == 0) {
+        out[i] = in0[i] > 0 ? INT64_MAX : INT64_MIN;
+        return;
+    }
+    int64_t d = in0[i] / in1[i];
+    int64_t mod = in0[i] % in1[i];
+    if (mod != 0 && ((in0[i] < 0) != (in1[i] < 0))) d -= 1;
+    out[i] = d;
 }
 /*
 template <typename T, std::enable_if_t<std::is_integral<T>::value, bool> = true>
@@ -86,16 +104,15 @@ void Divide::operator()(hipStream_t stream,
                         const void* in1,
                         const NumpyBroadcastMapper& in1_mapper,
                         void* out) const {
-    const float* in0_fp32=nullptr;
-    const float* in1_fp32=nullptr;
-    float* out_fp32=nullptr;
     switch(element_type_)
     {
         case Type_t::f32:
-            in0_fp32 = (const float*) in0;
-            in1_fp32 = (const float*) in0;
-            out_fp32 = (float*) out;
-            DivOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(in0_fp32, in1_fp32,out_fp32);
+            DivOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(
+                (const float*)in0, (const float*)in1, (float*)out);
+            break;
+        case Type_t::i64:
+            DivOpImpl_i64<<<num_blocks_, threads_per_block_, 0, stream>>>(
+                (const int64_t*)in0, (const int64_t*)in1, (int64_t*)out);
             break;
         default:
             throw_ov_exception(fmt::format("Input element type = {} is not supported by Div operation !!",
@@ -118,16 +135,15 @@ void PythonDivide::operator()(hipStream_t stream,
                               const void* in1,
                               const NumpyBroadcastMapper& in1_mapper,
                               void* out) const {
-    const float* in0_fp32=nullptr;
-    const float* in1_fp32=nullptr;
-    float* out_fp32=nullptr;
     switch(element_type_)
     {
         case Type_t::f32:
-            in0_fp32 = (const float*) in0;
-            in1_fp32 = (const float*) in0;
-            out_fp32 = (float*) out;
-            DivOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(in0_fp32, in1_fp32,out_fp32);
+            DivOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(
+                (const float*)in0, (const float*)in1, (float*)out);
+            break;
+        case Type_t::i64:
+            PythonDivOpImpl_i64<<<num_blocks_, threads_per_block_, 0, stream>>>(
+                (const int64_t*)in0, (const int64_t*)in1, (int64_t*)out);
             break;
         default:
             throw_ov_exception(fmt::format("Input element type = {} is not supported by Python-Div operation !!",

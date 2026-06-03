@@ -9,6 +9,7 @@
 #include "converters.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/topk.hpp"
+#include "openvino/op/util/topk_base.hpp"
 
 namespace ov {
 namespace rocm_gpu {
@@ -80,9 +81,9 @@ TopKOp::TopKOp(const CreationContext& context,
                IndexCollection&& inputIds,
                IndexCollection&& outputIds)
     : OperationBase(context, node, std::move(inputIds), std::move(outputIds)) {
-    const auto topKOp = ov::as_type<const ov::op::v1::TopK>(&node);
+    const auto topKOp = ov::as_type<const ov::op::util::TopKBase>(&node);
     if (!topKOp) {
-        throw_ov_exception(fmt::format("Only TopK v1 is supported! NodeName: {}", GetName()));
+        throw_ov_exception(fmt::format("Unsupported TopK version! NodeName: {}", GetName()));
     }
 
     const ov::element::Type element_type{topKOp->get_input_element_type(0)};
@@ -111,7 +112,7 @@ TopKOp::TopKOp(const CreationContext& context,
     std::copy(input_strides.begin(), input_strides.end(), kernel_param_.input_strides);
     std::copy(output_strides.begin(), output_strides.end(), kernel_param_.output_strides);
 
-    auto convertComputeType = [](const ov::op::v1::TopK::Mode& compute_mode) {
+    auto convertComputeType = [](const ov::op::TopKMode& compute_mode) {
         switch (compute_mode) {
             case ov::op::TopKMode::MAX:
                 return kernel::TopK::ComputeType::Max;
@@ -120,7 +121,7 @@ TopKOp::TopKOp(const CreationContext& context,
         }
         throw_ov_exception(fmt::format("Unknown compute_mode {}", compute_mode));
     };
-    auto convertSortType = [](const ov::op::v1::TopK::SortType& sort_type) {
+    auto convertSortType = [](const ov::op::TopKSortType& sort_type) {
         switch (sort_type) {
             case ov::op::TopKSortType::NONE:
                 return kernel::TopK::SortType::None;
