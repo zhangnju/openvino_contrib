@@ -60,9 +60,10 @@ struct CompiledConv {
     size_t            workspace_bytes = 0;
     // perf_config string used (e.g. "v4:64,256,8,16,256,16,4,1,2,2,1,1")
     std::string perf_config;
-    // Grid/block dims extracted from the compiled kernel
+    // Grid/block dims parsed from rocmlir-driver metadata:
+    //   block_size = 256 : i32, grid_size = 600 : i32
     int grid_x = 1, grid_y = 1, grid_z = 1;
-    int block_x = 64, block_y = 1, block_z = 1;
+    int block_x = 256, block_y = 1, block_z = 1;
 };
 
 // ───────────────────────────────────────────────────────────────────────────

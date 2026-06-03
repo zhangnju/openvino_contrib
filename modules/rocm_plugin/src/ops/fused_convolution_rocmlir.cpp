@@ -4,6 +4,7 @@
 #include "fused_convolution_rocmlir.hpp"
 #include "rocm_creation_context.hpp"
 #include "error.hpp"
+#include <mutex>
 #include "ops/converters.hpp"
 #include "ops/convolution_components/convolution_miopen_components.hpp"
 #include "kernels/bias_add.hpp"
@@ -67,6 +68,15 @@ FusedConvolutionRocMLIR::FusedConvolutionRocMLIR(
     activation_  = params.activation_;
     has_add_     = params.add_shape_.has_value();
 
+    std::cerr << "[RocMLIR-Fused-CTOR] " << node.get_friendly_name()
+              << " N=" << conv_params_.N << " C=" << conv_params_.C
+              << " H=" << conv_params_.H << " W=" << conv_params_.W
+              << " K=" << conv_params_.K << " R=" << conv_params_.R
+              << " S=" << conv_params_.S << " G=" << conv_params_.groups
+              << " pad=" << conv_params_.pad_h << "," << conv_params_.pad_w
+              << " stride=" << conv_params_.stride_h << "," << conv_params_.stride_w
+              << " fp16=" << conv_params_.fp16 << std::endl;
+
     // Compile (or reuse cached) rocMLIR kernel based on activation type
     if (activation_ == nodes::ActivationMode::NO_ACTIVATION) {
         kernel_ = &rocmlir::RocMLIRKernelCache::global()
@@ -120,23 +130,39 @@ void FusedConvolutionRocMLIR::Execute(const InferenceRequestContext& ctx,
 
     // ── Step 1: rocMLIR convolution kernel ───────────────────────────────────
     {
-        void* args[] = { &d_input, &d_filter, &d_output, &d_ws };
+        // rocmlir-gen kernel arg order: filter, input, output [, workspace]
+        // rocmlir-gen arg order: filter, input, output
+        void* args[] = { &d_filter, &d_input, &d_output, &d_ws };
         const auto& info = kernel_->info;
-        const int grid_x = (conv_params_.N * conv_params_.K * info.block_x - 1)
-                           / info.block_x + 1;
+
+        static std::once_flag first_fused;
+        std::call_once(first_fused, [&] {
+            std::cerr << "[RocMLIR-Fused] " << GetName()
+                      << " grid=" << info.grid_x << " block=" << info.block_x
+                      << " ws=" << info.workspace_bytes
+                      << " has_add=" << has_add_
+                      << " act=" << static_cast<int>(activation_) << std::endl;
+        });
+
         hipError_t err = hipModuleLaunchKernel(
             kernel_->function,
-            grid_x, 1, 1, info.block_x, 1, 1,
+            info.grid_x, 1, 1, info.block_x, 1, 1,
             0, ctx.getThreadContext().stream().get(),
             args, nullptr);
         if (err != hipSuccess)
-            throw_ov_exception(fmt::format("FusedConvolutionRocMLIR conv failed: {}",
+            throw_ov_exception(fmt::format("FusedConvolutionRocMLIR conv launch failed: {}",
                                            hipGetErrorString(err)));
     }
 
     // ── Step 2: bias add via custom HIP kernel ───────────────────────────────
-    // miopenConvolutionForwardBias is affected by MIOPEN_DEBUG_FIND_ONLY_SOLVER.
-    // Use a custom broadcast-add kernel instead.
+    // Synchronize to catch async GPU errors from the conv kernel
+    {
+        hipError_t sync_err = hipDeviceSynchronize();
+        if (sync_err != hipSuccess) {
+            throw_ov_exception(fmt::format("FusedConvolutionRocMLIR: conv kernel error: {}",
+                                           hipGetErrorString(sync_err)));
+        }
+    }
     {
         kernel::launch_bias_add(d_output, d_bias,
                                 conv_params_.N, conv_params_.K,

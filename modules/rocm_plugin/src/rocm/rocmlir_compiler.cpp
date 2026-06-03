@@ -372,12 +372,22 @@ CompiledConv compile_mlir_ir(const std::string& mlir_ir,
         }
     }
 
-    // Parse block dims from perf_config "v4:BX,BY,BZ,..."
-    // Format: v4:block_size,... (first field is block_x for most configs)
-    if (!result.perf_config.empty()) {
-        int bx = 64; // default
-        if (sscanf(result.perf_config.c_str(), "v4:%d,", &bx) == 1)
-            result.block_x = bx;
+    // Parse block_size and grid_size from rocmlir-driver metadata:
+    //   block_size = 256 : i32, grid_size = 600 : i32
+    {
+        int bsz = 256, gsz = 1;
+        auto parse_int_field = [&](const char* key, int& out) {
+            const std::string k = std::string(key) + " = ";
+            auto p = output.find(k);
+            if (p != std::string::npos) {
+                p += k.size();
+                out = std::stoi(output.substr(p));
+            }
+        };
+        parse_int_field("block_size", bsz);
+        parse_int_field("grid_size",  gsz);
+        result.block_x = bsz;
+        result.grid_x  = gsz;
     }
 
     return result;

@@ -4,6 +4,7 @@
 #include "convolution_rocmlir.hpp"
 #include "rocm_creation_context.hpp"
 #include "error.hpp"
+#include <mutex>
 
 #include <openvino/core/except.hpp>
 #include <fmt/format.h>
@@ -90,17 +91,24 @@ void ConvolutionRocMLIR::Execute(const InferenceRequestContext& ctx,
     void* d_ws     = wbs.mutable_buffers.empty() ? nullptr : wbs.mutable_buffers[0].get();
 
     // rocMLIR kernels expect arguments: (input, filter, output[, workspace])
-    void* args[] = { &d_input, &d_filter, &d_output, &d_ws };
-    const int nargs = (d_ws != nullptr) ? 4 : 3;
+    // rocmlir-gen kernel argument order: filter, input, output [, workspace]
+    // (matches rock_conv_gkc01... %arg0=filter, %arg1=input, %arg2=output)
+    void* args[] = { &d_filter, &d_input, &d_output, &d_ws };
 
     const auto& info = kernel_->info;
 
-    // Grid: kernel-specific; use a safe default if not parsed
-    const int grid_x  = (conv_params_.N * conv_params_.K * info.block_x - 1) / info.block_x + 1;
+    // Debug: print grid/block sizes on first call
+    static std::once_flag first;
+    std::call_once(first, [&] {
+        std::cerr << "[RocMLIR] " << GetName()
+                  << " grid=" << info.grid_x << " block=" << info.block_x
+                  << " ws=" << info.workspace_bytes
+                  << " kernel=" << info.kernel_name << std::endl;
+    });
 
     hipError_t err = hipModuleLaunchKernel(
         kernel_->function,
-        grid_x, 1, 1,               // grid
+        info.grid_x, 1, 1,          // grid
         info.block_x, 1, 1,         // block
         0,                           // shared mem
         ctx.getThreadContext().stream().get(),
