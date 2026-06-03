@@ -62,11 +62,13 @@ void FusedConvolutionmiopenDecomposed::Execute(const InferenceRequestContext& co
                                                     workbuffer,
                                                     conv_descs_->WorkspaceSize(),
                                                     conv_descs_->SolutionId()));
-    throwIfError(::miopenOpTensor(dnnHandle.get(),
-                                   miopenTensorOpAdd,
-                                   onePtr, outDesc.get(), outTensor,
-                                   onePtr, bias_desc_->get(), inputs[ArgIndices::bias].get(),
-                                   zeroPtr, outDesc.get(), outTensor));
+    throwIfError(::miopenConvolutionForwardBias(dnnHandle.get(),
+                                               onePtr,
+                                               bias_desc_->get(),
+                                               inputs[ArgIndices::bias].get(),
+                                               onePtr,
+                                               outDesc.get(),
+                                               outTensor));
     if (includesSecondAddition) {
         throwIfError(::miopenOpTensor(dnnHandle.get(),
                                        miopenTensorOpAdd,

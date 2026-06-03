@@ -88,6 +88,10 @@ public:
     const miopenConvAlgoPerf_t& Algo() const { return algo_perf_; }
     const std::size_t WorkspaceSize() const {return workspace_size_;}
     const uint64_t SolutionId() const {return solution_id_;}
+    bool IsAlgoFound() const { return algo_found_; }
+    void LazyFindAlgo(const rocm::DnnHandle& dnnHandle,
+                      const void* in, const void* filter, void* out,
+                      void* workspace, std::size_t workspaceSize);
     void FindAlgo(const rocm::DnnHandle& dnnHandle,
                   rocm::DevicePointer<const void*> inPtr,
                   rocm::DevicePointer<const void*> filterPtr,
@@ -115,10 +119,11 @@ private:
     rocm::DnnFilterDescriptor filter_;
     rocm::DnnTensorDescriptor output_;
     rocm::DnnConvolutionDescriptor conv_;
-    miopenConvAlgoPerf_t  algo_perf_;
+    mutable miopenConvAlgoPerf_t  algo_perf_;
     std::vector<miopenDataType_t> half_desc_types_;
-    std::size_t workspace_size_;
-    uint64_t solution_id_;
+    mutable std::size_t workspace_size_;
+    mutable uint64_t solution_id_;
+    mutable bool algo_found_{false};
 };
 
 /**

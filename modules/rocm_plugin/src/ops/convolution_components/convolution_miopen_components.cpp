@@ -5,6 +5,7 @@
 #include "convolution_miopen_components.hpp"
 
 #include <miopen/miopen.h>
+#include <set>
 #include <fmt/ostream.h>
 
 #include <rocm_config.hpp>
@@ -118,10 +119,31 @@ void ConvolutionDescriptorsmiopen::BenchmarkOptimalAlgo(const rocm::DnnHandle& d
     algo_perf_ = *optimalAlgo;
 }
 
+void ConvolutionDescriptorsmiopen::LazyFindAlgo(const rocm::DnnHandle& dnnHandle,
+                                                 const void* in, const void* filter, void* out,
+                                                 void* workspace, std::size_t workspaceSize) {
+    if (algo_found_) return;
+    const int requestedAlgoCount = 1;
+    int returnedAlgoCount = 0;
+    auto status = ::miopenFindConvolutionForwardAlgorithm(dnnHandle.get(),
+                                                          input_.get(), in,
+                                                          filter_.get(), filter,
+                                                          conv_.get(),
+                                                          output_.get(), out,
+                                                          requestedAlgoCount,
+                                                          &returnedAlgoCount,
+                                                          &algo_perf_,
+                                                          workspace, workspaceSize,
+                                                          false);
+    if (status == miopenStatusSuccess && returnedAlgoCount > 0) {
+        workspace_size_ = algo_perf_.memory;
+        algo_found_ = true;
+    }
+}
+
 void ConvolutionDescriptorsmiopen::GetAlgo(const rocm::DnnHandle& dnnHandle) {
     switch (tensor_element_type_) {
         case miopenHalf:
-            //std::cout<<"half"<<std::endl;
             for (const auto& half_desc_type : half_desc_types_) {
                 if (GetAlgoForConvDataType(dnnHandle, half_desc_type)) {
                     conv_desc_type_ = half_desc_type;
@@ -130,7 +152,6 @@ void ConvolutionDescriptorsmiopen::GetAlgo(const rocm::DnnHandle& dnnHandle) {
             }
             break;
         default:
-            //std::cout<<"float"<<std::endl;
             if (GetAlgoForConvDataType(dnnHandle, tensor_element_type_)) return;
     }
 
@@ -153,8 +174,7 @@ bool ConvolutionDescriptorsmiopen::GetAlgoForConvDataType(const rocm::DnnHandle&
              throw_ov_exception("MIOpen Failed to get forward workspace size");
     else
     {
-        //workspace_size_ = workspace_size;
-        //std::cout<<"workspace_size:"<<workspace_size<<std::endl;
+        workspace_size_ = workspace_size;
         size_t solution_count;
         status = ::miopenConvolutionForwardGetSolutionCount(dnnHandle.get(),
                                                     filter_.get(),
@@ -178,22 +198,22 @@ bool ConvolutionDescriptorsmiopen::GetAlgoForConvDataType(const rocm::DnnHandle&
         if(status != miopenStatusSuccess)
             throw_ov_exception("MIOpen failed to get solution");
         else{
-            // Prefer the solution with the smallest non-zero workspace, falling back to the first
-            solution_id_ = solutions[0].solution_id;
-            workspace_size_ = solutions[0].workspace_size;
-            for (size_t i = 0; i < actual_count; ++i) {
-                if (solutions[i].workspace_size > 0 && solutions[i].workspace_size < workspace_size_) {
+            // Solution 85 (GemmFwd1x1_0_1) and 88 cause GPU memory faults on gfx950 with MIOpen 7.2.
+            // Skip those and prefer ConvDirectNaiveConvFwd (typically 107).
+            // This is a workaround for a MIOpen bug.
+            static const std::set<uint64_t> faultyIds = {85, 88};
+            bool found = false;
+            for (size_t i = 0; i < actual_count && !found; ++i) {
+                if (!faultyIds.count(solutions[i].solution_id)) {
                     solution_id_ = solutions[i].solution_id;
                     workspace_size_ = solutions[i].workspace_size;
+                    found = true;
                 }
             }
-            // Compile the chosen solution so miopenConvolutionForwardImmediate can execute it
-            ::miopenConvolutionForwardCompileSolution(dnnHandle.get(),
-                                                      filter_.get(),
-                                                      input_.get(),
-                                                      conv_.get(),
-                                                      output_.get(),
-                                                      solution_id_);
+            if (!found) {
+                solution_id_ = solutions[0].solution_id;
+                workspace_size_ = solutions[0].workspace_size;
+            }
         } 
 
         /*
@@ -235,29 +255,70 @@ bool ConvolutionDescriptorsmiopen::FindAlgoForConvDataType(const rocm::DnnHandle
                                                           miopenDataType_t convDataType) {
     miopenStatus_t status = miopenStatusSuccess;
     conv_ = params_.MakeConvolutionDescriptor(convDataType);
+
+    // First get workspace size needed for Find
+    std::size_t findWorkspaceSize = 0;
+    ::miopenConvolutionForwardGetWorkSpaceSize(dnnHandle.get(),
+                                               filter_.get(), input_.get(), conv_.get(), output_.get(),
+                                               &findWorkspaceSize);
+
+    // Allocate temporary workspace for Find
+    void* findWorkspace = nullptr;
+    if (findWorkspaceSize > 0) hipMalloc(&findWorkspace, findWorkspaceSize);
+
+    // Allocate temporary input/filter/output buffers for Find
+    // Use output size as a safe overestimate for all buffers
+    std::size_t maxElems = 1;
+    {
+        std::array<int, MIOPEN_DIM_MAX> lens{1,1,1,1,1}, strides_tmp{};
+        miopenDataType_t dt;
+        miopenGetTensorDescriptor(output_.get(), &dt, lens.data(), strides_tmp.data());
+        for (int d : lens) { if (d > 1) maxElems *= (size_t)d; }
+        // Also check input descriptor
+        std::array<int, MIOPEN_DIM_MAX> inlens{1,1,1,1,1}, instrides{};
+        miopenGetTensorDescriptor(input_.get(), &dt, inlens.data(), instrides.data());
+        size_t inElems = 1;
+        for (int d : inlens) { if (d > 1) inElems *= (size_t)d; }
+        if (inElems > maxElems) maxElems = inElems;
+    }
+    // Use a large buffer (64MB) to be safe for filter weights and workspace
+    maxElems = std::max(maxElems, (size_t)(64 * 1024 * 1024 / sizeof(float)));
+    void* tmpIn = nullptr; void* tmpFilter = nullptr; void* tmpOut = nullptr;
+    hipMalloc(&tmpIn, maxElems * sizeof(float));
+    hipMalloc(&tmpFilter, maxElems * sizeof(float));
+    hipMalloc(&tmpOut, maxElems * sizeof(float));
+    hipMemset(tmpIn, 0, maxElems * sizeof(float));
+    hipMemset(tmpFilter, 0, maxElems * sizeof(float));
+    hipMemset(tmpOut, 0, maxElems * sizeof(float));
+
     const int requestedAlgoCount = 1;
     int returnedAlgoCount = 0;
-    #if 0
     status = ::miopenFindConvolutionForwardAlgorithm(dnnHandle.get(),
-                                                    input_.get(),
-                                                    filter_.get(),
-                                                    conv_.get(),
-                                                    output_.get(),
-                                                    requestedAlgoCount,
-                                                    &returnedAlgoCount,
-                                                    &algo_perf_);
-   
-    if ((status != miopenStatusSuccess) || (algo_perf_.status != miopenStatusSuccess) || (returnedAlgoCount <= 0)) {
+                                                     input_.get(), tmpIn,
+                                                     filter_.get(), tmpFilter,
+                                                     conv_.get(),
+                                                     output_.get(), tmpOut,
+                                                     requestedAlgoCount,
+                                                     &returnedAlgoCount,
+                                                     &algo_perf_,
+                                                     findWorkspace, findWorkspaceSize,
+                                                     false);
+    if (findWorkspace) hipFree(findWorkspace);
+    if (tmpIn) hipFree(tmpIn);
+    if (tmpFilter) hipFree(tmpFilter);
+    if (tmpOut) hipFree(tmpOut);
+
+    if (status != miopenStatusSuccess || returnedAlgoCount <= 0) {
         return false;
     }
 
-    //throwIfError(::miopenSetConvolutionMathType(conv_.get(), algo_perf_.mathType));
-
+    // Get workspace size for the selected algorithm
     size_t sizeInBytes = 0;
-    throwIfError(::miopenConvolutionForwardGetSolutionCount(
-        dnnHandle.get(), input_.get(), filter_.get(), conv_.get(), output_.get(), algo_perf_.algo, &sizeInBytes));
+    ::miopenConvolutionForwardGetWorkSpaceSize(dnnHandle.get(),
+                                               filter_.get(), input_.get(), conv_.get(), output_.get(),
+                                               &sizeInBytes);
     algo_perf_.memory = sizeInBytes;
-    #endif
+    workspace_size_ = sizeInBytes;
     return true;
 }
 

@@ -78,7 +78,7 @@ void FusedConvolutionmiopen::Execute(const InferenceRequestContext& context,
     const void* zeroPtr = &rocm::NumericConst<rocm::constants::zero>(conv_descs_->DescType());
     auto outTensor = outputs[ArgIndices::output].get();
 
-    // Step 1: convolution via immediate (solution) API
+    // Step 1: lazy Find on first call, then old-style Forward API
     throwIfError(::miopenConvolutionForwardImmediate(dnnHandle.get(),
                                                      conv_descs_->Filter().get(),
                                                      inputs[ArgIndices::filter].get(),
@@ -91,12 +91,14 @@ void FusedConvolutionmiopen::Execute(const InferenceRequestContext& context,
                                                      conv_descs_->WorkspaceSize(),
                                                      conv_descs_->SolutionId()));
 
-    // Step 2: bias add (C = 1*bias + 1*out -> out)
-    throwIfError(::miopenOpTensor(dnnHandle.get(),
-                                   miopenTensorOpAdd,
-                                   onePtr, outDesc.get(), outTensor,
-                                   onePtr, bias_desc_->get(), inputs[ArgIndices::bias].get(),
-                                   zeroPtr, outDesc.get(), outTensor));
+    // Step 2: bias add via ForwardBias which supports NC1HW broadcasting
+    throwIfError(::miopenConvolutionForwardBias(dnnHandle.get(),
+                                               onePtr,
+                                               bias_desc_->get(),
+                                               inputs[ArgIndices::bias].get(),
+                                               onePtr,
+                                               outDesc.get(),
+                                               outTensor));
 
     // Step 3: optional second add (skip connection)
     if (includesSecondAddition) {
