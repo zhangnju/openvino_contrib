@@ -4,6 +4,7 @@
 
 #include "matmul.hpp"
 
+#include <rocblas/rocblas.h>
 #include <rocm/blas.hpp>
 #include <rocm/float16.hpp>
 #include <rocm_operation_registry.hpp>
@@ -59,8 +60,8 @@ MatMulOp::MatMulOp(const CreationContext& context,
     stride_b_ = (batchBCount > 1) ? (k_ * n_) : 0;
     stride_c_ = (m_ * n_);
     #if 0
-    cublas_transpose_a_ = transposeA ? CUBLAS_OP_T : CUBLAS_OP_N;
-    cublas_transpose_b_ = transposeB ? CUBLAS_OP_T : CUBLAS_OP_N;
+    rocblas_transpose_a_ = transposeA ? rocblas_operation_transpose : rocblas_operation_none;
+    rocblas_transpose_b_ = transposeB ? rocblas_operation_transpose : rocblas_operation_none;
     #endif 
     if constexpr (std::is_same_v<TOperation, nodes::FullyConnected>) {
         beta_ = &rocm::NumericConst<rocm::constants::one>(compute_type_);
@@ -195,39 +196,39 @@ void MatMulOp::Execute(const InferenceRequestContext& context,
     auto matrixB = inputs[1];
     auto matrixC = outputs[0];
 
-    /**
-     * NOTE: A and B are switched in places. A returns k as leading dimension and B returns n.
-     *       Such workaround is done, because cuBlas works with column-major matrices,
-     *       but we need to get output row-major matrix
-     *       Instead of computing C = A x B (cuBlas will return in column-major format),
-     *       we compute Ct = Bt x At (where t means transposed)
-     *       As result Ct would be row-major matrix
-     */
-     #if 0
-    throwIfError(cublasGemmStridedBatchedEx(cuBlasHandle.get(),
-                                            cublas_transpose_b_,
-                                            cublas_transpose_a_,
-                                            n_,
-                                            m_,
-                                            k_,
-                                            &rocm::NumericConst<rocm::constants::one>(compute_type_),
-                                            matrixB.get(),
-                                            data_type_,
-                                            ld_b_,
-                                            stride_b_,
-                                            matrixA.get(),
-                                            data_type_,
-                                            ld_a_,
-                                            stride_a_,
-                                            beta_,
-                                            matrixC.get(),
-                                            data_type_,
-                                            ld_c_,
-                                            stride_c_,
-                                            batch_count_,
-                                            compute_type_,
-                                            CUBLAS_GEMM_DEFAULT));
-    #endif
+    // Map hipDataType → rocblas_datatype
+    auto to_rocblas_dt = [](hipDataType dt) -> rocblas_datatype {
+        switch (dt) {
+            case HIP_R_16F: return rocblas_datatype_f16_r;
+            case HIP_R_32F: return rocblas_datatype_f32_r;
+            case HIP_R_64F: return rocblas_datatype_f64_r;
+            case HIP_R_8I:  return rocblas_datatype_i8_r;
+            default:        return rocblas_datatype_f32_r;
+        }
+    };
+    const rocblas_datatype dt       = to_rocblas_dt(data_type_);
+    const rocblas_datatype ct       = to_rocblas_dt(compute_type_);
+
+    // rocBLAS uses column-major internally.
+    // We compute Ct = Bt × At so the result C is row-major.
+    throwIfError(rocblas_gemm_strided_batched_ex(
+        RocBlasHandle.get(),
+        rocblas_transpose_b_,   // transa for Bt
+        rocblas_transpose_a_,   // transb for At
+        n_,                     // m  (rows of Bt / Ct)
+        m_,                     // n  (cols of At / Ct)
+        k_,                     // k  (inner dimension)
+        &rocm::NumericConst<rocm::constants::one>(compute_type_),
+        matrixB.get(), dt, ld_b_, stride_b_,  // B (acts as A in col-major call)
+        matrixA.get(), dt, ld_a_, stride_a_,  // A (acts as B in col-major call)
+        beta_,
+        matrixC.get(), dt, ld_c_, stride_c_,  // C
+        matrixC.get(), dt, ld_c_, stride_c_,  // D (same as C for in-place)
+        batch_count_,
+        ct,
+        rocblas_gemm_algo_standard,
+        0,   // solution_index
+        0)); // flags
 }
 
 rocmGraphCompatibility MatMulOp::GetrocmGraphCompatibility() const { return rocmGraphCompatibility::FULL; }

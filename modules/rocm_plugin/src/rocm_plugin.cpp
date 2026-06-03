@@ -21,12 +21,9 @@ using namespace ov::rocm_gpu;
 
 Plugin::Plugin() {
     set_device_name("ROCM");
-    // On gfx950 (MI350) with MIOpen 7.2, most convolution solvers cause GPU memory faults.
-    // ConvDirectNaiveConvFwd is the only safe solver. Set this env var to restrict MIOpen
-    // to use only this solver. Must be set before MIOpen initialization.
-    if (!::getenv("MIOPEN_DEBUG_FIND_ONLY_SOLVER")) {
-        ::setenv("MIOPEN_DEBUG_FIND_ONLY_SOLVER", "ConvDirectNaiveConvFwd", 1);
-    }
+    // When ENABLE_ROCMLIR is active, convolution uses rocMLIR directly and does NOT
+    // call MIOpen for conv. We therefore do NOT restrict MIOpen solvers here.
+    // The MIOPEN_DEBUG_FIND_ONLY_SOLVER workaround is not needed in rocMLIR mode.
     for (int i = 0; i < rocm::Device::count(); ++i) {
         rocm::Device device{i};
         const size_t num_concurrent_streams = max_concurrent_streams(device);

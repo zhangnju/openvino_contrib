@@ -46,6 +46,27 @@ endif()
 # Required to expose MIOpen Backend/Graph API (miopenPointwiseMode_t, miopenBackendAttributeType_t, etc.)
 add_definitions(-DMIOPEN_BETA_API=1)
 
+# ── rocMLIR backend (optional) ────────────────────────────────────────────────
+# Provides rock.conv → HSACO kernel generation that bypasses MIOpen solver
+# selection, fixing GPU memory faults on gfx950 (MI350) with MIOpen 7.2.
+# Build rocMLIR from https://github.com/ROCm/rocMLIR and install to a prefix.
+# Usage: cmake -DENABLE_ROCMLIR=ON -DROCMLIR_INSTALL_DIR=/home/.../rocmlir_install
+option(ENABLE_ROCMLIR "Enable rocMLIR convolution backend" OFF)
+if(ENABLE_ROCMLIR)
+    set(ROCMLIR_INSTALL_DIR "/home/openvino/rocmlir_install"
+        CACHE PATH "rocMLIR install prefix (contains bin/rocmlir-driver)")
+    if(EXISTS "${ROCMLIR_INSTALL_DIR}/bin/rocmlir-driver")
+        message(STATUS "[rocm_gpu] rocMLIR driver found: ${ROCMLIR_INSTALL_DIR}/bin/rocmlir-driver")
+        add_definitions(-DENABLE_ROCMLIR)
+        add_definitions(-DROCMLIR_DRIVER_PATH="${ROCMLIR_INSTALL_DIR}/bin/rocmlir-driver")
+    else()
+        message(WARNING "[rocm_gpu] ENABLE_ROCMLIR=ON but rocmlir-driver not found at "
+                        "${ROCMLIR_INSTALL_DIR}/bin/rocmlir-driver -- disabling")
+        set(ENABLE_ROCMLIR OFF)
+    endif()
+endif()
+# ─────────────────────────────────────────────────────────────────────────────
+
 find_package(OpenVINODeveloperPackage REQUIRED
              PATHS "${InferenceEngineDeveloperPackage_DIR}")
 

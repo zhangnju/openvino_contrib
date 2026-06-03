@@ -82,10 +82,8 @@ private:
     long long stride_c_ = 0;
     int batch_count_ = 0;
     const rocm::constants::AnyNumeric* beta_ = nullptr;
-    #if 0
-    cublasOperation_t cublas_transpose_a_ = CUBLAS_OP_N;
-    cublasOperation_t cublas_transpose_b_ = CUBLAS_OP_N;
-    #endif 
+    rocblas_operation rocblas_transpose_a_ = rocblas_operation_none;
+    rocblas_operation rocblas_transpose_b_ = rocblas_operation_none;
 };
 
 }  // namespace rocm_gpu

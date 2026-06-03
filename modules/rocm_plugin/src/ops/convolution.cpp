@@ -1,4 +1,4 @@
-// Copyright (C) 2018-2021 Intel Corporation
+// Copyright (C) 2018-2024 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
@@ -14,6 +14,10 @@
 #include "convolution_miopen_be.hpp"
 #endif  // ENABLE_miopen_BACKEND_API
 
+#ifdef ENABLE_ROCMLIR
+#include "convolution_rocmlir.hpp"
+#endif  // ENABLE_ROCMLIR
+
 namespace ov {
 namespace rocm_gpu {
 
@@ -24,17 +28,30 @@ static OperationBase::Ptr convolutionFactory(const CreationContext& context,
     using IndexCollection = OperationBase::IndexCollection;
     const Convolution::Details::ConvolutionParams params{downcast<const ov::op::v1::Convolution>(node)};
     std::stringstream exception_msg;
+
+    // Priority 1: rocMLIR backend (rock.conv → HSACO → hipLaunchKernel)
+    // Bypasses MIOpen entirely, avoids gfx950 solver instability.
+#ifdef ENABLE_ROCMLIR
+    try {
+        return std::make_shared<ConvolutionRocMLIR>(
+            context, *node, IndexCollection{inputIds}, IndexCollection{outputIds}, params);
+    } catch (const std::exception& e) {
+        exception_msg << "\nFailed to create ConvolutionRocMLIR impl: " << e.what();
+    }
+#endif  // ENABLE_ROCMLIR
+
+    // Priority 2: MIOpen Backend API
 #ifdef ENABLE_miopen_BACKEND_API
     try {
-        //std::cout<<"miopen backend"<<std::endl;
         return std::make_shared<ConvolutionmiopenBE>(
             context, *node, IndexCollection{inputIds}, IndexCollection{outputIds}, params);
     } catch (const std::exception& e) {
         exception_msg << "\nFailed to create ConvolutionmiopenBE impl: " << e.what();
     }
 #endif  // ENABLE_miopen_BACKEND_API
+
+    // Priority 3: MIOpen Immediate Mode (legacy fallback)
     try {
-        //std::cout<<"not miopen backend"<<std::endl;
         return std::make_shared<Convolutionmiopen>(
             context, *node, IndexCollection{inputIds}, IndexCollection{outputIds}, params);
     } catch (const std::exception& e) {

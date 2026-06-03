@@ -17,6 +17,9 @@
 #ifdef ENABLE_miopen_BACKEND_API
 #include "fused_convolution_miopen_be.hpp"
 #endif  // ENABLE_miopen_BACKEND_API
+#ifdef ENABLE_ROCMLIR
+#include "fused_convolution_rocmlir.hpp"
+#endif  // ENABLE_ROCMLIR
 
 namespace ov {
 namespace rocm_gpu {
@@ -42,6 +45,19 @@ OperationBase::Ptr fusedConvolutionFactory(const CreationContext& context,
 
     const auto params = fused_conv ? Convolution::Details::FusedConvolutionParams{*fused_conv}
                                    : Convolution::Details::FusedConvolutionParams{*fused_group_conv};
+
+    // Priority 1: rocMLIR backend (rock.conv → HSACO)
+#ifdef ENABLE_ROCMLIR
+    try {
+        return std::make_shared<FusedConvolutionRocMLIR>(
+            context, *node, IndexCollection{inputIds}, IndexCollection{outputIds}, params);
+    } catch (const std::exception& e) {
+        exception_msg << fmt::format(
+            "unsupported `{}` node: Failed to create "
+            "FusedConvolutionRocMLIR impl: {}",
+            node->get_type_info().name, e.what());
+    }
+#endif  // ENABLE_ROCMLIR
 
 #ifdef ENABLE_miopen_BACKEND_API
     const bool should_try_backend = node->get_type_name() == std::string("FusedConvolution");
