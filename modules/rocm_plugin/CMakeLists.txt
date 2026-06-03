@@ -43,6 +43,9 @@ if (ENABLE_MIOPEN_BACKEND_API)
     add_definitions(-DENABLE_MIOPEN_BACKEND_API)
 endif()
 
+# Required to expose MIOpen Backend/Graph API (miopenPointwiseMode_t, miopenBackendAttributeType_t, etc.)
+add_definitions(-DMIOPEN_BETA_API=1)
+
 find_package(OpenVINODeveloperPackage REQUIRED
              PATHS "${InferenceEngineDeveloperPackage_DIR}")
 

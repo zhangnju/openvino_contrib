@@ -20,6 +20,7 @@
 #include "memory_manager/rocm_memory_manager.hpp"
 #include "memory_manager/model/rocm_memory_model_builder.hpp"
 #include "rocm/properties.hpp"
+#include "openvino/pass/serialize.hpp"
 #include "openvino/runtime/exec_model_info.hpp"
 #include "openvino/runtime/internal_properties.hpp"
 #include "openvino/runtime/iplugin.hpp"

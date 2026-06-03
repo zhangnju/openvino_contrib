@@ -65,7 +65,11 @@ std::vector<std::string> ResultOp::GetOutputTensorName(const ov::op::v0::Result&
     std::vector<std::string> outputNames;
 
     const auto& input = node.input_value(0);
-    auto name = ov::op::util::get_ie_output_name(input);
+    const auto& prev_layer = input.get_node_shared_ptr();
+    auto name = prev_layer->get_friendly_name();
+    if (prev_layer->get_output_size() != 1) {
+        name += "." + std::to_string(input.get_index());
+    }
     outputNames.push_back(name);
 
     auto resultName = node.get_friendly_name();
