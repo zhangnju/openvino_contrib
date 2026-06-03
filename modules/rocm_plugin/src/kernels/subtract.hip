@@ -16,11 +16,14 @@ struct SubtractOpImpl {
     __device__ static inline T op(T in0, T in1) { return in0 - in1; }
 };
 */
-static __global__ void SubtractOpImpl_fp32(const float* in0, const float* in1,float* out)
-{
+static __global__ void SubtractOpImpl_fp32(const float* in0, const float* in1, float* out) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
-
     out[i] = in0[i] - in1[i];
+}
+
+static __global__ void SubtractOpImpl_fp16(const __half* in0, const __half* in1, __half* out) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    out[i] = __hsub(in0[i], in1[i]);
 }
 Subtract::Subtract(Type_t element_type, size_t out_num_elements, size_t max_threads_per_block)
 {
@@ -42,11 +45,13 @@ void Subtract::operator()(hipStream_t stream,
     float* out_fp32=nullptr;
     switch(element_type_)
     {
+        case Type_t::f16:
+            SubtractOpImpl_fp16<<<num_blocks_, threads_per_block_, 0, stream>>>(
+                (const __half*)in0, (const __half*)in1, (__half*)out);
+            break;
         case Type_t::f32:
-            in0_fp32 = (const float*) in0;
-            in1_fp32 = (const float*) in1;
-            out_fp32 = (float*) out;
-            SubtractOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(in0_fp32, in1_fp32,out_fp32);
+            SubtractOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(
+                (const float*)in0, (const float*)in1, (float*)out);
             break;
         default:
             throw_ov_exception(fmt::format("Input element type = {} is not supported by Subtract operation !!",

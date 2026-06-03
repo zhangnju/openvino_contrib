@@ -49,16 +49,10 @@ void Split::operator()(hipStream_t stream, const void *src, void **dst) const {
     const float* src_fp32=nullptr;
     float** dst_fp32=nullptr;
     switch (element_type_) {
-        /*
-        case Type_t::boolean:
-            return Call<bool>(stream, src, dst);
-#ifdef rocm_HAS_BF16_TYPE
-        case Type_t::bf16:
-            return Call<hip_bfloat16>(stream, src, dst);
-#endif
         case Type_t::f16:
-            return Call<__half>(stream, src, dst);
-        */
+            return Call(stream,
+                        reinterpret_cast<const float*>(src),
+                        reinterpret_cast<float**>(dst));
         case Type_t::f32:
             src_fp32 = (const float*) src;
             dst_fp32 = (float**) dst;

@@ -9,10 +9,6 @@
 //#include "details/type_validator.hpp"
 #include "select.hpp"
 
-#include <half/half.hpp>
-using half    = half_float::half;
-using float16 = half_float::half;
-using __half    = half_float::half;
 
 namespace ov {
 namespace rocm_gpu {

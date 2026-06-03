@@ -53,16 +53,11 @@ void Concat::operator()(const hipStream_t stream, const void* chunks, const void
     const float* const* src_fp32=nullptr;
     float* dst_fp32=nullptr;
     switch (element_type_) {
-        /*
-        case Type_t::boolean:
-            return Call<bool>(stream, chunks, src, dst);
-#ifdef rocm_HAS_BF16_TYPE
-        case Type_t::bf16:
-            return Call<hip_bfloat16>(stream, chunks, src, dst);
-#endif
         case Type_t::f16:
-            return Call<__half>(stream, chunks, src, dst);
-        */
+            // Reinterpret __half* as float* for the kernel — concat/split just copies bytes
+            return Call(stream, chunks,
+                        reinterpret_cast<const float* const*>(src),
+                        reinterpret_cast<float*>(dst));
         case Type_t::f32:
             src_fp32 = (const float* const*) src;
             dst_fp32 = (float*) dst;

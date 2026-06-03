@@ -4,7 +4,7 @@
 
 #pragma once
 #include <hip/hip_runtime.h>
-#include "rocm/float16.hpp"
+#include <hip/hip_fp16.h>
 
 #include "rocm_type_traits.hpp"
 #include "switch.hpp"
@@ -36,6 +36,7 @@ struct ElementTypesSwitch {
 };
 
 using AllElementTypesSwitch = ElementTypesSwitch<
+    Type_t::f16,
     Type_t::f32,
     Type_t::i8,
     Type_t::i16,
@@ -46,7 +47,7 @@ using AllElementTypesSwitch = ElementTypesSwitch<
     Type_t::u32,
     Type_t::u64>;
 
-using FloatElementTypesSwitch = ElementTypesSwitch<Type_t::f32>;
+using FloatElementTypesSwitch = ElementTypesSwitch<Type_t::f16, Type_t::f32>;
 }  // namespace kernel
 }  // namespace rocm_gpu
 }  // namespace ov

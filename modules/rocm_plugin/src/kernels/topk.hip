@@ -130,7 +130,7 @@ TopK::TopK(const Type_t element_type,
       workspace_chunks_{num_input_element / workspace_chunk_size},
       workspace_chunk_size_{workspace_chunk_size} {
     
-    using TopKElementTypesSwitch = ElementTypesSwitch<Type_t::f32>;
+    using TopKElementTypesSwitch = ElementTypesSwitch<Type_t::f16, Type_t::f32>;
     TypeValidator<TopKElementTypesSwitch>::check(element_type_);
     TypeValidator<ElementTypesSwitch<Type_t::i32, Type_t::i64>>::check(index_element_type_);
     

@@ -5,7 +5,10 @@
 #pragma once
 
 #include <cstdint>
-#include <rocm/float16.hpp>
+// Do NOT include rocm/float16.hpp here.
+// In .hip compilation units, __half is provided by HIP runtime headers
+// (amd_hip_fp16.h). In .cpp host units, FP16 uses the runtime type.
+#include <hip/hip_runtime.h>
 
 namespace ov {
 namespace rocm_gpu {
@@ -57,6 +60,14 @@ using rocm_type_traits_t = typename rocm_type_traits<Type>::value_type;
 template <>
 struct rocm_type_traits<Type_t::boolean> {
     using value_type = char;
+};
+
+template <>
+struct rocm_type_traits<Type_t::f16> {
+    // __half is the HIP native FP16 type (from amd_hip_fp16.h), available
+    // in all .hip compilation units automatically. For host .cpp files,
+    // hip_runtime.h also provides it.
+    using value_type = __half;
 };
 
 template <>

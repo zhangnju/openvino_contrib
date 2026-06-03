@@ -63,16 +63,8 @@ void VariadicSplit::operator()(hipStream_t stream,
                                const void *axisSizes,
                                const void *axisOffsetSizes) const {
     switch (element_type_) {
-        /*
-        case Type_t::boolean:
-            return call<bool>(stream, src, dst, splitIdxs, axisSizes, axisOffsetSizes);
-#ifdef rocm_HAS_BF16_TYPE
-        case Type_t::bf16:
-            return call<hip_bfloat16>(stream, src, dst, splitIdxs, axisSizes, axisOffsetSizes);
-#endif
         case Type_t::f16:
             return call<__half>(stream, src, dst, splitIdxs, axisSizes, axisOffsetSizes);
-        */
         case Type_t::f32:
             return call<float>(stream, src, dst, splitIdxs, axisSizes, axisOffsetSizes);
         /*

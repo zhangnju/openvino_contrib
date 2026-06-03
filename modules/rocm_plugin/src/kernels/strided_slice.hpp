@@ -6,10 +6,6 @@
 
 
 #include <hip/hip_runtime.h>
-#include <half/half.hpp>
-using half    = half_float::half;
-using float16 = half_float::half;
-using __half    = half_float::half;
 #include <set>
 #include <vector>
 #include <hip/hip_runtime.h>

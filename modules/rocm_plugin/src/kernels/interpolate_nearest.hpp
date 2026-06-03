@@ -36,7 +36,6 @@ public:
                     void* dst) const;
 
 private:
-    //template <typename T>
     void callKernel(const hipStream_t stream,
                     const float* src,
                     const size_t* input_strides,
@@ -45,6 +44,15 @@ private:
                     const size_t* input_shape,
                     const size_t* output_shape,
                     float* dst) const;
+
+    void callKernel(const hipStream_t stream,
+                    const __half* src,
+                    const size_t* input_strides,
+                    const size_t* output_strides,
+                    const float* scales,
+                    const size_t* input_shape,
+                    const size_t* output_shape,
+                    __half* dst) const;
 
 private:
     size_t num_blocks_;

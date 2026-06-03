@@ -5,16 +5,13 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include <cstdint>
 
-#include <half/half.hpp>
-
-using half_float::half;
-typedef half float16;
-
-using half    = half_float::half;
-using float16 = half_float::half;
-using __half    = half_float::half;
+// __half is the HIP native FP16 type (defined in hip/amd_detail/amd_hip_fp16.h).
+// We provide float16 as a portable alias.
+// Do NOT redefine __half here — HIP already provides it.
+using float16 = __half;
 
 
 // Taken from:

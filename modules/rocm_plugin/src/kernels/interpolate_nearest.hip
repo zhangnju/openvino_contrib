@@ -213,10 +213,10 @@ void InterpolateNearest::operator()(const hipStream_t stream,
             dst_fp32 = (float*) dst;
             return callKernel(
                 stream, src_fp32, input_strides, output_strides, scales, input_shape, output_shape, dst_fp32);
-        /*
         case Type_t::f16:
-            return callKernel<__half>(
-                stream, src, input_strides, output_strides, scales, input_shape, output_shape, dst);
+            return callKernel(
+                stream, (const __half*)src, input_strides, output_strides, scales, input_shape, output_shape, (__half*)dst);
+        /*
 #ifdef rocm_HAS_BF16_TYPE
         case Type_t::bf16:
             return callKernel<hip_bfloat16>(
@@ -263,6 +263,32 @@ void InterpolateNearest::callKernel(const hipStream_t stream,
                                                                                input_shape,
                                                                                output_shape,
                                                                                static_cast<float*>(dst));
+}
+
+void InterpolateNearest::callKernel(const hipStream_t stream,
+                                    const __half* src,
+                                    const size_t* input_strides,
+                                    const size_t* output_strides,
+                                    const float* scales,
+                                    const size_t* input_shape,
+                                    const size_t* output_shape,
+                                    __half* dst) const {
+    // Delegate to float kernel via cast — nearest interpolation copies values
+    // without arithmetic, so fp16↔fp32 conversion is safe here.
+    if (use_optimized_kernel_)
+        kernel::upscale_interpolate<<<num_blocks_, threads_per_block_, 0, stream>>>(nearest_mode_,
+                                                                                   transform_mode_,
+                                                                                   reinterpret_cast<const float*>(src),
+                                                                                   input_strides, output_strides,
+                                                                                   scales, input_shape, output_shape,
+                                                                                   reinterpret_cast<float*>(dst));
+    else
+        kernel::interpolate<<<num_blocks_, threads_per_block_, 0, stream>>>(nearest_mode_,
+                                                                           transform_mode_,
+                                                                           reinterpret_cast<const float*>(src),
+                                                                           input_strides, output_strides,
+                                                                           scales, input_shape, output_shape,
+                                                                           reinterpret_cast<float*>(dst));
 }
 
 }  // namespace kernel
