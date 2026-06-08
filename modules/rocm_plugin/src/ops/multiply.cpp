@@ -26,17 +26,18 @@ static OperationBase::Ptr multiplyFactory(const CreationContext& context,
     const OperationBase::IndexCollection outputs{outputIds};
 
     std::stringstream exception_msg;
-    try {
-        return std::make_shared<MultiplymiopenOp>(
-            context, node, OperationBase::IndexCollection{inputs}, OperationBase::IndexCollection{outputs});
-    } catch (const std::exception& e) {
-        exception_msg << "Failed to create Multiplymiopen impl: " << e.what();
-    }
+    // Custom HIP kernel first: avoids miopenOpTensor() → Op5dTensorGeneric overhead.
     try {
         return std::make_shared<MultiplyrocmOp>(
             context, *node, OperationBase::IndexCollection{inputs}, OperationBase::IndexCollection{outputs});
     } catch (const std::exception& e) {
-        exception_msg << "\nFailed to create Multiplyrocm impl: " << e.what();
+        exception_msg << "Failed to create Multiplyrocm impl: " << e.what();
+    }
+    try {
+        return std::make_shared<MultiplymiopenOp>(
+            context, node, OperationBase::IndexCollection{inputs}, OperationBase::IndexCollection{outputs});
+    } catch (const std::exception& e) {
+        exception_msg << "\nFailed to create Multiplymiopen impl: " << e.what();
     }
     throw_ov_exception(fmt::format("Multiply node is not supported:\n{}", exception_msg.str()));
 }

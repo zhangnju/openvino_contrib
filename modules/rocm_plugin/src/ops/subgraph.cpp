@@ -57,6 +57,12 @@ void SubGraph::initExecuteSequence(bool isStableParams, bool isStableResults) {
 
     std::vector<Ptr> init_sequence{};
     OperationBuffersExtractor opBuffersExtractor{orderedNodes, isStableParams, isStableResults};
+
+    // Post-processing: register extra (non-graph-edge) inputs for attention MatMul nodes.
+    // This must run AFTER OperationBuffersExtractor is fully constructed (all tensors mapped).
+    // For nodes tagged with rocm_attn_qkv_name, it adds the QKV tensor to inputTensorIds()
+    // so RocmAttentionMatMulOp receives the full QKV as its last input at runtime.
+    opBuffersExtractor.registerAttentionExtraInputs(orderedNodes);
     const auto paramSize = model_->get_parameters().size();
     params_ = std::vector<OperationBase::Ptr>(paramSize);
     params_info_ = std::vector<OperationInfo>(paramSize);
@@ -76,6 +82,11 @@ void SubGraph::initExecuteSequence(bool isStableParams, bool isStableResults) {
         if (dynamic_cast<NopOp*>(operation.get())) {
             continue;
         }
+        // For AV MatMul with pe(V) fusion: extend pe_work workspace lifespan by 1 step.
+        // This prevents the memory model from reusing pe_work for the next op's output
+        // buffer while pe_conv and pe_add (GPU-async) are still executing on the stream.
+        // Since the GPU stream is sequential, extending by 1 step is sufficient:
+        // pe_add completes before the next op's kernel launches.
         operation->SetWorkbufferIds(
             opBuffersExtractor.processWorkbufferRequest(node_idx, operation->GetWorkBufferRequest()));
         if (InitNeeded == operation->SetWorkbufferIds(opBuffersExtractor.processWorkbufferRequest(

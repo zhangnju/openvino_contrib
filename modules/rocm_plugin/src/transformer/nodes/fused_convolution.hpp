@@ -71,29 +71,49 @@ public:
         TBaseConvolution::constructor_validate_and_infer_types();
     }
 
+    // 5-input constructor: conv+bias+silu+skip_add → silu(out) → add(silu, aux)
+    // Used when ROCMLIR_EPILOGUE_FUSION=1 fuses the outer Swish+Add chain into the conv kernel.
+    // Arg layout: data[0], filter[1], bias[2], skip[3], aux_silu[4]
+    // Compiles to: mlir_convolution_broadcast_add_sigmoid_mul_add_sigmoid_mul_add (6-arg kernel)
+    explicit BasicFusedConvolution(const ov::Output<ov::Node>& data_batch,
+                                   const ov::Output<ov::Node>& filters,
+                                   const ov::Output<ov::Node>& bias,
+                                   const ov::Output<ov::Node>& add_node,
+                                   const ov::Output<ov::Node>& aux_silu,
+                                   const ov::Strides& strides,
+                                   const ov::CoordinateDiff& pads_begin,
+                                   const ov::CoordinateDiff& pads_end,
+                                   const ov::Strides& dilations,
+                                   const ov::op::PadType& auto_pad,
+                                   ActivationMode activation)
+        : TBaseConvolution(data_batch, filters, strides, pads_begin, pads_end, dilations, auto_pad),
+          activation_{activation} {
+        TBaseConvolution::set_arguments({data_batch, filters, bias, add_node, aux_silu});
+        TBaseConvolution::constructor_validate_and_infer_types();
+    }
+
     std::shared_ptr<ov::Node> clone_with_new_inputs(const ov::OutputVector& new_args) const override {
         ov::check_new_args_count(this, new_args);
         if (new_args.size() == 3) {
-            return std::make_shared<BasicFusedConvolution<TBaseConvolution>>(new_args.at(0),
-                                                                             new_args.at(1),
-                                                                             new_args.at(2),
-                                                                             TBaseConvolution::m_strides,
-                                                                             TBaseConvolution::m_pads_begin,
-                                                                             TBaseConvolution::m_pads_end,
-                                                                             TBaseConvolution::m_dilations,
-                                                                             TBaseConvolution::m_auto_pad,
-                                                                             activation_);
+            return std::make_shared<BasicFusedConvolution<TBaseConvolution>>(
+                new_args.at(0), new_args.at(1), new_args.at(2),
+                TBaseConvolution::m_strides, TBaseConvolution::m_pads_begin,
+                TBaseConvolution::m_pads_end, TBaseConvolution::m_dilations,
+                TBaseConvolution::m_auto_pad, activation_);
+        } else if (new_args.size() == 5) {
+            // 5-input: conv+bias+silu+skip → silu → add(silu, aux)
+            return std::make_shared<BasicFusedConvolution<TBaseConvolution>>(
+                new_args.at(0), new_args.at(1), new_args.at(2),
+                new_args.at(3), new_args.at(4),
+                TBaseConvolution::m_strides, TBaseConvolution::m_pads_begin,
+                TBaseConvolution::m_pads_end, TBaseConvolution::m_dilations,
+                TBaseConvolution::m_auto_pad, activation_);
         } else {
-            return std::make_shared<BasicFusedConvolution<TBaseConvolution>>(new_args.at(0),
-                                                                             new_args.at(1),
-                                                                             new_args.at(2),
-                                                                             new_args.at(3),
-                                                                             TBaseConvolution::m_strides,
-                                                                             TBaseConvolution::m_pads_begin,
-                                                                             TBaseConvolution::m_pads_end,
-                                                                             TBaseConvolution::m_dilations,
-                                                                             TBaseConvolution::m_auto_pad,
-                                                                             activation_);
+            return std::make_shared<BasicFusedConvolution<TBaseConvolution>>(
+                new_args.at(0), new_args.at(1), new_args.at(2), new_args.at(3),
+                TBaseConvolution::m_strides, TBaseConvolution::m_pads_begin,
+                TBaseConvolution::m_pads_end, TBaseConvolution::m_dilations,
+                TBaseConvolution::m_auto_pad, activation_);
         }
     }
 
@@ -105,7 +125,9 @@ public:
 
     void validate_and_infer_types() override {
         TBaseConvolution::validate_and_infer_types();
-        OPENVINO_ASSERT(TBaseConvolution::get_input_size() == 3 || TBaseConvolution::get_input_size() == 4);
+        OPENVINO_ASSERT(TBaseConvolution::get_input_size() == 3 ||
+                        TBaseConvolution::get_input_size() == 4 ||
+                        TBaseConvolution::get_input_size() == 5);
         const auto& conv_out_shape = TBaseConvolution::get_output_shape(0);
         const auto& element_type = TBaseConvolution::get_output_element_type(0);
 
@@ -125,7 +147,8 @@ public:
         TBaseConvolution::set_output_type(0, element_type, conv_out_shape);
     }
 
-    bool has_add_node() const { return (TBaseConvolution::get_input_size() == 4); }
+    bool has_add_node()      const { return (TBaseConvolution::get_input_size() >= 4); }
+    bool has_silu_add_epilogue() const { return (TBaseConvolution::get_input_size() == 5); }
 
     void set_activation(ActivationMode mode) { activation_ = mode; }
 

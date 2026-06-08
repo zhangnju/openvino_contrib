@@ -5,7 +5,9 @@
 #include "concat.hpp"
 
 #include <fmt/format.h>
+#include <cstring>
 
+#include <hip/hip_runtime.h>
 #include <rocm_operation_registry.hpp>
 #include <openvino/core/except.hpp>
 #include <utility>
@@ -73,6 +75,22 @@ WorkbufferRequest ConcatOp::GetWorkBufferRequest() const { return {{immutableWbS
 void ConcatOp::InitSharedImmutableWorkbuffers(const Buffers& buffers) {
     OPENVINO_ASSERT(buffers.size() == 1, "Node name: ", GetName());
     rocm::DefaultStream::stream().upload(buffers[0], concat_kernel_.value().immutableWbData(), immutableWbSize());
+
+    // Allocate pinned host memory for the input pointer table.
+    // hipHostMalloc gives page-locked memory that is directly visible to the GPU,
+    // enabling H2D transfers that can be captured and replayed in HIP Graphs.
+    if (!pinned_ptr_table_) {
+        auto err = hipHostMalloc(&pinned_ptr_table_, mutableWbSize(), hipHostMallocDefault);
+        if (err != hipSuccess)
+            OPENVINO_THROW("ConcatOp: hipHostMalloc failed: ", hipGetErrorString(err));
+    }
+}
+
+ConcatOp::~ConcatOp() {
+    if (pinned_ptr_table_) {
+        hipHostFree(pinned_ptr_table_);
+        pinned_ptr_table_ = nullptr;
+    }
 }
 
 void ConcatOp::Execute(const InferenceRequestContext& context,
@@ -88,14 +106,21 @@ void ConcatOp::Execute(const InferenceRequestContext& context,
     OPENVINO_ASSERT(workbuffers.immutable_buffers.size() == 1, "Node name: ", GetName());
     OPENVINO_ASSERT(workbuffers.mutable_buffers.size() == 1, "Node name: ", GetName());
 
-    stream.upload(workbuffers.mutable_buffers[0], inputs.data(), mutableWbSize());
+    // Copy current input GPU pointers into the pinned host buffer, then upload.
+    // For static models, input GPU addresses are stable across inferences, so the
+    // HIP Graph captures the H2D with pinned_ptr_table_ as a persistent source.
+    // On graph replay, the same pinned buffer contains the same valid addresses.
+    OPENVINO_ASSERT(pinned_ptr_table_, "ConcatOp: pinned_ptr_table_ not allocated");
+    std::memcpy(pinned_ptr_table_, inputs.data(), mutableWbSize());
+    stream.upload(workbuffers.mutable_buffers[0], pinned_ptr_table_, mutableWbSize());
+
     (*concat_kernel_)(stream.get(),
                       workbuffers.immutable_buffers[0].get(),
                       reinterpret_cast<const void* const*>(workbuffers.mutable_buffers[0].get()),
                       outputs[0].get());
 }
 
-rocmGraphCompatibility ConcatOp::GetrocmGraphCompatibility() const { return rocmGraphCompatibility::NONE; }
+rocmGraphCompatibility ConcatOp::GetrocmGraphCompatibility() const { return rocmGraphCompatibility::FULL; }
 
 OPERATION_REGISTER(ConcatOp, Concat);
 }  // namespace rocm_gpu

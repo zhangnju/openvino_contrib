@@ -112,7 +112,8 @@ public:
      * @param request workbuffer request
      * @returns workbuffer ids
      */
-    WorkbufferIds processWorkbufferRequest(int node_idx, const WorkbufferRequest& request);
+    WorkbufferIds processWorkbufferRequest(int node_idx, const WorkbufferRequest& request,
+                                           int lifespan_extra = 0);
 
     /**
      * @returns sizes of immutable workbuffers
@@ -205,6 +206,45 @@ private:
      * @param node_idx Current node index
      */
     void mergeConcatMutableTensors(const NodePtr& node, int node_idx);
+
+    /**
+     * Zero-copy alias extraction for VariadicSplitAlias nodes.
+     * Makes each output[i] a child TensorID of the input TensorID at the
+     * appropriate channel byte offset — no GPU copy is needed.
+     * Only called when ROCM_ZEROCOPY_SPLIT != "0".
+     * @param node VariadicSplitAlias node (channel-axis, NCHW)
+     * @param node_idx Current node index
+     */
+    void extractSplitAliasTensors(const NodePtr& node, int node_idx);
+
+public:
+    /**
+     * Post-processing: register extra (non-graph-edge) input tensors for specific nodes.
+     * Used to inject the full QKV tensor into attention MatMul nodes so that
+     * RocmAttentionMatMulOp can access the full QKV tensor which is needed
+     * by some attention kernel implementations.
+     *
+     * For each node tagged with rt_info["rocm_attn_qkv_name"], this method finds
+     * the QKV tensor in tensor_names_ and appends its TensorID to the node's
+     * extra_node_inputs_ entry. inputTensorIds() then returns it as an additional
+     * input after the regular inputs.
+     *
+     * Call this AFTER the OperationBuffersExtractor constructor completes (all tensors mapped).
+     * @param ordered_nodes All nodes in topological order (needed to locate QKV).
+     */
+    void registerAttentionExtraInputs(gsl::span<const NodePtr> ordered_nodes);
+
+private:
+    /**
+     * Extra (non-graph-edge) inputs for specific nodes.
+     * Key: node friendly name. Value: additional TensorIDs appended by inputTensorIds().
+     * Used to inject the QKV tensor into attention MatMul ops without changing graph edges.
+     */
+    std::unordered_map<std::string, std::vector<TensorID>> extra_node_inputs_;
+    // extra_node_outputs_: additional output TensorIDs for nodes with pe fusion.
+    // Used to register FGC output as an extra output of AV MatMul, so pe_add
+    // can write the pe+attn result to the FGC buffer (accessible as outputs[1]).
+    std::unordered_map<std::string, std::vector<TensorID>> extra_node_outputs_;
 
     /**
      * Encapsulates immutable tensors extraction for the given node

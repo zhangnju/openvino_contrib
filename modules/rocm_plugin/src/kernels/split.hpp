@@ -34,8 +34,8 @@ public:
     [[nodiscard]] size_t mutableWbSize() const { return sizeof(float*) * num_splits_; }
 
 private:
-    //template <typename T>
     void Call(hipStream_t stream, const float* src, float** dst) const;
+    void Call_fp16(hipStream_t stream, const __half* src, __half** dst) const;
 
     Type_t element_type_{};
     size_t num_splits_{};

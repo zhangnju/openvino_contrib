@@ -6,6 +6,7 @@
 
 #include <miopen/miopen.h>
 
+#include <atomic>
 #include <rocm/device_pointers.hpp>
 #include <rocm_operation_base.hpp>
 #include <kernels/concat.hpp>
@@ -21,6 +22,7 @@ public:
              const NodeOp& node,
              IndexCollection&& inputIds,
              IndexCollection&& outputIds);
+    ~ConcatOp();
     void Execute(const InferenceRequestContext& context,
                  Inputs inputTensors,
                  Outputs outputTensors,
@@ -36,6 +38,11 @@ private:
 
     std::size_t num_inputs_;
     std::optional<kernel::Concat> concat_kernel_;
+    // Pinned host buffer for HIP Graph-compatible pointer table uploads.
+    // Allocated once, filled at Execute time. H2D from pinned memory can be
+    // captured in HIP Graph; the pointer values are stable for static models.
+    mutable void* pinned_ptr_table_ = nullptr;
+    mutable std::atomic<bool> ptr_table_initialized_{false};
 };
 
 }  // namespace rocm_gpu

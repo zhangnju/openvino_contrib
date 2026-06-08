@@ -28,6 +28,7 @@ public:
 
 private:
     std::optional<kernel::Swish> kernel_;
+    size_t tensor_bytes_ = 0;  // byte size of input/output tensor (for SiLU tracking)
 };
 
 }  // namespace rocm_gpu

@@ -14,6 +14,7 @@
 #include "fused_convolution_miopen.hpp"
 #include "fused_convolution_miopen_decomposed.hpp"
 #include "transformer/nodes/activation_type.hpp"
+#include "openvino/op/swish.hpp"
 #ifdef ENABLE_miopen_BACKEND_API
 #include "fused_convolution_miopen_be.hpp"
 #endif  // ENABLE_miopen_BACKEND_API
@@ -21,13 +22,34 @@
 #include "fused_convolution_rocmlir.hpp"
 #endif  // ENABLE_ROCMLIR
 
+#ifdef ENABLE_CK_WMMA
+#include "convolution_ck_wmma.hpp"
+#endif  // ENABLE_CK_WMMA
+
 namespace ov {
 namespace rocm_gpu {
+
+// No-op op: used when a FusedGroupConvolution's computation is already handled
+// by an upstream fused kernel (e.g., pe(V)+attn fusion in AV MatMul).
+class NoOpConvOp : public OperationBase {
+public:
+    NoOpConvOp(const CreationContext& ctx, const ov::Node& node,
+               IndexCollection&& inputs, IndexCollection&& outputs)
+        : OperationBase(ctx, node, std::move(inputs), std::move(outputs)) {}
+
+    void Execute(const InferenceRequestContext&, Inputs, Outputs, const Workbuffers&) const override {}
+    rocmGraphCompatibility GetrocmGraphCompatibility() const override { return rocmGraphCompatibility::FULL; }
+};
 
 OperationBase::Ptr fusedConvolutionFactory(const CreationContext& context,
                                            const std::shared_ptr<ov::Node>& node,
                                            OperationBase::IndexCollection&& inputIds,
                                            OperationBase::IndexCollection&& outputIds) {
+    // If tagged as pe(V) conv (computation handled by AV MatMul fused kernel), return no-op.
+    if (node->get_rt_info().count("rocm_attn_pe_conv")) {
+        return std::make_shared<NoOpConvOp>(context, *node,
+            OperationBase::IndexCollection{inputIds}, OperationBase::IndexCollection{outputIds});
+    }
     using ArgIndices = Convolution::Details::FusedConvolutionIndices;
     using IndexCollection = OperationBase::IndexCollection;
     const auto element_type = node->get_input_element_type(ArgIndices::input);
@@ -43,8 +65,38 @@ OperationBase::Ptr fusedConvolutionFactory(const CreationContext& context,
     const auto fused_group_conv = std::dynamic_pointer_cast<nodes::FusedGroupConvolution>(node);
     OPENVINO_ASSERT(fused_conv || fused_group_conv);
 
-    const auto params = fused_conv ? Convolution::Details::FusedConvolutionParams{*fused_conv}
-                                   : Convolution::Details::FusedConvolutionParams{*fused_group_conv};
+    auto params = fused_conv ? Convolution::Details::FusedConvolutionParams{*fused_conv}
+                            : Convolution::Details::FusedConvolutionParams{*fused_group_conv};
+
+    // Detect downstream Swish pattern: FusedConv → Swish (single consumer, no add).
+    // Override activation to SWISH so FusedConvolutionRocMLIR compiles Conv+Bias+SiLU.
+    // The downstream SwishOp uses thread-local SiLU tracking to become a no-op.
+    // Always enabled when ENABLE_ROCMLIR is set; ROCMLIR_EPILOGUE_FUSION controls
+    // whether MIGraphX-guided compilation is used for the SiLU kernel.
+#ifdef ENABLE_ROCMLIR
+    if (params.activation_ == nodes::ActivationMode::NO_ACTIVATION && !params.add_shape_.has_value()) {
+        // Detect any Swish consumer: FusedConv/FusedGroupConv → ... → Swish.
+        // When any consumer is Swish, compile Conv+Bias+SiLU fused kernel.
+        // The downstream SwishOp uses silu_tracking + in-place buffer to become a no-op.
+        for (const auto& tgt : node->output(0).get_target_inputs()) {
+            if (ov::is_type<ov::op::v4::Swish>(tgt.get_node())) {
+                params.activation_ = nodes::ActivationMode::SWISH;
+                break;
+            }
+        }
+    }
+#endif  // ENABLE_ROCMLIR
+
+    // Priority 0: CK WMMA with auto-profiling vs rocMLIR (RDNA4/gfx12xx + FP16 only)
+    // First Execute: times both kernels and permanently selects the faster one.
+#ifdef ENABLE_CK_WMMA
+    try {
+        return std::make_shared<FusedConvolutionCkWmma>(
+            context, *node, IndexCollection{inputIds}, IndexCollection{outputIds}, params);
+    } catch (const std::exception& e) {
+        exception_msg << fmt::format("FusedConvolutionCkWmma failed: {}", e.what());
+    }
+#endif  // ENABLE_CK_WMMA
 
     // Priority 1: rocMLIR backend (rock.conv → HSACO)
 #ifdef ENABLE_ROCMLIR

@@ -76,6 +76,19 @@ target_link_libraries(${OBJ_NAME}
                       roc::rocblas
                       ${NGRAPH_LIBRARIES}
 )
+
+# CK WMMA: add include path for CK templates (header-only device code)
+if(ENABLE_CK_WMMA)
+    target_include_directories(${OBJ_NAME} SYSTEM PUBLIC "/opt/rocm/include")
+    # Link CK static library containing pre-instantiated conv instances
+    if(TARGET composable_kernel::device_conv_operations)
+        target_link_libraries(${OBJ_NAME} PRIVATE composable_kernel::device_conv_operations)
+    elseif(EXISTS "/opt/rocm/lib/libdevice_conv_operations.a")
+        target_link_libraries(${OBJ_NAME} PRIVATE "/opt/rocm/lib/libdevice_conv_operations.a")
+    endif()
+    # CK requires C++17 (already set above)
+    target_compile_options(${OBJ_NAME} PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-std=c++17>)
+endif()
 #target_compile_features(${OBJ_NAME} PRIVATE cxx_std_11)
 # set_target_properties(${OBJ_NAME} PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELEASE ${ENABLE_LTO})
 

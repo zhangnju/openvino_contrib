@@ -44,6 +44,9 @@
 #include "transformations/op_conversions/hswish_decomposition.hpp"
 #include "transformations/common_optimizations/reshape_prelu.hpp"
 #include "transformer/rocmlir_conv_decompose_transformation.hpp"
+#include "transformer/elementwise_fusion_transformation.hpp"
+#include "transformer/variadic_split_zero_copy.hpp"
+#include "transformer/rocm_attention_fusion.hpp"
 
 using namespace ov::rocm_gpu;
 
@@ -145,14 +148,15 @@ void GraphTransformer::transform(const rocm::Device& device,
                 return is_sequence_primitive_supported(node);
             });
 
-    // rocMLIR K×C group decomposition: converts non-1×1 Convolution into an
-    // equivalent GroupConvolution with G=K*C groups. This avoids a rocMLIR 7.2
-    // bug on gfx950 where large-kernel convolutions with non-zero data produce
-    // GPU memory faults (mirrors MIGraphX's fuse_mlir rock.conv strategy).
-    // Run BEFORE AsymPadding and ConvFusion so those passes see the rewritten ops.
+    // NOTE: RocMLIRConvDecompose (K×C group decomposition) was designed to work around
+    // a MIOpen GemmFwd1x1 bug on gfx950 (CDNA). It converts 3×3 Convolution into
+    // GroupConvolution with G=K*C groups, but this produces shapes with thousands of
+    // groups (e.g. G=18432) that neither rocMLIR nor MIOpen can handle stably.
+    // On gfx1201 (RDNA 4) rocMLIR handles all conv shapes directly — disable these passes.
+    // To re-enable for gfx950 only, guard with: if (device.gcnArch().find("gfx950") != npos)
 #ifdef ENABLE_ROCMLIR
-    pass_manager.register_pass<ov::rocm_gpu::pass::RocMLIRConvDecompose>();
-    pass_manager.register_pass<ov::rocm_gpu::pass::RocMLIRGroupConvDecompose>();
+    // pass_manager.register_pass<ov::rocm_gpu::pass::RocMLIRConvDecompose>();
+    // pass_manager.register_pass<ov::rocm_gpu::pass::RocMLIRGroupConvDecompose>();
 #endif
 
     pass_manager.register_pass<ov::rocm_gpu::pass::ConvolutionAsymPaddingTransformation>();
@@ -167,13 +171,37 @@ void GraphTransformer::transform(const rocm::Device& device,
     pass_manager.register_pass<ov::rocm_gpu::pass::ReduceTransformation>();
     pass_manager.register_pass<ov::rocm_gpu::pass::DetectionOutputFixInputTypesTransformation>();
 
+    // Fuse chains of elementwise ops (Swish, Mul, Add, Sigmoid, etc.) into a single
+    // FusedElementwise kernel launch. Run AFTER conv fusion (which handles Conv+SiLU)
+    // and AFTER NopElimination. The pass eliminates ~150+ individual kernel launches
+    // in yolo26x by reading each intermediate tensor only once.
+    // NOTE: ElementwiseFusionPass correctly handles pe(V) Add nodes (attention pe Add) via
+    // a fixed aux-input calculation for binary-op chain roots.
+    pass_manager.register_pass<ov::rocm_gpu::pass::ElementwiseFusionPass>();
+
+    // Fuse Attention MatMul patterns (Reshape+Split+Transpose+MatMul) via MIGraphX MLIR.
+    // Replaces rocBLAS Q*K^T (0.644ms/iter) with fused kernel (0.020ms/iter) = 32× speedup.
+    // Controlled by ROCM_FUSE_ATTENTION env var (default: enabled on gfx12xx fp16).
+    // pe(V) conv fusion: enabled on gfx1201 (RDNA4) where Form B is verified stable.
+    // gfx1100 (RDNA3): rocMLIR depthwise conv for pe generates MIOpen fallback error on gfx1100,
+    //   so pe fusion is kept disabled until rocMLIR gfx1100 depthwise support is confirmed.
+    // gfx950 (CDNA3/wave64): pe Add absorbed by ElementwiseFusionPass instead.
+    {
+        const std::string arch = device.props().gcnArchName;
+        const bool enable_pe_fusion = arch.find("gfx1201") != std::string::npos;
+        pass_manager.register_pass<ov::rocm_gpu::pass::RocmAttentionFusionPass>(arch, enable_pe_fusion);
+    }
+
+    // Zero-copy VariadicSplit: replace channel-axis VariadicSplit with VariadicSplitAlias.
+    // The memory planner (rocm_op_buffers_extractor) assigns alias outputs as sub-ranges
+    // of the input buffer, eliminating GPU data copies entirely (as MIGraphX does with
+    // its load[offset] mechanism). Enabled when ROCM_ZEROCOPY_SPLIT != "0" (default: on).
+    pass_manager.register_pass<ov::rocm_gpu::pass::VariadicSplitZeroCopyPass>();
+
     // Do we actually need to eliminate broadcast one more time at the end?
     pass_manager.register_pass<ov::pass::NopElimination>();
 
     pass_manager.run_passes(model);
-
-    [[maybe_unused]] const auto& transformedOps = model->get_ordered_ops();
-    [[maybe_unused]] const auto& transformedOpsSize = transformedOps.size();
 
     return;
 }

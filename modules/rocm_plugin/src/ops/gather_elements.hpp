@@ -17,6 +17,9 @@ public:
                      IndexCollection&& inputIds,
                      IndexCollection&& outputIds);
 
+    WorkbufferRequest GetWorkBufferRequest() const override;
+    void InitSharedImmutableWorkbuffers(const Buffers& buffers) override;
+
     void Execute(const InferenceRequestContext& context,
                  Inputs inputTensors,
                  Outputs outputTensors,
@@ -27,6 +30,7 @@ private:
     int32_t axis_;
     int32_t ndim_;
     size_t element_size_;
+    size_t indices_element_size_;
     int64_t total_out_;
     std::vector<int64_t> out_strides_;
     std::vector<int64_t> data_strides_;

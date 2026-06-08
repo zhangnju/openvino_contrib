@@ -3,6 +3,7 @@
 //
 
 #include "softmax.hpp"
+#include "rocm_attention_softmax.hpp"
 
 #include <fmt/format.h>
 
@@ -190,6 +191,35 @@ void SoftmaxOp::Execute(const InferenceRequestContext& context,
 
 rocmGraphCompatibility SoftmaxOp::GetrocmGraphCompatibility() const { return rocmGraphCompatibility::FULL; }
 
-OPERATION_REGISTER(SoftmaxOp, Softmax);
 }  // namespace rocm_gpu
 }  // namespace ov
+
+// Factory for Softmax: use MIGraphX fused kernel for attention-tagged nodes.
+namespace {
+ov::rocm_gpu::OperationBase::Ptr softmaxFactory(
+        const ov::rocm_gpu::CreationContext& context,
+        const std::shared_ptr<ov::Node>& node,
+        ov::rocm_gpu::OperationBase::IndexCollection&& inputIds,
+        ov::rocm_gpu::OperationBase::IndexCollection&& outputIds) {
+    using namespace ov::rocm_gpu;
+    if (RocmAttentionSoftmaxOp::isEnabled() &&
+        node->get_rt_info().count("rocm_attn_softmax")) {
+        try {
+            return std::make_shared<RocmAttentionSoftmaxOp>(
+                context, *node,
+                OperationBase::IndexCollection{inputIds},
+                OperationBase::IndexCollection{outputIds});
+        } catch (const std::exception& e) {
+            std::cerr << "[AttnSoftmax] Fallback to MIOpen: " << e.what() << "\n";
+        }
+    }
+    // SoftmaxOp constructor takes const NodeOp& (v1::Softmax)
+    auto softmax_node = std::dynamic_pointer_cast<ov::op::v1::Softmax>(node);
+    OPENVINO_ASSERT(softmax_node, "softmaxFactory: node is not v1::Softmax");
+    return std::make_shared<SoftmaxOp>(context, *softmax_node, std::move(inputIds), std::move(outputIds));
+}
+}  // namespace
+
+namespace ov { namespace rocm_gpu {
+OPERATION_REGISTER_FACTORY(softmaxFactory, Softmax);
+}}  // namespace ov::rocm_gpu

@@ -233,6 +233,44 @@ void MatMulOp::Execute(const InferenceRequestContext& context,
 
 rocmGraphCompatibility MatMulOp::GetrocmGraphCompatibility() const { return rocmGraphCompatibility::FULL; }
 
-OPERATION_REGISTER(MatMulOp, MatMul);
+// See below (after closing namespace) for the attention-aware factory
+
 }  // namespace rocm_gpu
 }  // namespace ov
+
+// ── Attention-aware MatMul factory (outside namespace) ───────────────────────
+// When ROCM_FUSE_ATTENTION != "0" and a MatMul node has been tagged by
+// RocmAttentionFusionPass (via rt_info["rocm_attn_kind"]), create
+// RocmAttentionMatMulOp instead of standard rocBLAS MatMulOp.
+// Set ROCM_FUSE_ATTENTION=0 to revert to standard rocBLAS (no regression).
+#include "rocm_attention_matmul.hpp"
+namespace {
+ov::rocm_gpu::OperationBase::Ptr matmulAttentionFactory(
+        const ov::rocm_gpu::CreationContext& context,
+        const std::shared_ptr<ov::Node>& node,
+        ov::rocm_gpu::OperationBase::IndexCollection&& inputIds,
+        ov::rocm_gpu::OperationBase::IndexCollection&& outputIds)
+{
+    const auto& rt = node->get_rt_info();
+    if (ov::rocm_gpu::RocmAttentionMatMulOp::isEnabled() && rt.count("rocm_attn_kind")) {
+        try {
+            return std::make_shared<ov::rocm_gpu::RocmAttentionMatMulOp>(
+                context, *node,
+                ov::rocm_gpu::OperationBase::IndexCollection{inputIds},
+                ov::rocm_gpu::OperationBase::IndexCollection{outputIds});
+        } catch (const std::exception& e) {
+            std::cerr << "[AttnFusion] Fallback to rocBLAS MatMul: " << e.what() << "\n";
+        }
+    }
+    // Cast to MatMul to access get_transpose_a/b (required by template)
+    auto matmul_node = std::dynamic_pointer_cast<ov::op::v0::MatMul>(node);
+    OPENVINO_ASSERT(matmul_node, "matmulAttentionFactory: node is not MatMul");
+    return std::make_shared<ov::rocm_gpu::MatMulOp>(
+        context, *matmul_node,
+        ov::rocm_gpu::OperationBase::IndexCollection{inputIds},
+        ov::rocm_gpu::OperationBase::IndexCollection{outputIds});
+}
+}  // anonymous namespace
+namespace ov { namespace rocm_gpu {
+OPERATION_REGISTER_FACTORY(matmulAttentionFactory, MatMul);
+}}  // namespace ov::rocm_gpu

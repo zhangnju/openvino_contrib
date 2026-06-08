@@ -272,6 +272,11 @@ inline constexpr miopenActivationMode_t convertActivationMode(const nodes::Activ
             return miopenActivationCLIPPEDRELU;
         case nodes::ActivationMode::ELU:
             return miopenActivationELU;
+        case nodes::ActivationMode::SWISH:
+            // MIOpen legacy path doesn't support SWISH natively.
+            // Return PASSTHRU so the MIOpen fallback can proceed;
+            // the downstream Swish node handles the activation separately.
+            return miopenActivationPASTHRU;
         case nodes::ActivationMode::NO_ACTIVATION:
             return miopenActivationPASTHRU;
         default:

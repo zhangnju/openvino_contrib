@@ -4,7 +4,11 @@
 #include "fused_convolution_rocmlir.hpp"
 #include "rocm_creation_context.hpp"
 #include "error.hpp"
+#include "ops/silu_tracking.hpp"
+#include "transformer/nodes/fused_convolution_slice.hpp"
+#include "transformer/nodes/fused_convolution_slice_out.hpp"
 #include <mutex>
+#include <sstream>
 #include "ops/converters.hpp"
 #include "ops/convolution_components/convolution_miopen_components.hpp"
 #include "kernels/bias_add.hpp"
@@ -68,25 +72,239 @@ FusedConvolutionRocMLIR::FusedConvolutionRocMLIR(
     activation_  = params.activation_;
     has_add_     = params.add_shape_.has_value();
 
-    std::cerr << "[RocMLIR-Fused-CTOR] " << node.get_friendly_name()
-              << " N=" << conv_params_.N << " C=" << conv_params_.C
-              << " H=" << conv_params_.H << " W=" << conv_params_.W
-              << " K=" << conv_params_.K << " R=" << conv_params_.R
-              << " S=" << conv_params_.S << " G=" << conv_params_.groups
-              << " pad=" << conv_params_.pad_h << "," << conv_params_.pad_w
-              << " stride=" << conv_params_.stride_h << "," << conv_params_.stride_w
-              << " fp16=" << conv_params_.fp16 << std::endl;
+    // Check if this is a FusedConvolutionSlice node (input-side slice)
+    if (const auto* slice_node = dynamic_cast<const nodes::FusedConvolutionSlice*>(&node)) {
+        conv_params_.c_start = slice_node->get_c_start();
+        const auto& in_shape = node.get_input_shape(0);
+        conv_params_.C_full  = static_cast<int>(in_shape[1]);
+    } else {
+        const auto& rt_info = node.get_rt_info();
+        auto it_cstart = rt_info.find("rocmlir_slice_c_start");
+        auto it_cfull  = rt_info.find("rocmlir_slice_c_full");
+        if (it_cstart != rt_info.end() && it_cfull != rt_info.end()) {
+            conv_params_.c_start = std::stoi(it_cstart->second.as<std::string>());
+            conv_params_.C_full  = std::stoi(it_cfull->second.as<std::string>());
+        }
+    }
+    const bool has_input_slice = (conv_params_.C_full > 0 && conv_params_.C_full != conv_params_.C);
 
-    // Compile (or reuse cached) rocMLIR kernel based on activation type
-    if (activation_ == nodes::ActivationMode::NO_ACTIVATION) {
+    // Check if this is a FusedConvolutionSliceOut node (output-side slice + SiLU + skip-add)
+    int slice_out_k_full = 0, slice_out_c_start = 0, slice_out_c_end = 0;
+    if (const auto* sout = dynamic_cast<const nodes::FusedConvolutionSliceOut*>(&node)) {
+        slice_out_k_full  = static_cast<int>(node.get_input_shape(1)[0]); // K_full from filter
+        slice_out_c_start = sout->get_c_out_start();
+        slice_out_c_end   = sout->get_c_out_end();
+    } else {
+        const auto& rt_info = node.get_rt_info();
+        auto it_kfull = rt_info.find("rocmlir_slice_out_k_full");
+        auto it_cst   = rt_info.find("rocmlir_slice_out_c_start");
+        auto it_cen   = rt_info.find("rocmlir_slice_out_c_end");
+        if (it_kfull != rt_info.end() && it_cst != rt_info.end() && it_cen != rt_info.end()) {
+            slice_out_k_full  = std::stoi(it_kfull->second.as<std::string>());
+            slice_out_c_start = std::stoi(it_cst->second.as<std::string>());
+            slice_out_c_end   = std::stoi(it_cen->second.as<std::string>());
+        }
+    }
+    const bool has_output_slice = (slice_out_k_full > 0);
+
+    // Detect 5-input FusedConvolution node: conv+bias+silu+skip → silu(out) → add(silu, aux)
+    // Created by MarkSwishAddEpiloguePass when FC has single-consumer Swish.
+    // Uses 6-arg migraphx kernel: mlir_convolution_broadcast_add_sigmoid_mul_add_sigmoid_mul_add
+    const bool has_silu_add_epilogue = (node.get_input_size() == 5);
+    has_silu_add_epilogue_ = has_silu_add_epilogue;
+
+    // Detect conv+bias+reshape pattern (MIGraphX mlir_convolution_broadcast_add_reshape).
+    // Tagged by MarkConvReshapeEpiloguePass when FC(bias) → Reshape (single consumer).
+    // compile a 3-arg migraphx kernel that includes reshape as zero-cost epilogue.
+    {
+        const auto& rt = node.get_rt_info();
+        auto it = rt.find("rocm_conv_reshape_dims");
+        if (it != rt.end() && (std::getenv("ROCMLIR_CONV_RESHAPE_FUSION") || std::getenv("ROCMLIR_EPILOGUE_FUSION"))) {
+            const std::string dims_str = it->second.as<std::string>();
+            // Parse dims string e.g. "1,4,6400"
+            std::vector<int> reshape_dims;
+            std::istringstream ss(dims_str);
+            std::string tok;
+            while (std::getline(ss, tok, ','))
+                reshape_dims.push_back(std::stoi(tok));
+
+            static std::unordered_map<size_t, rocmlir::KernelEntry> reshape_cache_;
+            static std::mutex reshape_mu_;
+            size_t rkey = conv_params_.hash();
+            for (int d : reshape_dims) rkey ^= std::hash<int>{}(d) + 0x9e3779b9 + (rkey << 6) + (rkey >> 2);
+            {
+                std::lock_guard<std::mutex> lk(reshape_mu_);
+                auto it2 = reshape_cache_.find(rkey);
+                if (it2 != reshape_cache_.end()) {
+                    kernel_ = &it2->second;
+                } else {
+                    auto compiled = rocmlir::compile_conv_migraphx_reshape(conv_params_, reshape_dims);
+                    hipModule_t mod; hipFunction_t fn;
+                    hipModuleLoadData(&mod, compiled.hsaco.data());
+                    hipModuleGetFunction(&fn, mod, compiled.kernel_name.c_str());
+                    rocmlir::KernelEntry entry;
+                    entry.module = mod; entry.function = fn;
+                    entry.info = std::move(compiled); entry.params = conv_params_;
+                    auto& stored = reshape_cache_[rkey] = std::move(entry);
+                    kernel_ = &stored;
+                    std::cerr << "[ConvReshapeKernel] grid=" << kernel_->info.grid_x
+                              << " block=" << kernel_->info.block_x << "\n";
+                }
+            }
+            // This kernel outputs reshaped data; no separate SiLU/bias needed
+            conv_reshape_epilogue_ = true;
+            return;  // kernel_ is set; skip standard selection below
+        }
+    }
+
+    // Compile (or reuse cached) rocMLIR kernel based on activation type.
+    // Priority:
+    //   5-input epilogue  → 6-arg Conv+Bias+SiLU+Skip+SiLU+Aux kernel (migraphx dialect)
+    //   output-slice      → Conv+Bias+SliceOut+SiLU+Add (5-arg)
+    //   input-slice+SWISH → Slice+Conv+Bias+SiLU fused kernel (rocmlir-gen + v3 tuning)
+    //   SWISH + skip-add  → 5-arg Conv+Bias+SiLU+SkipAdd fused kernel
+    //   SWISH only        → 4-arg Conv+Bias+SiLU fused kernel
+    //   no activation     → 4-arg Conv+Bias kernel
+    if (has_silu_add_epilogue) {
+        // 6-arg migraphx kernel: compile via ROCMLIR_EPILOGUE_FUSION pipeline
+        static std::unordered_map<size_t, rocmlir::KernelEntry> silu_add_cache_;
+        static std::mutex silu_add_mu_;
+        const size_t key = conv_params_.hash() ^ static_cast<size_t>(0xEEFF12345678ULL);
+        {
+            std::lock_guard<std::mutex> lk(silu_add_mu_);
+            auto it = silu_add_cache_.find(key);
+            if (it != silu_add_cache_.end()) {
+                kernel_ = &it->second;
+            } else {
+                // with_skip=true, with_silu_add=true → 6-arg kernel
+                auto compiled = rocmlir::compile_conv_migraphx(conv_params_, "",
+                    /*with_skip=*/true, /*with_silu_add=*/true);
+                compiled.bias_fused     = true;
+                compiled.silu_fused     = true;
+                compiled.skip_add_fused = true;
+                hipModule_t mod; hipFunction_t fn;
+                hipModuleLoadData(&mod, compiled.hsaco.data());
+                hipModuleGetFunction(&fn, mod, compiled.kernel_name.c_str());
+                rocmlir::KernelEntry entry;
+                entry.module = mod; entry.function = fn;
+                entry.info = std::move(compiled); entry.params = conv_params_;
+                auto& stored = silu_add_cache_[key] = std::move(entry);
+                kernel_ = &stored;
+                std::cerr << "[SiLUAddEpilogue] Compiled 6-arg kernel '"
+                          << kernel_->info.kernel_name << "' grid="
+                          << kernel_->info.grid_x << " block=" << kernel_->info.block_x << "\n";
+            }
+        }
+    } else if (has_output_slice) {
+        // Use the slice-out-silu-add cache (need a custom cache entry)
+        // For now compile directly and cache with unique key via conv_params modification
+        // Store slice-out params in conv_params_ extra fields for the kernel cache
+        // We reuse C_full/c_start to encode K_full/c_out_start; the cache key hash includes them
+        rocmlir::ConvParams slice_out_params = conv_params_;
+        slice_out_params.C_full  = slice_out_k_full;
+        slice_out_params.c_start = slice_out_c_start;
+        // The kernel will be compiled with output slice, but kernel cache uses this params hash
+        static std::unordered_map<size_t, rocmlir::KernelEntry> slice_out_cache_;
+        static std::mutex slice_out_mu_;
+        const size_t key = slice_out_params.hash()
+            ^ static_cast<size_t>(0xCCC7DDDEEE8FULL)
+            ^ (static_cast<size_t>(slice_out_c_end) << 8);
+        {
+            std::lock_guard<std::mutex> lk(slice_out_mu_);
+            auto it = slice_out_cache_.find(key);
+            if (it != slice_out_cache_.end()) {
+                kernel_ = &it->second;
+            } else {
+                auto compiled = rocmlir::compile_conv_slice_out_silu_add(
+                    conv_params_, slice_out_k_full, slice_out_c_start, slice_out_c_end);
+                hipModule_t mod; hipFunction_t fn;
+                hipModuleLoadData(&mod, compiled.hsaco.data());
+                hipModuleGetFunction(&fn, mod, compiled.kernel_name.c_str());
+                rocmlir::KernelEntry entry;
+                entry.module = mod; entry.function = fn;
+                entry.info = std::move(compiled); entry.params = conv_params_;
+                auto& stored = slice_out_cache_[key];
+                stored = std::move(entry);
+                kernel_ = &stored;
+            }
+        }
+    } else if (has_input_slice && activation_ == nodes::ActivationMode::SWISH) {
+        kernel_ = &rocmlir::RocMLIRKernelCache::global()
+                       .get_or_compile_slice_conv_bias_silu(conv_params_);
+    } else if (has_input_slice) {
+        // Input slice but no SiLU - plain slice+bias kernel
+        kernel_ = &rocmlir::RocMLIRKernelCache::global()
+                       .get_or_compile_slice_conv_bias_silu(conv_params_);  // will use NO_ACTIVATION
+    } else if (activation_ == nodes::ActivationMode::SWISH && has_add_) {
+        // Check if migraphx dialect is requested (experimental: may differ from tuned v3:)
+        static const bool use_epilogue_fusion = []{ const char* e = std::getenv("ROCMLIR_EPILOGUE_FUSION"); return e && std::string(e)=="1"; }();
+        if (use_epilogue_fusion) {
+            // migraphx dialect: conv+bias+silu+skip_add in one kernel (5 args)
+            auto compiled = rocmlir::compile_conv_migraphx(conv_params_, "", /*with_skip=*/true);
+            auto& stored = rocmlir::RocMLIRKernelCache::global()
+                               .insert_migraphx_silu_add(conv_params_, std::move(compiled));
+            kernel_ = &stored;
+        } else {
+        kernel_ = &rocmlir::RocMLIRKernelCache::global()
+                       .get_or_compile_fused_bias_silu_add(conv_params_);
+        }
+    } else if (activation_ == nodes::ActivationMode::SWISH) {
+        static const bool use_epilogue_fusion2 = []{ const char* e = std::getenv("ROCMLIR_EPILOGUE_FUSION"); return e && std::string(e)=="1"; }();
+        if (use_epilogue_fusion2) {
+            // migraphx dialect: conv+bias+silu in one kernel (4 args)
+            auto compiled = rocmlir::compile_conv_migraphx(conv_params_, "", /*with_skip=*/false);
+            auto& stored = rocmlir::RocMLIRKernelCache::global()
+                               .insert_migraphx_silu(conv_params_, std::move(compiled));
+            kernel_ = &stored;
+        } else {
+        kernel_ = &rocmlir::RocMLIRKernelCache::global()
+                       .get_or_compile_fused_bias_act(conv_params_, rocmlir::Activation::Sigmoid);
+        }
+    } else if (activation_ == nodes::ActivationMode::NO_ACTIVATION && has_add_) {
+        // Conv+Bias+SkipAdd (no SiLU): matches MIGraphX mlir_convolution_broadcast_add_add.
+        // Use migraphx kernel when ROCMLIR_EPILOGUE_FUSION=1 or ROCMLIR_CONV_SKIP_FUSION=1.
+        static const bool fuse_skip = []{
+            return std::getenv("ROCMLIR_EPILOGUE_FUSION") ||
+                   std::getenv("ROCMLIR_CONV_SKIP_FUSION");
+        }();
+        if (fuse_skip) {
+            static std::unordered_map<size_t, rocmlir::KernelEntry> skip_cache_;
+            static std::mutex skip_mu_;
+            const size_t key = conv_params_.hash() ^ static_cast<size_t>(0xABCD1234ABCDULL);
+            {
+                std::lock_guard<std::mutex> lk(skip_mu_);
+                auto it = skip_cache_.find(key);
+                if (it != skip_cache_.end()) {
+                    kernel_ = &it->second;
+                } else {
+                    auto compiled = rocmlir::compile_conv_migraphx_skip(conv_params_);
+                    hipModule_t mod; hipFunction_t fn;
+                    hipModuleLoadData(&mod, compiled.hsaco.data());
+                    hipModuleGetFunction(&fn, mod, compiled.kernel_name.c_str());
+                    rocmlir::KernelEntry entry;
+                    entry.module = mod; entry.function = fn;
+                    entry.info = std::move(compiled); entry.params = conv_params_;
+                    auto& stored = skip_cache_[key] = std::move(entry);
+                    kernel_ = &stored;
+                }
+            }
+        } else {
+            kernel_ = &rocmlir::RocMLIRKernelCache::global()
+                           .get_or_compile_fused_bias(conv_params_);
+        }
+    } else {
         kernel_ = &rocmlir::RocMLIRKernelCache::global()
                        .get_or_compile_fused_bias(conv_params_);
-    } else {
-        rocmlir::Activation act = rocmlir::Activation::None;
-        if (activation_ == nodes::ActivationMode::RELU)    act = rocmlir::Activation::ReLU;
-        if (activation_ == nodes::ActivationMode::SIGMOID) act = rocmlir::Activation::Sigmoid;
-        kernel_ = &rocmlir::RocMLIRKernelCache::global()
-                       .get_or_compile_fused_bias_act(conv_params_, act);
+    }
+
+    // Pre-initialize standalone Swish kernel for fallback (when SiLU not fused in kernel).
+    // Not needed when skip_add_fused=true (5-arg kernel handles SiLU internally).
+    if (activation_ == nodes::ActivationMode::SWISH && !has_add_) {
+        const size_t n_out = (size_t)conv_params_.N * conv_params_.K *
+                             conv_params_.out_h() * conv_params_.out_w();
+        const auto el_type = (params.conv_.element_type_ == ov::element::Type_t::f16) ?
+                             kernel::Type_t::f16 : kernel::Type_t::f32;
+        swish_kernel_.emplace(el_type, ctx.device().props().maxThreadsPerBlock, n_out, 1.0);
     }
 
     // Build bias descriptor (shape: 1×K×1×1)
@@ -103,8 +321,10 @@ FusedConvolutionRocMLIR::FusedConvolutionRocMLIR(
                          *params.add_shape_, params.conv_.element_type_);
     }
 
-    // Optional: activation descriptor
-    if (activation_ != nodes::ActivationMode::NO_ACTIVATION) {
+    // Optional: activation descriptor (only for MIOpen-supported activations)
+    // SWISH is handled separately via SwishOpImpl kernel (not MIOpen), so skip it here.
+    if (activation_ != nodes::ActivationMode::NO_ACTIVATION &&
+        activation_ != nodes::ActivationMode::SWISH) {
         activation_desc_ = rocm::DnnActivationDescriptor{};
         activation_desc_->set(convertActivationMode(activation_), 0.0, 0.0, 0.0);
     }
@@ -128,42 +348,123 @@ void FusedConvolutionRocMLIR::Execute(const InferenceRequestContext& ctx,
     void* d_output = outputs[Idx::output].get();
     void* d_ws     = wbs.mutable_buffers.empty() ? nullptr : wbs.mutable_buffers[0].get();
 
-    // ── Step 1: rocMLIR convolution kernel ───────────────────────────────────
-    {
-        // rocmlir-gen kernel arg order: filter, input, output [, workspace]
-        // rocmlir-gen arg order: filter, input, output
-        void* args[] = { &d_filter, &d_input, &d_output, &d_ws };
-        const auto& info = kernel_->info;
+    const auto& info = kernel_->info;
 
-        static std::once_flag first_fused;
-        std::call_once(first_fused, [&] {
-            std::cerr << "[RocMLIR-Fused] " << GetName()
-                      << " grid=" << info.grid_x << " block=" << info.block_x
-                      << " ws=" << info.workspace_bytes
-                      << " has_add=" << has_add_
-                      << " act=" << static_cast<int>(activation_) << std::endl;
-        });
+    // For input-slice kernels that do NOT contain a Slice op in the MLIR
+    // (fallback v3 kernels), apply the channel offset manually.
+    // The kernel was compiled for [N, C_slice, H, W] input, but d_input points
+    // to the full [N, C_full, H, W] tensor. We compute the byte offset for
+    // c_start channels and pass the adjusted pointer.
+    // Condition: has_input_slice AND kernel uses standard (non-slice) MLIR.
+    if (conv_params_.C_full > 0 && conv_params_.c_start > 0 &&
+        info.kernel_name.find("slice_conv") == std::string::npos &&
+        info.kernel_name.find("mlir_slice") == std::string::npos) {
+        const size_t elem_size = conv_params_.fp16 ? 2 : 4;
+        const size_t channel_stride = (size_t)conv_params_.H * conv_params_.W;
+        const size_t byte_offset = (size_t)conv_params_.c_start * channel_stride * elem_size;
+        d_input = static_cast<char*>(d_input) + byte_offset;
+    }
 
+    // ── Conv+Bias+Reshape kernel (3-arg migraphx): Q/K/V attention projection ──
+    // mlir_convolution_broadcast_add_reshape: writes reshaped output directly from conv.
+    // No separate SiLU or bias step; kernel writes to reshaped output layout.
+    if (conv_reshape_epilogue_) {
+        // 3-arg: (input, filter, bias) → reshaped_output
+        // MIGraphX convention: input, filter, bias, output (legacy ordering)
+        void* args3[] = { &d_input, &d_filter, &d_bias, &d_output };
+        hipError_t err = hipModuleLaunchKernel(
+            kernel_->function,
+            info.grid_x, 1, 1, info.block_x, 1, 1,
+            0, ctx.getThreadContext().stream().get(),
+            args3, nullptr);
+        if (err != hipSuccess)
+            throw_ov_exception(fmt::format("FusedConvRocMLIR conv+bias+reshape launch failed: {}",
+                                           hipGetErrorString(err)));
+        return;
+    }
+
+    // ── 6-arg epilogue kernel: Conv+Bias+SiLU+Skip → SiLU(out) → Add(silu, aux) ──
+    // Used for 5-input FusedConvolution created by MarkSwishAddEpiloguePass.
+    // Arg order (migraphx convention): input, filter, bias, skip, aux_silu, output
+    if (has_silu_add_epilogue_ && inputs.size() > Idx::aux_silu) {
+        void* d_skip = const_cast<void*>(inputs[Idx::add].get());
+        void* d_aux  = const_cast<void*>(inputs[Idx::aux_silu].get());
+        // migraphx 6-arg: (input, filter, bias, skip, aux, output)
+        void* args6[] = { &d_input, &d_filter, &d_bias, &d_skip, &d_aux, &d_output };
+        hipError_t err = hipModuleLaunchKernel(
+            kernel_->function,
+            info.grid_x, 1, 1, info.block_x, 1, 1,
+            0, ctx.getThreadContext().stream().get(),
+            args6, nullptr);
+        if (err != hipSuccess)
+            throw_ov_exception(fmt::format("FusedConvRocMLIR 6arg-silu-add-silu-add launch failed: {}",
+                                           hipGetErrorString(err)));
+        // Output = final result after outer silu+add; no further SiLU needed
+        return;
+    }
+
+    // For FusedConvolutionSliceOut: has_add_=true (set by factory via add_shape_) AND input[3]=skip
+    if (info.bias_fused && info.skip_add_fused && inputs.size() > Idx::add) {
+        // ── 5-arg fused kernel: Conv+Bias+(Slice)+SiLU+SkipAdd ───────────────
+        // Arg order: filter, input, bias, skip, output (rocMLIR patched kernel convention)
+        // Legacy format (mlir_convolution_broadcast_*): input, filter, bias, skip, output
+        void* d_add = const_cast<void*>(inputs[Idx::add].get());
+        const bool legacy_arg_order = info.kernel_name.find("mlir_convolution") != std::string::npos;
+        void* args5_legacy[]  = { &d_input, &d_filter, &d_bias, &d_add, &d_output };
+        void* args5_patched[] = { &d_filter, &d_input,  &d_bias, &d_add, &d_output };
+        void** args5 = legacy_arg_order
+            ? reinterpret_cast<void**>(args5_legacy)
+            : reinterpret_cast<void**>(args5_patched);
+        hipError_t err = hipModuleLaunchKernel(
+            kernel_->function,
+            info.grid_x, 1, 1, info.block_x, 1, 1,
+            0, ctx.getThreadContext().stream().get(),
+            args5, nullptr);
+        if (err != hipSuccess)
+            throw_ov_exception(fmt::format("FusedConvRocMLIR 5arg-silu-add launch failed: {}",
+                                           hipGetErrorString(err)));
+        // SiLU is fused; mark so downstream SwishOp becomes no-op
+        mark_silu_applied(d_output);
+
+    } else if (info.bias_fused) {
+        // ── 4-arg fused kernel: Conv+Bias (+SiLU) ────────────────────────────
+        // Arg order: filter, input, bias, output (rocMLIR patched kernel convention)
+        // Legacy format (mlir_convolution_broadcast_*): input, filter, bias, output
+        void* args_legacy[]  = { &d_input,  &d_filter, &d_bias, &d_output };
+        void* args_patched[] = { &d_filter, &d_input,  &d_bias, &d_output };
+        const bool legacy_arg_order2 =
+            info.kernel_name.find("mlir_convolution") != std::string::npos;
+        void** args = legacy_arg_order2
+            ? reinterpret_cast<void**>(args_legacy)
+            : reinterpret_cast<void**>(args_patched);
         hipError_t err = hipModuleLaunchKernel(
             kernel_->function,
             info.grid_x, 1, 1, info.block_x, 1, 1,
             0, ctx.getThreadContext().stream().get(),
             args, nullptr);
         if (err != hipSuccess)
-            throw_ov_exception(fmt::format("FusedConvolutionRocMLIR conv launch failed: {}",
+            throw_ov_exception(fmt::format("FusedConvRocMLIR {}-fused launch failed: {}",
+                                           info.kernel_name.substr(0, 20),
                                            hipGetErrorString(err)));
-    }
-
-    // ── Step 2: bias add via custom HIP kernel ───────────────────────────────
-    // Synchronize to catch async GPU errors from the conv kernel
-    {
-        hipError_t sync_err = hipDeviceSynchronize();
-        if (sync_err != hipSuccess) {
-            throw_ov_exception(fmt::format("FusedConvolutionRocMLIR: conv kernel error: {}",
-                                           hipGetErrorString(sync_err)));
+        // bias_add already done by kernel; SiLU too if silu_fused
+        // Mark this output buffer so downstream SwishOp can skip its execution
+        if (info.silu_fused) {
+            mark_silu_applied(d_output);
         }
-    }
-    {
+    } else {
+        // ── Plain conv (3 args), then separate bias_add ────────────────────────
+        {
+            void* args[] = { &d_filter, &d_input, &d_output, &d_ws };
+            (void)d_ws;
+            hipError_t err = hipModuleLaunchKernel(
+                kernel_->function,
+                info.grid_x, 1, 1, info.block_x, 1, 1,
+                0, ctx.getThreadContext().stream().get(),
+                args, nullptr);
+            if (err != hipSuccess)
+                throw_ov_exception(fmt::format("FusedConvolutionRocMLIR conv launch failed: {}",
+                                               hipGetErrorString(err)));
+        }
         kernel::launch_bias_add(d_output, d_bias,
                                 conv_params_.N, conv_params_.K,
                                 conv_params_.out_h(), conv_params_.out_w(),
@@ -171,10 +472,9 @@ void FusedConvolutionRocMLIR::Execute(const InferenceRequestContext& ctx,
                                 ctx.getThreadContext().stream().get());
     }
 
-    // ── Step 3: optional skip-connection add (same shape, element-wise) ──────
-    if (has_add_ && inputs.size() > Idx::add) {
+    // ── Step 3: optional skip-connection add (only when NOT fused into kernel) ─
+    if (has_add_ && !info.skip_add_fused && inputs.size() > Idx::add) {
         void* d_add = const_cast<void*>(inputs[Idx::add].get());
-        // Use bias_add kernel with K=total elements, N=H=W=1 to do flat add
         const int total = conv_params_.N * conv_params_.K *
                           conv_params_.out_h() * conv_params_.out_w();
         kernel::launch_bias_add(d_output, d_add,
@@ -183,15 +483,11 @@ void FusedConvolutionRocMLIR::Execute(const InferenceRequestContext& ctx,
                                 ctx.getThreadContext().stream().get());
     }
 
-    // ── Step 4: optional activation via existing elementwise kernel ───────────
-    // Use existing abs/sigmoid HIP kernels or simply skip (for SiLU = Sigmoid*input,
-    // the rocm plugin applies this post-activation at a higher level).
-    // For now: only RELU and SIGMOID are wired; others are identity.
-    if (activation_ != nodes::ActivationMode::NO_ACTIVATION) {
-        // Inline elementwise: reuse existing rocm_plugin kernels via the stream
-        // (sigmoid/relu are already implemented as elementwise ops in the plugin)
-        // TODO: call ov::rocm_gpu::kernel::... directly here
-        // For now, skip to avoid MIOpen calls that fail under FIND_ONLY_SOLVER.
+    // ── Step 4: activation ────────────────────────────────────────────────────
+    // Swish is applied by the fused kernel (if silu_fused) or separately here.
+    if (activation_ == nodes::ActivationMode::SWISH &&
+        swish_kernel_.has_value() && !info.silu_fused) {
+        (*swish_kernel_)(ctx.getThreadContext().stream().get(), d_output, d_output);
     }
 }
 

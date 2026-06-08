@@ -3,7 +3,9 @@
 //
 
 #include "swish.hpp"
+#include "silu_tracking.hpp"
 
+#include <hip/hip_runtime.h>
 #include <rocm_operation_registry.hpp>
 #include <openvino/core/except.hpp>
 #include <openvino/op/constant.hpp>
@@ -56,6 +58,7 @@ SwishOp::SwishOp(const CreationContext& context,
     const double beta = beta_from_constant(node);
     kernel_ = kernel::Swish{
         convertDataType<ov::rocm_gpu::kernel::Type_t>(input_element_type), max_threads_per_block, num_elements, beta};
+    tensor_bytes_ = num_elements * input_element_type.size();
 }
 
 void SwishOp::Execute(const InferenceRequestContext& context,
@@ -65,8 +68,26 @@ void SwishOp::Execute(const InferenceRequestContext& context,
     OPENVINO_ASSERT(kernel_, "Node name: ", GetName());
     OPENVINO_ASSERT(inputTensors.size() >= 1, "Node name: ", GetName());
     OPENVINO_ASSERT(outputTensors.size() == 1, "Node name: ", GetName());
+
+    const void* in_ptr  = inputTensors[0].get();
+    void*       out_ptr = outputTensors[0].get();
+
+    // Check if the preceding FusedConvolutionRocMLIR already applied SiLU in its kernel.
+    // In that case, the input buffer already contains the correct SiLU-activated values.
+    if (is_silu_applied(in_ptr)) {
+        clear_silu_mark(in_ptr);
+        // If buffers are the same (in-place Swish), complete no-op — SiLU values already there.
+        // If different buffers, need D2D copy (original behavior).
+        if (in_ptr != out_ptr) {
+            hipMemcpyAsync(out_ptr, in_ptr, tensor_bytes_,
+                           hipMemcpyDeviceToDevice,
+                           context.getThreadContext().stream().get());
+        }
+        return;
+    }
+
     const auto& stream = context.getThreadContext().stream();
-    (*kernel_)(stream.get(), inputTensors[0].get(), outputTensors[0].get());
+    (*kernel_)(stream.get(), in_ptr, out_ptr);
 }
 
 rocmGraphCompatibility SwishOp::GetrocmGraphCompatibility() const { return rocmGraphCompatibility::FULL; }

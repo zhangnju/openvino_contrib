@@ -30,25 +30,15 @@ static OperationBase::Ptr clampFactory(const CreationContext& context,
 
     std::stringstream exception_msg;
     try {
+        return std::make_shared<ClamprocmOp>(context, node_op, IndexCollection{inputIds}, IndexCollection{outputIds});
+    } catch (const std::exception& e) {
+        exception_msg << "Failed to create ClamprocmOp implementation: " << e.what();
+    }
+    try {
         return std::make_shared<ClippedRelumiopenOp>(
             context, node_op, IndexCollection{inputIds}, IndexCollection{outputIds});
     } catch (const std::exception& e) {
-        exception_msg << "Failed to create ClippedRelumiopenOp implementation: " << e.what();
-    }
-    // TODO: ClampmiopenOp is disabled now due to performance lower then both, ClippedRelumiopenOp and ClamprocmOp
-    // versions (rocm 11.2 + miopen 8.1.0).
-    // It may be enabled in the future if becomes faster in a newer miopen version
-    //
-    // try {
-    //     return std::make_shared<ClampmiopenOp>(context, node_op, IndexCollection{inputIds},
-    //     IndexCollection{outputIds});
-    // } catch (const std::exception& e) {
-    //     exception_msg << "\nFailed to create ClampmiopenOp implementation: " << e.what();
-    // }
-    try {
-        return std::make_shared<ClamprocmOp>(context, node_op, IndexCollection{inputIds}, IndexCollection{outputIds});
-    } catch (const std::exception& e) {
-        exception_msg << "\nFailed to create ClamprocmOp implementation: " << e.what();
+        exception_msg << "\nFailed to create ClippedRelumiopenOp implementation: " << e.what();
     }
     throw_ov_exception(fmt::format("Clamp node is not supported:\n{}", exception_msg.str()));
 }

@@ -49,11 +49,17 @@ const KernelEntry& RocMLIRKernelCache::get_or_compile(const ConvParams& p,
     const size_t key = p.hash();
     std::lock_guard<std::mutex> lk(mu_);
     auto it = cache_.find(key);
-    if (it != cache_.end()) return it->second;
+    // Return cached entry only if valid AND matches params (guards against hash collision)
+    if (it != cache_.end() && it->second && it->second->function != nullptr
+            && it->second->params == p)
+        return *it->second;
 
-    auto& entry = cache_[key];
-    entry = load_kernel(compile_conv(p, driver));
-    return entry;
+    // Compile. May throw — unique_ptr prevents leaving a broken entry in the map.
+    auto entry = std::make_unique<KernelEntry>(load_kernel(compile_conv(p, driver)));
+    entry->params = p;
+    KernelEntry* ptr = entry.get();
+    cache_[key] = std::move(entry);  // pointer to heap object stays stable after rehash
+    return *ptr;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -65,11 +71,15 @@ const KernelEntry& RocMLIRKernelCache::get_or_compile_fused_bias(
     const size_t key = p.hash() ^ static_cast<size_t>(0xB1a51ULL);
     std::lock_guard<std::mutex> lk(mu_);
     auto it = fused_bias_cache_.find(key);
-    if (it != fused_bias_cache_.end()) return it->second;
+    if (it != fused_bias_cache_.end() && it->second && it->second->function != nullptr
+            && it->second->params == p)
+        return *it->second;
 
-    auto& entry = fused_bias_cache_[key];
-    entry = load_kernel(compile_fused_conv_bias(p, driver));
-    return entry;
+    auto entry = std::make_unique<KernelEntry>(load_kernel(compile_fused_conv_bias(p, driver)));
+    entry->params = p;
+    KernelEntry* ptr = entry.get();
+    fused_bias_cache_[key] = std::move(entry);
+    return *ptr;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -84,23 +94,114 @@ const KernelEntry& RocMLIRKernelCache::get_or_compile_fused_bias_act(
     const size_t key = p.hash();
     std::lock_guard<std::mutex> lk(mu_);
     auto it = target_cache->find(key);
-    if (it != target_cache->end()) return it->second;
+    if (it != target_cache->end() && it->second && it->second->function != nullptr
+            && it->second->params == p)
+        return *it->second;
 
-    auto& entry = (*target_cache)[key];
-    entry = load_kernel(compile_fused_conv_bias_act(p, act, driver));
-    return entry;
+    auto entry = std::make_unique<KernelEntry>(load_kernel(compile_fused_conv_bias_act(p, act, driver)));
+    entry->params = p;
+    KernelEntry* ptr = entry.get();
+    (*target_cache)[key] = std::move(entry);
+    return *ptr;
+}
+
+const KernelEntry& RocMLIRKernelCache::get_or_compile_fused_bias_silu_add(
+        const ConvParams& p, const std::string& driver) {
+    const size_t key = p.hash() ^ static_cast<size_t>(0xA7D3C2B1E0F5ULL);
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = fused_bias_silu_add_cache_.find(key);
+    if (it != fused_bias_silu_add_cache_.end() && it->second && it->second->function != nullptr
+            && it->second->params == p)
+        return *it->second;
+
+    auto entry = std::make_unique<KernelEntry>(
+        load_kernel(compile_fused_conv_bias_silu_add(p, driver)));
+    entry->params = p;
+    KernelEntry* ptr = entry.get();
+    fused_bias_silu_add_cache_[key] = std::move(entry);
+    return *ptr;
+}
+
+const KernelEntry& RocMLIRKernelCache::get_or_compile_slice_conv_bias_silu(
+        const ConvParams& p, const std::string& driver) {
+    const size_t key = p.hash() ^ static_cast<size_t>(0xB3C5D7E9F1A2ULL);
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = slice_conv_bias_silu_cache_.find(key);
+    if (it != slice_conv_bias_silu_cache_.end() && it->second && it->second->function != nullptr
+            && it->second->params == p)
+        return *it->second;
+
+    std::unique_ptr<KernelEntry> entry;
+    try {
+        // Try MIGraphX-guided slice-conv compilation (produces mlir_slice_convolution_*).
+        entry = std::make_unique<KernelEntry>(load_kernel(compile_slice_conv_bias_silu(p, driver)));
+    } catch (const std::exception& ex) {
+        // MIGraphX doesn't emit MLIR for this shape (e.g., 3×3 conv uses binary code objects).
+        // Fall back to standard rocMLIR v3 bias+SiLU compilation. The execute path will
+        // offset the input pointer by c_start channels to implement the slice.
+        std::cerr << "[SliceConv] Falling back to v3 rocmlir for "
+                  << "C_full=" << p.C_full << " C=" << p.C << " c_start=" << p.c_start
+                  << " K=" << p.K << " R=" << p.R << "x" << p.S << "\n";
+        ConvParams p_sliced = p;
+        p_sliced.C_full = 0;  // no slice in the kernel itself; Execute applies pointer offset
+        p_sliced.c_start = 0;
+        entry = std::make_unique<KernelEntry>(
+            load_kernel(compile_fused_conv_bias_act(p_sliced, Activation::Sigmoid)));
+        entry->info.bias_fused = true;
+        entry->info.silu_fused = true;
+    }
+    entry->params = p;
+    KernelEntry* ptr = entry.get();
+    slice_conv_bias_silu_cache_[key] = std::move(entry);
+    return *ptr;
+}
+
+const KernelEntry& RocMLIRKernelCache::insert_migraphx_silu(const ConvParams& p, CompiledConv&& compiled) {
+    std::lock_guard<std::mutex> lk(mu_);
+    const size_t key = p.hash();
+    auto it = migraphx_silu_cache_.find(key);
+    if (it != migraphx_silu_cache_.end()) return *it->second;
+    // migraphx conv+bias+silu: bias and silu are fused in the kernel
+    compiled.bias_fused = true;
+    compiled.silu_fused = true;
+    compiled.skip_add_fused = false;
+    auto entry = std::make_unique<KernelEntry>(load_kernel(std::move(compiled)));
+    entry->params = p;
+    auto* ptr = entry.get();
+    migraphx_silu_cache_[key] = std::move(entry);
+    return *ptr;
+}
+
+const KernelEntry& RocMLIRKernelCache::insert_migraphx_silu_add(const ConvParams& p, CompiledConv&& compiled) {
+    std::lock_guard<std::mutex> lk(mu_);
+    const size_t key = p.hash();
+    auto it = migraphx_silu_add_cache_.find(key);
+    if (it != migraphx_silu_add_cache_.end()) return *it->second;
+    // migraphx conv+bias+silu+add: bias, silu, and skip-add are all fused in the kernel
+    compiled.bias_fused = true;
+    compiled.silu_fused = true;
+    compiled.skip_add_fused = true;
+    auto entry = std::make_unique<KernelEntry>(load_kernel(std::move(compiled)));
+    entry->params = p;
+    auto* ptr = entry.get();
+    migraphx_silu_add_cache_[key] = std::move(entry);
+    return *ptr;
 }
 
 void RocMLIRKernelCache::clear() {
     std::lock_guard<std::mutex> lk(mu_);
-    for (auto& [k, e] : cache_)               if (e.module) hipModuleUnload(e.module);
-    for (auto& [k, e] : fused_bias_cache_)    if (e.module) hipModuleUnload(e.module);
-    for (auto& [k, e] : fused_bias_relu_cache_)    if (e.module) hipModuleUnload(e.module);
-    for (auto& [k, e] : fused_bias_sigmoid_cache_) if (e.module) hipModuleUnload(e.module);
-    cache_.clear();
-    fused_bias_cache_.clear();
-    fused_bias_relu_cache_.clear();
-    fused_bias_sigmoid_cache_.clear();
+    auto unload = [](auto& m) {
+        for (auto& [k, e] : m) if (e && e->module) hipModuleUnload(e->module);
+        m.clear();
+    };
+    unload(cache_);
+    unload(fused_bias_cache_);
+    unload(fused_bias_relu_cache_);
+    unload(fused_bias_sigmoid_cache_);
+    unload(fused_bias_silu_add_cache_);
+    unload(slice_conv_bias_silu_cache_);
+    unload(migraphx_silu_cache_);
+    unload(migraphx_silu_add_cache_);
 }
 
 } // namespace rocmlir

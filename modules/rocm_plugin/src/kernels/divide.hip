@@ -37,10 +37,26 @@ static __global__ void DivOpImpl_fp32(const float* in0,const float* in1,float* o
     out[i] = fdividef(in0[i], in1[i]);
 }
 
+static __global__ void DivOpImpl_i32(const int32_t* in0, const int32_t* in1, int32_t* out)
+{
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    out[i] = in1[i] != 0 ? in0[i] / in1[i] : (in0[i] > 0 ? INT32_MAX : INT32_MIN);
+}
+
 static __global__ void DivOpImpl_i64(const int64_t* in0,const int64_t* in1, int64_t* out)
 {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     out[i] = in1[i] != 0 ? in0[i] / in1[i] : (in0[i] > 0 ? INT64_MAX : INT64_MIN);
+}
+
+static __global__ void PythonDivOpImpl_i32(const int32_t* in0, const int32_t* in1, int32_t* out)
+{
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (in1[i] == 0) { out[i] = in0[i] > 0 ? INT32_MAX : INT32_MIN; return; }
+    int32_t d = in0[i] / in1[i];
+    int32_t mod = in0[i] % in1[i];
+    if (mod != 0 && ((in0[i] < 0) != (in1[i] < 0))) d -= 1;
+    out[i] = d;
 }
 
 static __global__ void PythonDivOpImpl_i64(const int64_t* in0,const int64_t* in1, int64_t* out)
@@ -110,6 +126,10 @@ void Divide::operator()(hipStream_t stream,
             DivOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(
                 (const float*)in0, (const float*)in1, (float*)out);
             break;
+        case Type_t::i32:
+            DivOpImpl_i32<<<num_blocks_, threads_per_block_, 0, stream>>>(
+                (const int32_t*)in0, (const int32_t*)in1, (int32_t*)out);
+            break;
         case Type_t::i64:
             DivOpImpl_i64<<<num_blocks_, threads_per_block_, 0, stream>>>(
                 (const int64_t*)in0, (const int64_t*)in1, (int64_t*)out);
@@ -140,6 +160,10 @@ void PythonDivide::operator()(hipStream_t stream,
         case Type_t::f32:
             DivOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(
                 (const float*)in0, (const float*)in1, (float*)out);
+            break;
+        case Type_t::i32:
+            PythonDivOpImpl_i32<<<num_blocks_, threads_per_block_, 0, stream>>>(
+                (const int32_t*)in0, (const int32_t*)in1, (int32_t*)out);
             break;
         case Type_t::i64:
             PythonDivOpImpl_i64<<<num_blocks_, threads_per_block_, 0, stream>>>(

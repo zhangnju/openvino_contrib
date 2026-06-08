@@ -88,11 +88,12 @@ private:
  *  - `ov::rocm_gpu::nodes::FusedConvolution`
  */
 struct FusedConvolutionIndices {
-    static constexpr size_t input = 0;
-    static constexpr size_t filter = 1;
-    static constexpr size_t bias = 2;
-    static constexpr size_t add = 3;
-    static constexpr size_t output = 0;
+    static constexpr size_t input   = 0;
+    static constexpr size_t filter  = 1;
+    static constexpr size_t bias    = 2;
+    static constexpr size_t add     = 3;
+    static constexpr size_t aux_silu = 4;  // 5th input for 6-arg epilogue kernel
+    static constexpr size_t output  = 0;
 };
 
 /**

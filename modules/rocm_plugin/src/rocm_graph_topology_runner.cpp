@@ -5,6 +5,7 @@
 #include "rocm_graph_topology_runner.hpp"
 
 #include "rocm/event.hpp"
+#include "rocm/runtime.hpp"
 #include "ops/tensor_iterator.hpp"
 
 namespace ov {

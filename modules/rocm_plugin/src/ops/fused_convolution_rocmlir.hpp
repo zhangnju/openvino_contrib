@@ -11,12 +11,14 @@
 
 #pragma once
 
+#include <optional>
 #include <rocm_operation_base.hpp>
 #include "rocm/rocmlir_compiler.hpp"
 #include "rocm/rocmlir_kernel_cache.hpp"
 #include "rocm/dnn.hpp"
 #include "ops/convolution_components/convolution_components.hpp"
 #include "transformer/nodes/activation_type.hpp"
+#include "kernels/swish.hpp"
 
 namespace ov {
 namespace rocm_gpu {
@@ -53,7 +55,13 @@ private:
     std::optional<rocm::DnnActivationDescriptor> activation_desc_;
 
     bool has_add_ = false;
+    bool has_silu_add_epilogue_  = false;  // 5-input node: outer silu+add fused into 6-arg kernel
+    bool conv_reshape_epilogue_  = false;  // conv+bias+reshape fused into single migraphx kernel
     nodes::ActivationMode activation_ = nodes::ActivationMode::NO_ACTIVATION;
+
+    // Pre-initialized Swish kernel for SWISH activation mode (applied after conv+bias)
+    std::optional<kernel::Swish> swish_kernel_;
+    bool activation_fused_in_kernel_ = false;  // reserved for future rocMLIR epilogue fusion
 };
 
 } // namespace rocm_gpu

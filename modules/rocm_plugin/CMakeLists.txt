@@ -65,6 +65,22 @@ if(ENABLE_ROCMLIR)
         set(ENABLE_ROCMLIR OFF)
     endif()
 endif()
+# ── CK WMMA backend (AMD Composable Kernel, RDNA4 optimized) ─────────────────
+# Usage: cmake -DENABLE_CK_WMMA=ON
+# Requires: CK installed in /opt/rocm (standard ROCm installation)
+# Provides: profile-guided rocMLIR vs CK WMMA selection on first run.
+option(ENABLE_CK_WMMA "Enable CK WMMA convolution backend (RDNA4 / gfx12xx)" OFF)
+if(ENABLE_CK_WMMA)
+    find_package(composable_kernel QUIET PATHS /opt/rocm/lib/cmake)
+    if(composable_kernel_FOUND OR EXISTS "/opt/rocm/include/ck/ck.hpp")
+        message(STATUS "[rocm_gpu] CK WMMA backend enabled (CK at /opt/rocm)")
+        add_definitions(-DENABLE_CK_WMMA)
+        set(CK_INCLUDE_DIR "/opt/rocm/include" CACHE PATH "CK include directory")
+    else()
+        message(WARNING "[rocm_gpu] ENABLE_CK_WMMA=ON but CK headers not found -- disabling")
+        set(ENABLE_CK_WMMA OFF)
+    endif()
+endif()
 # ─────────────────────────────────────────────────────────────────────────────
 
 find_package(OpenVINODeveloperPackage REQUIRED

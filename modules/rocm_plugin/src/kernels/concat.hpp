@@ -46,6 +46,7 @@ public:
 
 private:
     void Call(hipStream_t stream, const void* chunks, const float* const* src, float* dst) const;
+    void Call_fp16(hipStream_t stream, const void* chunks, const __half* const* src, __half* dst) const;
 
     Type_t element_type_{};
     size_t num_inputs_{};

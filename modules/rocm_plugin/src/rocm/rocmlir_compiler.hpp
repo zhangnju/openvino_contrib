@@ -5,8 +5,7 @@
 // Generates rock.conv MLIR IR from convolution parameters and compiles it
 // to HSACO binary using the rocmlir-driver tool (subprocess).
 //
-// This mirrors MIGraphX's fuse_mlir pass but operates out-of-process,
-// invoking rocmlir-driver as a subprocess to avoid linking the full LLVM stack.
+// Invokes rocmlir-driver as a subprocess to avoid linking the full LLVM stack.
 
 #pragma once
 
@@ -42,6 +41,14 @@ struct ConvParams {
     // Number of compute units (used for tuning)
     int num_cu = 256;
 
+    // Optional input channel slice: the input tensor passed at runtime has C_full channels
+    // and we use channels [c_start, c_start + C) in the convolution.
+    // When c_start == 0 and C_full == C, no slice is applied (normal mode).
+    // This enables fusing VariadicSplit → FusedConvolution into a single kernel that
+    // reads directly from the pre-split buffer with a channel offset.
+    int C_full = 0;    // 0 means use C (no slice)
+    int c_start = 0;   // channel start index in the full input tensor
+
     // Derived output spatial dims
     int out_h() const { return (H + 2 * pad_h - dilation_h * (R - 1) - 1) / stride_h + 1; }
     int out_w() const { return (W + 2 * pad_w - dilation_w * (S - 1) - 1) / stride_w + 1; }
@@ -64,6 +71,15 @@ struct CompiledConv {
     //   block_size = 256 : i32, grid_size = 600 : i32
     int grid_x = 1, grid_y = 1, grid_z = 1;
     int block_x = 256, block_y = 1, block_z = 1;
+    // True when the kernel is a bias-fused variant:
+    //   args = (filter, input, bias, output)   [4 args instead of 3]
+    // The calling code must pass bias as 3rd argument.
+    bool bias_fused = false;
+    // True when bias+SiLU are both fused (implies bias_fused=true)
+    bool silu_fused = false;
+    // True when bias+SiLU+skip-Add are all fused (5-arg kernel: filter,input,bias,skip,output)
+    // Implies bias_fused=true and silu_fused=true.
+    bool skip_add_fused = false;
 };
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -76,7 +92,7 @@ enum class Activation { None, ReLU, Sigmoid };
 // ───────────────────────────────────────────────────────────────────────────
 
 // Generate rock.conv MLIR IR text for the given parameters.
-// The output matches what MIGRAPHX_TRACE_MLIR=2 produces.
+// Uses rocmlir-gen to generate the MLIR IR text.
 std::string generate_conv_ir(const ConvParams& p);
 
 // Generate fused rock.conv + broadcast_add (bias) MLIR IR.
@@ -104,6 +120,56 @@ CompiledConv compile_fused_conv_bias(const ConvParams& p,
 CompiledConv compile_fused_conv_bias_act(const ConvParams& p,
                                          Activation act,
                                          const std::string& rocmlir_driver_path = "");
+
+// High-level: generate + compile fused conv+bias+SiLU+skip-Add kernel (5 args).
+// Args order: (input, filter, bias, skip_input, output)
+CompiledConv compile_fused_conv_bias_silu_add(const ConvParams& p,
+                                               const std::string& rocmlir_driver_path = "");
+
+// High-level: generate + compile Slice+Conv+Bias+SiLU fused kernel.
+// p.C_full = full input channels, p.c_start = channel offset, p.C = used channels.
+// The caller applies the c_start byte offset to the input pointer at execute time.
+// Arg order: (input_slice, filter, bias, output)
+CompiledConv compile_slice_conv_bias_silu(const ConvParams& p,
+                                           const std::string& rocmlir_driver_path = "");
+
+// High-level: Conv+Bias+SiLU+Add(skip) kernel for sliced output.
+// K_full = total conv output channels. Output slice = [c_out_start, c_out_end).
+// Arg order (5 args): (filter, data, bias, skip_input, output)
+CompiledConv compile_conv_slice_out_silu_add(const ConvParams& p,
+                                              int K_full,
+                                              int c_out_start,
+                                              int c_out_end,
+                                              const std::string& rocmlir_driver_path = "");
+
+// MIGraphX dialect compilation: conv+bias+silu with epilogue ops.
+// Uses -kernel-pipeline=migraphx,highlevel,gpu,rocdl,binary instead of rock.conv full.
+// Activated by ROCMLIR_EPILOGUE_FUSION=1 env var.
+//
+// Epilogue variants:
+//   with_skip=false, with_silu_add=false → 4-arg: conv+bias+silu
+//   with_skip=true,  with_silu_add=false → 5-arg: conv+bias+silu+skip_add
+//   with_skip=true,  with_silu_add=true  → 6-arg: conv+bias+silu+skip_add+silu+aux_add
+//     (fuses C2f/C2PSA bottleneck: FC(silu+shortcut) → silu(fc_out) → add(silu, cv1_silu))
+CompiledConv compile_conv_migraphx(const ConvParams& p,
+                                    const std::string& rocmlir_driver_path = "",
+                                    bool with_skip = false,
+                                    bool with_silu_add = false);
+
+// Conv+Bias+SkipAdd (NO SiLU): mlir_convolution_broadcast_add_add (4-arg kernel).
+// Fuses conv+bias+skip_add WITHOUT silu into one kernel.
+// Eliminates separate launch_bias_add for NO_ACTIVATION + has_add cases.
+// Matches MIGraphX's 15-instance mlir_convolution_broadcast_add_add pattern.
+CompiledConv compile_conv_migraphx_skip(const ConvParams& p,
+                                         const std::string& rocmlir_driver_path = "");
+
+// Conv+Bias+Reshape kernel: Q/K/V attention projection pattern.
+// reshape_dims: target shape after conv output, e.g. {N, K, OH*OW}.
+// Generates mlir_convolution_broadcast_add_reshape (3-arg kernel).
+// Matches MIGraphX's 168-instance pattern in yolo26x.
+CompiledConv compile_conv_migraphx_reshape(const ConvParams& p,
+                                            const std::vector<int>& reshape_dims,
+                                            const std::string& rocmlir_driver_path = "");
 
 // Find rocmlir-driver in standard install locations.
 // Search order: env ROCMLIR_DRIVER, /home/openvino/rocmlir_install/bin,

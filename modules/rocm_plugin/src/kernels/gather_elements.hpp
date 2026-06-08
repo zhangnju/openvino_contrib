@@ -20,6 +20,7 @@ void launchGatherElements(const void* data,
                           int32_t ndim,
                           int64_t total_out,
                           size_t element_size,
+                          size_t indices_element_size,
                           hipStream_t stream);
 
 }  // namespace kernel
