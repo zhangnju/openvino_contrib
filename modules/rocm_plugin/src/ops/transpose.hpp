@@ -17,6 +17,7 @@ public:
                 const std::shared_ptr<ov::Node>& node,
                 IndexCollection&& inputIds,
                 IndexCollection&& outputIds);
+    ~TransposeOp();
 
     void Execute(const InferenceRequestContext& context,
                  Inputs inputTensors,
@@ -30,8 +31,10 @@ private:
     std::optional<std::vector<int32_t>> perm_;
     size_t element_size_;
     int32_t ndim_;
+    int64_t total_elements_;
     ov::element::Type_t input_type_;
     ov::element::Type_t perm_type_;
+    void* device_buf_ = nullptr;  // pre-allocated: [src_strides|dst_strides|perm]
 
     static bool isPermutationTensorSpecified(const ov::Node& node);
     static std::optional<std::vector<int32_t>> tryToExtractPermutation(const ov::Node& node, int32_t ndim);

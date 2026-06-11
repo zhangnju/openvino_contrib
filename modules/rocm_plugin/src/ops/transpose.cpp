@@ -34,6 +34,20 @@ TransposeOp::TransposeOp(const CreationContext& context,
     element_size_ = size;
 
     perm_ = tryToExtractPermutation(*node, ndim_);
+
+    // Compute total elements for fixed-perm case
+    total_elements_ = 1;
+    for (auto d : src_shape_) total_elements_ *= d;
+
+    // Pre-allocate device stride/perm buffers to avoid hipMalloc at Execute time.
+    // Only possible when perm is statically known (constant input or identity).
+    if (perm_.has_value()) {
+        device_buf_ = kernel::allocTransposeDeviceBuffers(src_shape_.data(), perm_->data(), ndim_);
+    }
+}
+
+TransposeOp::~TransposeOp() {
+    kernel::freeTransposeDeviceBuffers(device_buf_);
 }
 
 bool TransposeOp::isPermutationTensorSpecified(const ov::Node& node) {
@@ -92,13 +106,38 @@ void TransposeOp::Execute(const InferenceRequestContext& context,
         }
     }
 
-    kernel::launchTranspose(inputTensors[0].get(),
-                            outputTensors[0].get(),
-                            src_shape_.data(),
-                            perm.data(),
-                            ndim_,
-                            element_size_,
-                            context.getThreadContext().stream().get());
+    if (device_buf_) {
+        // Fast path: use pre-allocated device strides (hipGraph-safe, no hipMalloc).
+        kernel::launchTranspose(inputTensors[0].get(),
+                                outputTensors[0].get(),
+                                device_buf_,
+                                total_elements_,
+                                ndim_,
+                                element_size_,
+                                context.getThreadContext().stream().get());
+    } else {
+        // Slow path: dynamic perm from input tensor (not hipGraph-compatible).
+        // Allocate device buffers on the fly for this case.
+        int64_t src_strides[8], dst_strides[8];
+        int64_t dst_shape[8];
+        for (int i = 0; i < ndim_; ++i) dst_shape[i] = src_shape_[perm[i]];
+        src_strides[ndim_ - 1] = 1;
+        for (int i = ndim_ - 2; i >= 0; --i) src_strides[i] = src_strides[i + 1] * src_shape_[i + 1];
+        dst_strides[ndim_ - 1] = 1;
+        for (int i = ndim_ - 2; i >= 0; --i) dst_strides[i] = dst_strides[i + 1] * dst_shape[i + 1];
+        int64_t total = 1;
+        for (int i = 0; i < ndim_; ++i) total *= dst_shape[i];
+        void* tmp_buf = kernel::allocTransposeDeviceBuffers(src_shape_.data(), perm.data(), ndim_);
+        kernel::launchTranspose(inputTensors[0].get(),
+                                outputTensors[0].get(),
+                                tmp_buf,
+                                total,
+                                ndim_,
+                                element_size_,
+                                context.getThreadContext().stream().get());
+        context.getThreadContext().stream().synchronize();
+        kernel::freeTransposeDeviceBuffers(tmp_buf);
+    }
 }
 
 rocmGraphCompatibility TransposeOp::GetrocmGraphCompatibility() const {

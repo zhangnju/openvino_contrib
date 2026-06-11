@@ -20,6 +20,13 @@ TileOp::TileOp(const CreationContext& context,
     for (auto d : in_shape) in_shape_.push_back(static_cast<int64_t>(d));
     for (auto d : out_shape) out_shape_.push_back(static_cast<int64_t>(d));
     element_size_ = node->get_input_element_type(0).size();
+    total_out_ = 1;
+    for (auto d : out_shape_) total_out_ *= d;
+    device_buf_ = kernel::allocTileDeviceBuffers(in_shape_.data(), out_shape_.data(), ndim_);
+}
+
+TileOp::~TileOp() {
+    kernel::freeTileDeviceBuffers(device_buf_);
 }
 
 void TileOp::Execute(const InferenceRequestContext& context,
@@ -31,8 +38,8 @@ void TileOp::Execute(const InferenceRequestContext& context,
 
     kernel::launchTile(inputTensors[0].get(),
                        outputTensors[0].get(),
-                       in_shape_.data(),
-                       out_shape_.data(),
+                       device_buf_,
+                       total_out_,
                        ndim_,
                        element_size_,
                        context.getThreadContext().stream().get());
