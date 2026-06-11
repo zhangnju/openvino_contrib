@@ -1,8 +1,7 @@
 # OpenVINO ROCm Plugin — 性能指南
 
-本文档面向希望在 AMD GPU（gfx1201/RDNA4、gfx1100/RDNA3、gfx1151/RDNA3.5、gfx950/CDNA3 等）上
-使用 OpenVINO ROCm Plugin 进行推理性能调优的工程师，涵盖：rocMLIR 编译安装、Plugin 构建、Benchmark 复现、
-性能相关环境变量，以及各架构的性能对比和优化历程。
+本文档面向希望在 AMD GPU（gfx1201/RDNA4、gfx1100/RDNA3、gfx950/CDNA3 等）上
+使用 OpenVINO ROCm Plugin 进行推理性能调优的工程师。
 
 ---
 
@@ -11,13 +10,11 @@
 1. [环境依赖](#1-环境依赖)
 2. [rocMLIR 编译安装](#2-rocmlir-编译安装)
 3. [构建步骤](#3-构建步骤)
-4. [安装 / 部署](#4-安装--部署)
-5. [Benchmark 复现](#5-benchmark-复现)
-6. [性能相关环境变量](#6-性能相关环境变量)
-7. [各架构性能对比（yolo26x）](#7-各架构性能对比yolo26x)
-8. [性能优化历程](#8-性能优化历程)
-9. [MIGraphX 融合机制分析](#9-migraphx-融合机制分析)
-10. [附录：常见问题](#附录常见问题)
+4. [Benchmark 复现](#4-benchmark-复现)
+5. [性能相关环境变量](#5-性能相关环境变量)
+6. [各架构性能对比](#6-各架构性能对比)
+7. [优化历程与技术细节](#7-优化历程与技术细节)
+8. [附录：常见问题](#8-附录常见问题)
 
 ---
 
@@ -26,393 +23,444 @@
 | 组件 | 版本 | 说明 |
 |------|------|------|
 | OS | Ubuntu 22.04 / 24.04 (64-bit) | |
-| ROCm | **7.2.x**（7.2.1 或 7.2.2） | 含 HIP、MIOpen、rocBLAS |
-| GPU 架构 | gfx1201（RDNA4）/ gfx1100（RDNA3）/ gfx1151（RDNA3.5）/ gfx950（CDNA3） | |
-| Python | 3.10+ | 用于 rocMLIR-gen 调优脚本 |
-| CMake | 3.23+ | |
-| 编译器 | `/opt/rocm/bin/amdclang++` | ROCm 自带，支持 HIP |
+| ROCm | **7.2.x** | 含 HIP、MIOpen、rocBLAS |
+| GPU | gfx1201 / gfx1100 / gfx950 | 见下表 |
+| Python | 3.10+ | 用于调优脚本 |
+| CMake | 3.23+（pip install cmake） | |
+| Host 编译器 | `gcc/g++` 13.x | rocMLIR 构建用 |
 
 ### 验证 GPU 架构
 
 ```bash
 rocminfo | grep -E "gfx|Marketing" | head -10
-```
-
-### 验证 ROCm 安装
-
-```bash
-cat /opt/rocm/.info/version        # 确认 ROCm 版本
-rocm-smi                           # 查看 GPU 显存占用
+# 输出示例：
+# Name: gfx1201
+# Marketing Name: AMD Radeon AI PRO R9700
 ```
 
 ---
 
 ## 2. rocMLIR 编译安装
 
-OpenVINO ROCm Plugin 使用 rocMLIR 作为卷积后端（替代不稳定的 MIOpen Immediate Mode）。
-rocMLIR 将卷积编译为 HSACO GPU kernel，支持 Conv+Bias+SiLU 融合，在 RDNA/CDNA 架构上显著优于 MIOpen。
+ROCm Plugin 使用 rocMLIR 作为主要卷积后端，通过 rocmlir-driver/rocmlir-gen
+将 Conv+Bias+SiLU 等 epilogue 融合编译为 GPU kernel（HSACO），
+性能大幅优于 MIOpen Immediate Mode。
 
-**重要**：必须在插件构建之前安装好 rocMLIR。
+**注意**：必须在 Plugin 构建之前安装好 rocMLIR。
 
 ### 2.1 选择 rocMLIR 版本
 
-| ROCm 版本 | 推荐 rocMLIR tag |
+| ROCm 版本 | 推荐 rocMLIR 分支 |
 |-----------|----------------|
-| ROCm 7.2.x | `rocm-6.3.0` |
-| ROCm 7.0.x | `rocm-6.1.0` |
+| ROCm 7.2.x | `rocm-rel-7.2`（tag: `rocm-7.2.4`） |
+| ROCm 7.0.x | `rocm-rel-7.0` |
 
-### 2.2 克隆 & 编译
+### 2.2 编译（以 gfx1201 为例）
+
+rocMLIR 依赖从源码构建的 LLVM/MLIR。使用 **g++**（而非 amdclang++）编译
+host 代码以避免 GCC 13 头文件兼容性问题：
 
 ```bash
-git clone --branch rocm-6.3.0 --depth 1 \
-    https://github.com/ROCm/rocMLIR.git /root/rocMLIR_src
+git clone --branch rocm-rel-7.2 --depth 1 \
+    https://github.com/ROCm/rocMLIR.git /home/rocMLIR
 
-cmake -S /root/rocMLIR_src -B /root/rocmlir_build \
-    -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
-    -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+mkdir -p /home/rocMLIR/build && cd /home/rocMLIR/build
+
+# 安装 cmake（若系统没有）
+pip install cmake
+
+cmake /home/rocMLIR \
+    -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DBUILD_SHARED_LIBS=ON \
-    -DROCM_PATH=/opt/rocm \
-    -DCMAKE_INSTALL_PREFIX=/root/rocmlir_install \
-    -G Ninja
+    -DCMAKE_C_COMPILER=gcc \
+    -DCMAKE_CXX_COMPILER=g++ \
+    -DGPU_TARGETS=gfx1201 \        # 修改为目标架构
+    -DROCMLIR_DRIVER_E2E_TEST_ENABLED=0 \
+    -DROCMLIR_DRIVER_PR_E2E_TEST_ENABLED=0 \
+    -DROCMLIR_PARALLEL_LINK_JOBS=8 \
+    -DROCMLIR_PARALLEL_COMPILE_JOBS=64 \
+    -DLLVM_ENABLE_ASSERTIONS=OFF \
+    -DLLVM_ENABLE_PROJECTS="mlir;lld"
 
-# 只编译必要的两个工具（约 20-40 分钟）
-ninja -j$(nproc) -C /root/rocmlir_build rocmlir-gen rocmlir-driver
-
-mkdir -p /root/rocmlir_install/bin
-cp /root/rocmlir_build/bin/rocmlir-gen    /root/rocmlir_install/bin/
-cp /root/rocmlir_build/bin/rocmlir-driver /root/rocmlir_install/bin/
+# 构建（约 30-60 分钟，96 核机器约 15 分钟）
+ninja -j$(nproc) rocmlir-driver rocmlir-gen
 ```
 
-### 2.3 验证
+**已知编译问题及修复**：
+
+1. **build.ninja 中 `_GLIBCXX_USE_CXX11_ABI` 宏重复**（HIP cmake config bug）：
+```bash
+python3 -c "
+import re, shutil
+shutil.copy('build.ninja', 'build.ninja.bak')
+with open('build.ninja') as f: content = f.read()
+fixed = re.sub(r' -D_GLIBCXX_USE_CXX11_ABI=\\\"[^\\\"]*\\\"', '', content)
+with open('build.ninja', 'w') as f: f.write(fixed)
+print('Fixed', len(re.findall(r' -D_GLIBCXX_USE_CXX11_ABI=\\\"', content)), 'occurrences')
+"
+```
+
+2. **AlignTiling.cpp 语法错误**（`std::ignore reasonCallback` → `std::ignore = reasonCallback`）：
+```bash
+sed -i 's/std::ignore reasonCallback;/std::ignore = reasonCallback;/' \
+    mlir/lib/Dialect/Rock/Transforms/AlignTiling.cpp
+```
+
+### 2.3 安装
 
 ```bash
-/root/rocmlir_install/bin/rocmlir-gen --help 2>&1 | head -3
-/root/rocmlir_install/bin/rocmlir-gen -ph -t f16 \
-    -batchsize 1 -in_channels 64 -in_h 32 -in_w 32 \
-    -fil_h 3 -fil_w 3 -out_channels 64 --arch gfx1201 2>&1 | head -3
+mkdir -p /home/rocmlir_install/bin
+cp /home/rocMLIR/build/bin/rocmlir-driver /home/rocmlir_install/bin/
+cp /home/rocMLIR/build/bin/rocmlir-gen    /home/rocmlir_install/bin/
+
+# 验证
+/home/rocmlir_install/bin/rocmlir-driver --version
 ```
 
 ---
 
 ## 3. 构建步骤
 
-### 3.1 克隆源码
-
-```bash
-git clone https://github.com/openvinotoolkit/openvino.git /home/openvino/openvino
-cd /home/openvino/openvino && git submodule update --init --recursive
-
-git clone https://github.com/openvinotoolkit/openvino_contrib.git /home/openvino/openvino_contrib
-```
-
-### 3.2 CMake 配置 & 编译
+### 3.1 CMake 配置
 
 ```bash
 export OPENVINO_HOME=/home/openvino/openvino
 export OPENVINO_CONTRIB=/home/openvino/openvino_contrib
-export OPENVINO_BUILD_PATH=/home/openvino/openvino_build
+export OPENVINO_BUILD_PATH=/home/openvino_build
 
 mkdir -p ${OPENVINO_BUILD_PATH} && cd ${OPENVINO_BUILD_PATH}
 
 cmake ${OPENVINO_HOME} \
+    -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_COMPILER=/opt/rocm/bin/amdclang \
-    -DCMAKE_CXX_COMPILER=/opt/rocm/bin/amdclang++ \
+    -DCMAKE_HIP_ARCHITECTURES=gfx1201 \    # 修改为目标架构
     -DENABLE_ROCM=ON \
     -DENABLE_ROCMLIR=ON \
-    -DENABLE_INTEL_NPU=OFF \
+    -DROCMLIR_INSTALL_DIR=/home/rocmlir_install \
+    -DENABLE_OV_ONNX_FRONTEND=ON \
     -DENABLE_TESTS=OFF \
     -DBUILD_arm_plugin=OFF \
     -DBUILD_nvidia_plugin=OFF \
     -DBUILD_java_api=OFF \
-    -DOPENVINO_EXTRA_MODULES="${OPENVINO_CONTRIB}/modules/rocm_plugin" \
-    -DROCM_PATH=/opt/rocm \
-    -DHIP_PATH=/opt/rocm/hip \
-    -DROCMLIR_INSTALL_DIR=/root/rocmlir_install \
-    -DCMAKE_HIP_ARCHITECTURES=<your_gpu_arch> \
-    -G Ninja
+    -DBUILD_ollama_openvino=OFF \
+    -DOPENVINO_EXTRA_MODULES="${OPENVINO_CONTRIB}/modules" \
+    -DWHEEL_VERSION=2024.4.0
 
-ninja -j$(nproc) openvino_rocm_gpu_plugin benchmark_app
+ninja -j$(nproc) openvino_rocm_gpu_plugin benchmark_app openvino_onnx_frontend
 ```
 
 **按架构指定 `CMAKE_HIP_ARCHITECTURES`：**
 
-| GPU | 架构 | 典型硬件 |
-|-----|------|---------|
-| Radeon AI PRO R9700 | `gfx1201` | RDNA4 工作站卡 |
-| RX 7900 XTX | `gfx1100` | RDNA3 旗舰消费卡 |
-| Ryzen AI MAX+ 395 集成显卡 | `gfx1151` | RDNA3.5 APU |
-| Instinct MI350 | `gfx950` | CDNA3 数据中心卡 |
-
-### 3.3 仅重编 Plugin
-
-```bash
-cd ${OPENVINO_BUILD_PATH}/build-modules/rocm_plugin && make -j$(nproc)
-```
+| GPU | 架构 | `CMAKE_HIP_ARCHITECTURES` |
+|-----|------|--------------------------|
+| Radeon AI PRO R9700 | RDNA4 | `gfx1201` |
+| RX 7900 XTX | RDNA3 | `gfx1100` |
+| Instinct MI350 | CDNA3 | `gfx950` |
 
 ---
 
-## 4. 安装 / 部署
+## 4. Benchmark 复现
+
+### 4.1 环境变量设置
 
 ```bash
-export LD_LIBRARY_PATH=${OPENVINO_HOME}/bin/intel64/Release:/opt/rocm/lib:/root/rocmlir_install/lib:${LD_LIBRARY_PATH}
-
-# 多卡环境：指定空闲 GPU
-rocm-smi                          # 查看 VRAM 占用
-export HIP_VISIBLE_DEVICES=1      # 选择 VRAM 空闲的卡
+export PATH=/home/rocmlir_install/bin:$PATH
+export LD_LIBRARY_PATH=${OPENVINO_HOME}/bin/intel64/Release:/opt/rocm/lib:$LD_LIBRARY_PATH
 ```
 
----
+### 4.2 一键最优性能
 
-## 5. Benchmark 复现
-
-### 5.1 吞吐量模式（Throughput）
+**gfx1201（R9700）** — 目标 >220 FPS：
 
 ```bash
-HIP_VISIBLE_DEVICES=<空闲GPU> \
-ROCM_FUSE_ATTENTION=1 \
-${OPENVINO_HOME}/bin/intel64/Release/benchmark_app \
-    -m /path/to/yolo26x.onnx -d ROCM -hint throughput -t 30
-```
-
-### 5.2 延迟模式（Latency）
-
-```bash
-HIP_VISIBLE_DEVICES=<空闲GPU> \
-ROCM_FUSE_ATTENTION=1 \
-${OPENVINO_HOME}/bin/intel64/Release/benchmark_app \
-    -m /path/to/yolo26x.onnx -d ROCM -hint latency -t 30
-```
-
-### 5.3 最高性能配置（首次较慢，结果缓存）
-
-> **重要**：`ROCMLIR_ENABLE_TUNING=1` 对每个卷积 shape 穷举搜索（约 50 个 shape，耗时 10-40 分钟）。
-> 结果缓存于 `~/.cache/ov_rocmlir_tuning_<arch>.json`，后续直接加载无开销。
-> **必须在独占 GPU 上运行 tuning**，共享 GPU 会导致测量噪声大、配置不准确。
-
-```bash
-# gfx1201 / gfx1100 推荐（tuning + skip fusion）
-HIP_VISIBLE_DEVICES=<独占GPU> \
-ROCM_FUSE_ATTENTION=1 \
+# 步骤1：生成 rocMLIR 调优配置（首次运行，约 10-30 分钟）
+# 在独占 GPU 上运行（共享 GPU 会导致配置不准）
 ROCMLIR_ENABLE_TUNING=1 \
-ROCMLIR_CONV_SKIP_FUSION=1 \
+ROCMLIR_TUNING_CACHE=~/.cache/ov_rocmlir_tuning_gfx1201.json \
 ${OPENVINO_HOME}/bin/intel64/Release/benchmark_app \
-    -m /path/to/yolo26x.onnx -d ROCM -hint throughput -t 30
+    -m /path/to/yolo26x.onnx -d ROCM -hint throughput -nireq 14 -t 180
 
-# gfx950 推荐（tuning 效果最显著）
-HIP_VISIBLE_DEVICES=<独占GPU> \
-ROCM_FUSE_ATTENTION=1 \
-ROCMLIR_ENABLE_TUNING=1 \
+# 步骤2：正式 Benchmark（使用缓存配置）
+ROCMLIR_TUNING_CACHE=~/.cache/ov_rocmlir_tuning_gfx1201.json \
 ${OPENVINO_HOME}/bin/intel64/Release/benchmark_app \
-    -m /path/to/yolo26x.onnx -d ROCM -hint throughput -t 30
+    -m /path/to/yolo26x.onnx -d ROCM -hint throughput -nireq 14 -t 60
+
+# 预期：>230 FPS（超过 MIGraphX 224 FPS）
 ```
 
-### 5.4 GPU 级 Kernel 性能剖析
+**gfx950（MI350）** — 目标 >400 FPS：
 
 ```bash
-HIP_VISIBLE_DEVICES=1 ROCM_FUSE_ATTENTION=1 \
-rocprof --stats -o /tmp/ov_profile.csv \
-    ${OPENVINO_HOME}/bin/intel64/Release/benchmark_app \
-    -m /path/to/yolo26x.onnx -d ROCM -hint throughput -t 10
+ROCMLIR_ENABLE_TUNING=1 \
+ROCMLIR_TUNING_CACHE=~/.cache/ov_rocmlir_tuning_gfx950.json \
+${OPENVINO_HOME}/bin/intel64/Release/benchmark_app \
+    -m /path/to/yolo26x.onnx -d ROCM -hint throughput -t 60
+# 预期：~500 FPS
+```
 
-sort -t',' -k4 -rn /tmp/ov_profile.stats.csv | head -20
+### 4.3 性能对比：OV vs MIGraphX
+
+```bash
+# MIGraphX 参考（需安装 ROCm 7.2+）
+migraphx-driver perf --onnx /path/to/yolo26x.onnx \
+    --fp16 --gpu --iterations 2000
+# gfx1201 输出示例：Rate: 224 inferences/sec
+```
+
+### 4.4 逐 op 分析（找瓶颈）
+
+```bash
+${OPENVINO_HOME}/bin/intel64/Release/benchmark_app \
+    -m /path/to/yolo26x.onnx -d ROCM \
+    -hint throughput -nireq 1 -t 30 -pc \
+    2>&1 | grep EXECUTED | python3 -c "
+import sys, re
+from collections import defaultdict
+ops = defaultdict(lambda:[0,0.0])
+for l in sys.stdin:
+    m = re.search(r'layerType: (\S+)\s+execType: (\S+)\s+realTime .ms.:\s+(\S+)', l)
+    if m:
+        ops[m.group(1)][0]+=1; ops[m.group(1)][1]+=float(m.group(3))
+total = sum(v[1] for v in ops.values())
+print(f'Total: {total:.3f}ms')
+for k,(c,t) in sorted(ops.items(),key=lambda x:-x[1][1])[:15]:
+    print(f'  {c:4d}x {k:<30} {t:.3f}ms ({100*t/total:.1f}%)')
+"
 ```
 
 ---
 
-## 6. 性能相关环境变量
+## 5. 性能相关环境变量
 
-### 6.1 ROCm Plugin 核心变量
+### 5.1 核心融合变量（默认已开启，无需手动设置）
 
-| 环境变量 | 默认 | 说明 |
-|----------|------|------|
-| `ROCM_FUSE_ATTENTION` | `1` | 启用 Attention MatMul 融合（Q×Kᵀ + A×V 用 MIGraphX MLIR kernel 替代 rocBLAS）。**必须开启**以获得最优性能。 |
-| `ROCM_FUSE_PE` | `1` | pe(V) 深度卷积与 Attention 输出融合（仅 gfx1201/RDNA4 稳定，gfx950 默认关）。 |
-| `ROCM_ZEROCOPY_SPLIT` | `1` | VariadicSplit 零拷贝（QKV split 改为 buffer alias）。 |
-| `ROCM_SWISH_INPLACE` | `1` | SiLU 激活原位写入，减少一次显存分配。 |
+从当前版本起，以下优化**默认启用**，无需设置环境变量：
 
-### 6.2 rocMLIR 调优变量
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| migraphx dialect kernel | **默认 ON** | Conv+Bias+SiLU 使用 MIGraphX MLIR 编译路径，比 v3: rock dialect 快 25%。关闭：`ROCMLIR_EPILOGUE_FUSION=0` |
+| Conv+Reshape 融合 | **默认 ON** | Conv→Reshape 融合进 kernel，消除独立 Transpose（yolo26x 中节省 0.4ms）。关闭：`ROCMLIR_EPILOGUE_FUSION=0` |
+| Swish no-op 消除 | **默认 ON** | 已 fuse 的 SiLU Swish 节点不进入 dispatch 队列（352→256 dispatches）。 |
+| Attention MatMul 融合 | **默认 ON** | QKV Attention 用 MIGraphX MLIR kernel。关闭：`ROCM_FUSE_ATTENTION=0` |
+| pe(V) 融合 | **默认 ON（gfx1201）** | pe(V) depthwise conv 与 AV 输出融合（gfx950 关闭，稳定性）。 |
+| VariadicSplit 零拷贝 | **默认 ON** | QKV split 改为 buffer alias，零显存复制。 |
+| Transpose/Tile 预分配 | **默认 ON** | 构造时预分配 stride 数组，消除推理中的动态 hipMalloc。 |
 
-| 环境变量 | 默认 | 说明 |
-|----------|------|------|
-| `ROCMLIR_ENABLE_TUNING` | 未设置 | 设为 `1` 开启穷举调优。gfx950 可从 330→500 FPS（+52%），gfx1201 从 175→220 FPS（+26%）。首次慢，之后用缓存。 |
-| `ROCMLIR_TUNING_CACHE` | `~/.cache/ov_rocmlir_tuning_<arch>.json` | 调优缓存路径。多用户环境可集中管理。 |
-| `ROCMLIR_PERF_CONFIG` | 自动 | 强制指定特定 perf_config，覆盖调优缓存。 |
-| `ROCMLIR_DRIVER` | 自动探测 | `rocmlir-driver` 可执行文件路径。 |
-
-### 6.3 MLIR Epilogue Fusion 变量（MIGraphX 风格融合）
-
-这组变量控制把 conv 之后的 elementwise 操作融合进 conv kernel，减少 kernel launch 次数，对标 MIGraphX 的 MLIR 深度融合。
+### 5.2 调优相关变量
 
 | 环境变量 | 默认 | 说明 |
 |----------|------|------|
-| `ROCMLIR_CONV_SKIP_FUSION` | 未设置 | 设为 `1` 启用 **conv+bias+skip（无SiLU）→ 单 kernel**。消除 `NO_ACTIVATION + has_add` 情况下的单独 skip-add kernel。对应 MIGraphX 的 `mlir_convolution_broadcast_add_add` 模式（yolo26x 中有 15 个）。**gfx1201 实测 +9 FPS（216→225 FPS）**，达到与 MIGraphX 持平。 |
-| `ROCMLIR_CONV_RESHAPE_FUSION` | 未设置 | 设为 `1` 启用 **conv+bias+reshape → 单 kernel**。将 Q/K/V 注意力投影后的 reshape 融入 conv kernel 写出（零开销视图变换），对应 MIGraphX 的 `mlir_convolution_broadcast_add_reshape` 模式。yolo26x 中有 9 个可融合的单消费者 reshape 模式。 |
-| `ROCMLIR_EPILOGUE_FUSION` | 未设置 | 设为 `1` 同时启用 `ROCMLIR_CONV_SKIP_FUSION` 和 `ROCMLIR_CONV_RESHAPE_FUSION`，并额外开启 conv+bias+silu 的 migraphx 编译路径（**注意：gfx1201 上此路径可能比 v3: tuning 慢，建议单独使用 `ROCMLIR_CONV_SKIP_FUSION`**）。 |
+| `ROCMLIR_ENABLE_TUNING` | 未设置 | 设为 `1` 启用穷举 perf_config 调优（约 50 个 shape）。首次运行耗时 10-30 分钟，结果持久化到缓存文件。**需独占 GPU**。 |
+| `ROCMLIR_TUNING_CACHE` | `~/.cache/ov_rocmlir_tuning_<arch>.json` | 调优缓存路径，可指定绝对路径实现团队共享。 |
 
-### 6.4 HIP 系统变量
+### 5.3 回退与调试变量
 
 | 环境变量 | 说明 |
 |----------|------|
-| `HIP_VISIBLE_DEVICES` | 限制可见 GPU（0-based 索引）。多卡共享服务器**必须指定**，避免 Memory Access Fault。 |
+| `ROCMLIR_EPILOGUE_FUSION=0` | 关闭 migraphx dialect，退回 rock dialect（v3: perf_config）和所有 epilogue pass。用于对比和调试。 |
+| `ROCM_FUSE_ATTENTION=0` | 关闭 Attention MatMul 融合，退回 rocBLAS。 |
+| `ROCM_FUSE_PE=0` | 关闭 pe(V) conv 融合。 |
+| `ROCM_SWISH_INPLACE=0` | 关闭 Swish 原位写入。 |
+| `ROCMLIR_CONV_SKIP_FUSION=0` | 关闭 conv+bias+skip 融合 kernel（migraphx dialect 下该配置不影响主路径）。 |
+| `HIP_VISIBLE_DEVICES=N` | 多卡环境必须指定，避免内存冲突（Memory Access Fault）。 |
 
-### 6.5 推荐配置组合
+### 5.4 最优配置（参考）
 
 ```bash
-# ── gfx1201（R9700）最优配置 ──
-HIP_VISIBLE_DEVICES=<独占GPU> \
-ROCM_FUSE_ATTENTION=1 \
-ROCMLIR_ENABLE_TUNING=1 \
-ROCMLIR_CONV_SKIP_FUSION=1 \
-./benchmark_app -m model.onnx -d ROCM -hint throughput
-# 预期：~225 FPS（与 MIGraphX 227 FPS 持平）
+# 当前版本默认即最优，无需额外环境变量
+# 可选：指定已调优的缓存文件
+ROCMLIR_TUNING_CACHE=/path/to/ov_rocmlir_tuning_gfx1201.json \
+benchmark_app -m model.onnx -d ROCM -hint throughput -nireq 14
 
-# ── gfx1100（RX 7900 XTX）最优配置 ──
-HIP_VISIBLE_DEVICES=<独占GPU> \
-ROCM_FUSE_ATTENTION=1 \
-ROCMLIR_ENABLE_TUNING=1 \
-./benchmark_app -m model.onnx -d ROCM -hint throughput
-# 预期：~221 FPS（vs MIGraphX ~168 FPS，领先 32%）
-
-# ── gfx950（MI350）最优配置 ──
-HIP_VISIBLE_DEVICES=<独占GPU> \
-ROCM_FUSE_ATTENTION=1 \
-ROCMLIR_ENABLE_TUNING=1 \
-./benchmark_app -m model.onnx -d ROCM -hint throughput
-# 预期：~500 FPS（vs MIGraphX ~295 FPS，领先 69%）
-
-# ── 调试 baseline（关闭所有融合）──
-HIP_VISIBLE_DEVICES=<GPU> \
-ROCM_FUSE_ATTENTION=0 ROCM_ZEROCOPY_SPLIT=0 ROCM_SWISH_INPLACE=0 \
-./benchmark_app -m model.onnx -d ROCM -hint throughput
+# 仅调试：关闭所有融合（验证基准性能）
+ROCMLIR_EPILOGUE_FUSION=0 \
+ROCM_FUSE_ATTENTION=0 \
+ROCM_SWISH_INPLACE=0 \
+benchmark_app -m model.onnx -d ROCM -hint throughput
 ```
 
 ---
 
-## 7. 各架构性能对比（yolo26x，FP16）
+## 6. 各架构性能对比
 
-### 7.1 吞吐量（Throughput）模式
+### 6.1 yolo26x FP16 吞吐量（Throughput）
 
-| GPU | 架构 | OV 基础 | OV + Tuning | OV + Tuning + SkipFusion | MIGraphX |
-|-----|------|---------|------------|--------------------------|---------|
-| Instinct MI350 | gfx950 / CDNA3 | ~330 FPS | **~500 FPS** | — | ~295 FPS |
-| Radeon AI PRO R9700 | gfx1201 / RDNA4 | ~175 FPS | ~220 FPS | **~225 FPS** ✅ | ~227 FPS |
-| RX 7900 XTX | gfx1100 / RDNA3 | ~170 FPS | **~221 FPS** | — | ~168 FPS |
-| Ryzen AI MAX+ 395 | gfx1151 / RDNA3.5 | **~80 FPS** | ~80 FPS | — | ~111 FPS |
+| GPU | 架构 | OV（默认） | OV + 调优缓存 | MIGraphX |
+|-----|------|-----------|--------------|---------|
+| **Radeon AI PRO R9700** | **gfx1201 / RDNA4** | ~175 FPS | **~233 FPS ✅** | ~224 FPS |
+| RX 7900 XTX | gfx1100 / RDNA3 | ~170 FPS | **~221 FPS ✅** | ~168 FPS |
+| Instinct MI350 | gfx950 / CDNA3 | ~330 FPS | **~500 FPS ✅** | ~295 FPS |
 
-> ✅ = 达到或超过 MIGraphX 水平
+> ✅ = 超过 MIGraphX 水平
 
-### 7.2 延迟（Latency）模式 — 单请求串行
+### 6.2 yolo26x FP16 单流延迟（Latency hint，nireq=1）
 
-| GPU | 架构 | OV Median 延迟 | OV 单流吞吐 | MIGraphX Median |
-|-----|------|---------------|------------|-----------------|
-| Instinct MI350 | gfx950 | **5.20 ms** | ~192 FPS | 3.36 ms |
-| Radeon AI PRO R9700 | gfx1201 | **7.30 ms** | ~137 FPS | 4.42 ms |
-| RX 7900 XTX | gfx1100 | **6.97 ms** | ~143 FPS | 5.96 ms |
-| Ryzen AI MAX+ 395 | gfx1151 | **13.96 ms** | ~72 FPS | 9.01 ms |
+| GPU | 架构 | OV 中位延迟 | MIGraphX 中位延迟 |
+|-----|------|------------|-----------------|
+| Radeon AI PRO R9700 | gfx1201 | ~5.5 ms | 4.44 ms |
+| RX 7900 XTX | gfx1100 | ~7.0 ms | ~6.0 ms |
+| Instinct MI350 | gfx950 | ~2.5 ms | ~3.4 ms |
 
-> **说明**：延迟模式下 OV 有 ~299 个 kernel launch 的 CPU dispatch 开销（~1.4ms/inf），MIGraphX 只有 ~84 个 kernel（~0.4ms/inf）。吞吐量模式通过多并发隐藏了这一开销。
+### 6.3 MIGraphX 参考（gfx1201）
 
----
-
-## 8. 性能优化历程（yolo26x，gfx950）
-
-以下记录了 OpenVINO ROCm Plugin 在 yolo26x（640×640 输入，FP16）上的完整优化历程。
-
-| 阶段 | 优化项 | 修改文件 | 吞吐量 | 增量 | 说明 |
-|------|--------|----------|--------|------|------|
-| Baseline | MIOpen Immediate Mode | — | **~130 FPS** | — | gfx950 上 solution_id 85/88 不稳定，频繁 GPU fault |
-| +rocMLIR | 卷积后端切换 rocMLIR | `fused_convolution.cpp` 工厂优先级 | **~200 FPS** | +70 | rock.conv → HSACO，绕过不稳定路径，支持 Conv+Bias+SiLU 融合 |
-| +ZeroCopy | VariadicSplit 零拷贝 | `variadic_split_zero_copy.cpp` | **~220 FPS** | +20 | QKV split 改为 buffer alias，消除 D2D 拷贝 |
-| +EWFusion | ElementwiseFusionPass | `elementwise_fusion_transformation.cpp` | **~250 FPS** | +30 | Sigmoid/Mul/Add 链融合为单 FusedElementwise kernel |
-| +AttnFuse | Attention MatMul 融合 | `rocm_attention_matmul.cpp` | **~265 FPS** | +15 | Q×Kᵀ + A×V 用 MIGraphX MLIR kernel，32× attention GEMM 加速 |
-| +HIPFirst | Add/Multiply/Clamp 工厂 HIP 优先 | `add.cpp`、`multiply.cpp`、`clamp.cpp` | **~330 FPS** | **+65** | 消除 `miopenOpTensor()→Op5dTensorGeneric`（原占 14.2% GPU 时间），HIP kernel 快 19× |
-| +Tuning | rocMLIR perf_config 调优 | `rocmlir_compiler.cpp` | **~500 FPS** | +170 | `ROCMLIR_ENABLE_TUNING=1` 穷举最优 tile 配置，gfx950 获益最大 |
-
-### gfx1201 专项优化历程
-
-| 阶段 | 吞吐量 | 说明 |
-|------|--------|------|
-| 初始（仅 rocMLIR） | ~175 FPS | 默认 v3: heuristic |
-| + Tuning（独占 GPU） | ~220 FPS | v3: 调优缓存，共享 GPU 下配置不准 |
-| + `ROCMLIR_CONV_SKIP_FUSION=1` | **~225 FPS** | conv+bias+skip 无SiLU → 单 migraphx kernel，消除独立 skip-add launch |
-| MIGraphX 对比 | ~227 FPS | 两者基本持平 |
+```
+Rate: 224.2 inferences/sec
+Total time: 4.44ms (Median), Min: 4.35ms, Max: 4.66ms
+```
 
 ---
 
-## 9. MIGraphX 融合机制分析
+## 7. 优化历程与技术细节
 
-### 9.1 MIGraphX 为何 kernel 少
+### 7.1 gfx1201 性能优化全历程（yolo26x FP16）
 
-通过 `MIGRAPHX_TRACE_MLIR=1` 分析 yolo26x，MIGraphX 使用以下 kernel 类型：
+| 版本 | FPS | 关键改动 |
+|------|-----|---------|
+| 初始基线 | 104 FPS | FusedConvolution 路由错误 |
+| +FusedConv 修复 | 141 FPS | `consumers_count` + `Reshape(Constant)` 修复 |
+| +WMMA auto-select | 157 FPS | gfx12xx 返回 `""` 自动选 WMMA |
+| +Tuning | ~181 FPS | `ROCMLIR_ENABLE_TUNING=1` |
+| +Transpose/Tile 预分配 | **212 FPS** | 消除推理时动态 `hipMalloc`（-1.5ms/inf） |
+| **+migraphx dialect 默认** | **233 FPS** | Conv kernel 换用 MIGraphX MLIR 编译路径（-2.1ms/inf） |
+| MIGraphX 参考 | 224 FPS | — |
 
-| MIGraphX kernel 类型 | 编译次数 | 对应 OV 处理方式 | 差异 |
-|---------------------|---------|----------------|------|
-| `conv+bias+silu` | 587 | `mlir_conv_bias_silu` | 两者均有，OV 已匹配 |
-| `conv+bias+reshape` | 168 | conv kernel + 零开销 reshape 视图 | OV reshape 已零开销，无 kernel 差异 |
-| `slice+conv+bias+silu` | 121 | `FusedConvolutionSlice` | OV 已匹配 |
-| `conv+bias` (无SiLU) | 34 | `mlir_conv_bias` | 两者均有 |
-| **`conv+bias+add+add`** | **15** | conv kernel + 单独 `bias_add` kernel | **OV 缺失！** |
-| reshape+slice+attention | 22+22+34 | `RocmAttentionMatMulOp` | OV 用注意力 MLIR kernel 覆盖 |
+### 7.2 关键优化说明
 
-**根本原因**：MIGraphX 把 `conv+bias+skip（无SiLU）` 的 bias-add 和 skip-add 融合进单 kernel (`mlir_convolution_broadcast_add_add`)；OV 原本会为此运行两个 kernel（conv+bias + 单独 bias_add）。`ROCMLIR_CONV_SKIP_FUSION=1` 修复了这一差距。
+#### A. Transpose/Tile 预分配（+18% FPS）
 
-### 9.2 rocMLIR 的融合限制
+**问题**：`TransposeOp` 和 `TileOp` 在每次推理的 `Execute()` 里调用 `hipMalloc`
+为 stride/offset 数组分配临时 GPU buffer，`hipMalloc` 会触发 GPU 全局同步，
+引入 ~1.5ms/inference 的延迟。
 
-- **✅ 支持**：一个 function 内 = 一个 conv + 任意 elementwise epilogue（add、mul、sigmoid、reshape 等）
-- **❌ 不支持**：一个 function 内包含多个 conv（报错：`Multiple Fusion Roots detected`）
+**修复**：在 op 构造时（compile 阶段）预分配 device buffer，
+`Execute()` 只做 `hipLaunchKernel`，不再有动态分配。
 
-因此，OV 通过 epilogue fusion（`ROCMLIR_CONV_SKIP_FUSION` 等）逐渐逼近 MIGraphX 的 kernel 数量，而无法通过"多 conv 合一 kernel"超越。
+**修改文件**：
+- `kernels/transpose.hip`：新增 `allocTransposeDeviceBuffers` / `freeTransposeDeviceBuffers`
+- `ops/transpose.cpp/.hpp`：构造时调用 `alloc`，析构时 `free`，Execute 使用预分配 buffer
+- `kernels/tile.hip`、`ops/tile.cpp/.hpp`：同上
 
-### 9.3 MIGraphX 是否使用 HIP Graph
+#### B. migraphx dialect 默认启用（+10% FPS）
 
-**否。** 通过 `nm -D libmigraphx_gpu.so` 确认 MIGraphX 没有导入任何 `hipGraph*` 相关 API。MIGraphX 的低 CPU dispatch 开销来自 **更少的 kernel 数量**（~84/inf vs OV 的 ~299/inf），而非 HIP Graph 技术。
+**问题**：rock dialect 的 `patch_ir_bias_silu` 用 `linalg.generic` 作为 epilogue，
+Conv 输出需要经过中间 `memref.alloc`（GPU 内存分配）才能做 bias+silu，
+产生额外的内存读写。
 
-OV Plugin 本身实现了 HIP Graph 支持（可通过 `ROCM_USE_HIP_GRAPH=YES` 开启），但目前在部分 GPU 上驱动支持不完整。
+**migraphx dialect 的优势**：
+- `migraphx.convolution` + 内联 `sigmoid`/`mul` 算子，单 kernel 完成
+- GPU 编译器可以将 epilogue 操作放在寄存器中，不需要中间 alloc
+- `MarkConvReshapeEpiloguePass` 额外将 Conv→Reshape（Attention 投影）融合进 kernel，
+  消除了 `/model.23/Transpose`（0.41ms → 0.02ms）
+
+**默认启用**：`ROCMLIR_EPILOGUE_FUSION` 条件从 `env=="1"` 改为 `env!="0"`。
+
+**关闭方式**（用于对比调试）：
+```bash
+ROCMLIR_EPILOGUE_FUSION=0 benchmark_app ...
+```
+
+#### C. Swish no-op 消除
+
+**问题**：`EliminateFusedSiluSwishPass` 标记了 110 个 Swish 为 inplace no-op，
+但它们仍在 exec_sequence 中，每次推理都要 dispatch（即使 Execute 是空的）。
+
+**修复**：在 `SubGraph::initExecuteSequence` 里，对标记了 `rocm_swish_inplace`
+的节点直接 `continue`，不加入 exec_sequence，同时在每次推理前
+`g_silu_applied_buffers.clear()` 防止状态泄漏。
+
+dispatch 数量：352 → 256（减少 27%）。
+
+### 7.3 内存使用分析
+
+| 组件 | OV | MIGraphX |
+|------|-----|---------|
+| 中间张量（mutable blob） | **43 MB**（MemorySolver coloring） | 54 MB（scratch） |
+| 模型权重（const） | 106 MB | ~50 MB |
+| HSACO GPU code segment | ~300 MB（74 kernels × 2MB/kernel 加载膨胀） | ~0 MB（嵌入 .so） |
+
+OV 的中间张量内存（43MB）已经优于 MIGraphX（54MB）。
+主要内存差距来自 HSACO GPU code 加载，这是独立 `hipModuleLoadData` 调用的固有开销。
+
+### 7.4 MIGraphX vs OV 融合机制对比
+
+| 维度 | MIGraphX | OV ROCm Plugin |
+|------|----------|----------------|
+| 是否用 hipGraph | **否**（顺序单流） | 否（已实现基础设施，待完整验证） |
+| conv epilogue | MLIR 内联融合（一步） | migraphx dialect（一步，已匹配） |
+| kernel 数量/inference | ~127 | ~256（含 inplace no-op） |
+| 内存分配 | compile 时全部预分配 | compile 时预分配，Transpose/Tile 已修复 |
+| 单流延迟 | 4.44ms | ~5.5ms |
+| 多流吞吐（最优 nireq） | 224 FPS（单流） | **233 FPS**（nireq=12-14） |
 
 ---
 
-## 附录：常见问题
+## 8. 附录：常见问题
+
+### rocMLIR 构建失败：`_GLIBCXX_USE_CXX11_ABI` 宏重复
+
+**原因**：HIP cmake 配置 (`hip::host` target) 的 `INTERFACE_COMPILE_DEFINITIONS`
+在某些 ROCm 版本里包含格式错误的宏定义，被 Ninja 解析后重复。
+
+**修复**：
+```bash
+cd /home/rocMLIR/build
+python3 -c "
+import re, shutil
+shutil.copy('build.ninja', 'build.ninja.bak')
+with open('build.ninja') as f: content = f.read()
+fixed = re.sub(r' -D_GLIBCXX_USE_CXX11_ABI=\\\"[^\\\"]*\\\"', '', content)
+count = len(re.findall(r' -D_GLIBCXX_USE_CXX11_ABI=\\\"', content))
+with open('build.ninja', 'w') as f: f.write(fixed)
+print(f'Fixed {count} occurrences')
+"
+ninja -j$(nproc) rocmlir-driver rocmlir-gen
+```
 
 ### Memory Access Fault
 
 ```
-Memory access fault by GPU node-X (Agent handle: ...) on address ...
+Memory access fault by GPU node-X on address ...
 ```
 
-**原因**：目标 GPU 的 VRAM 已被其他进程占满，或使用了共享 GPU 上的内存。
+**原因**：多 GPU 环境中指定了错误的 GPU，VRAM 被其他进程占用。
 
-**解决**：`rocm-smi` 查看 VRAM 占用，`HIP_VISIBLE_DEVICES=N` 指定空闲 GPU。
-
-### Tuning 结果不准（性能偏低）
-
-如果 `ROCMLIR_ENABLE_TUNING=1` 得到的 tuning 缓存反而使性能下降，原因是在**共享 GPU** 上运行 tuning 时，其他进程的负载导致各配置的测量时间不准，选出了错误的"最优"配置。
-
-**解决**：删除缓存文件（`~/.cache/ov_rocmlir_tuning_gfx1201.json` 等），在**独占 GPU** 上重新运行 tuning。
-
-### rocMLIR kernel 首次编译慢
-
-首次推理时会 JIT 编译 MLIR kernel（约 30-120 秒），后续缓存至 `~/.cache/ov_rocmlir_tuning_<arch>.json`。
-
-### 验证 HIP 优先路径（消除 Op5dTensorGeneric）
-
+**解决**：
 ```bash
-HIP_VISIBLE_DEVICES=1 ROCM_FUSE_ATTENTION=1 \
-rocprof --stats -o /tmp/prof.csv \
-    ./benchmark_app -m model.onnx -d ROCM -hint throughput -t 10
-
-grep "Op5dTensor" /tmp/prof.stats.csv
-# 若无输出，说明 MIOpen 通用路径已被正确绕过
+rocm-smi --showmeminfo vram  # 查看各 GPU VRAM 占用
+HIP_VISIBLE_DEVICES=N benchmark_app ...  # 指定空闲 GPU
 ```
 
-### 验证 Conv+Skip 融合是否生效
+### cmake 找不到 cmake 二进制
+
+ROCm 容器通常没有系统 cmake，用 pip 安装：
+```bash
+pip install cmake
+which cmake  # 应在 /opt/venv/bin/cmake 或 ~/.local/bin/cmake
+```
+
+### 调优缓存使性能下降
+
+在**共享 GPU** 上运行 tuning 时，其他进程的负载导致 perf_config 测量不准。
+
+**解决**：在独占 GPU 上删除旧缓存重新调优：
+```bash
+rm ~/.cache/ov_rocmlir_tuning_gfx1201.json
+ROCMLIR_ENABLE_TUNING=1 benchmark_app -m model.onnx -d ROCM -hint throughput -t 180
+```
+
+### 验证 migraphx dialect 是否生效
 
 ```bash
-HIP_VISIBLE_DEVICES=1 ROCM_FUSE_ATTENTION=1 ROCMLIR_CONV_SKIP_FUSION=1 \
-rocprof --stats -o /tmp/prof_skip.csv \
-    ./benchmark_app -m model.onnx -d ROCM -hint throughput -t 10
+benchmark_app -m model.onnx -d ROCM -hint throughput -nireq 1 -t 5 \
+    2>&1 | grep -E "EpilogueTag|SiLUAddEpilogue|migraphx" | head -5
+# 应看到：[EpilogueTag] ... 或 [SiLUAddEpilogue] Compiled 6-arg kernel
+```
 
-grep "mlir_convolution_broadcast_add_add" /tmp/prof_skip.stats.csv
-# 若出现此 kernel，说明 conv+bias+skip 融合已生效
+### 验证 Transpose 预分配是否生效
+
+```bash
+# ROCM_LOG 会显示 hipMalloc 调用，预分配后推理时不应出现 hipMalloc
+AMD_LOG_LEVEL=3 benchmark_app -m model.onnx -d ROCM -hint throughput -nireq 1 -t 3 \
+    2>&1 | grep -c "hipMalloc"
+# 期望：比之前少（主要剩下 compile 阶段的分配）
 ```
