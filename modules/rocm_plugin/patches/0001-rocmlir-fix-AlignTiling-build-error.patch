@@ -1,0 +1,29 @@
+From 755a77dd78439cb4b3da265c216cdcec0510be87 Mon Sep 17 00:00:00 2001
+From: zhangnju <zhangnju@126.com>
+Date: Thu, 11 Jun 2026 14:43:51 +0000
+Subject: [PATCH] Fix AlignTiling build error: std::ignore = reasonCallback
+
+In NDEBUG mode, 'std::ignore reasonCallback' is invalid C++ syntax
+(missing the assignment operator). Fix to 'std::ignore = reasonCallback'
+to suppress the unused variable warning, matching the pattern used
+elsewhere in the same function.
+---
+ mlir/lib/Dialect/Rock/Transforms/AlignTiling.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/mlir/lib/Dialect/Rock/Transforms/AlignTiling.cpp b/mlir/lib/Dialect/Rock/Transforms/AlignTiling.cpp
+index 641a1354eb96..3efbb1da14a7 100644
+--- a/mlir/lib/Dialect/Rock/Transforms/AlignTiling.cpp
++++ b/mlir/lib/Dialect/Rock/Transforms/AlignTiling.cpp
+@@ -399,7 +399,7 @@ void LinalgAlignRewriter::notifyMatchFailure(
+   });
+ #ifdef NDEBUG
+   std::ignore = loc;
+-  std::ignore reasonCallback;
++  std::ignore = reasonCallback;
+ #endif
+ }
+ 
+-- 
+2.43.0
+

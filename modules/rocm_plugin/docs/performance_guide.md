@@ -86,9 +86,43 @@ cmake /home/rocMLIR \
 ninja -j$(nproc) rocmlir-driver rocmlir-gen
 ```
 
-**已知编译问题及修复**：
+### 2.3 应用 rocm_plugin patches
 
-1. **build.ninja 中 `_GLIBCXX_USE_CXX11_ABI` 宏重复**（HIP cmake config bug）：
+ROCm Plugin 在 `patches/` 目录下提供了针对 rocMLIR 的补丁，**在 cmake 之前 apply**：
+
+```bash
+ROCM_PLUGIN_DIR=/home/openvino/openvino_contrib/modules/rocm_plugin
+ROCMLIR_DIR=/home/rocMLIR
+
+# 应用所有 patch（按文件名顺序）
+for patch in ${ROCM_PLUGIN_DIR}/patches/*.patch; do
+    echo "Applying: $(basename $patch)"
+    git -C ${ROCMLIR_DIR} am --3way < "$patch"
+done
+```
+
+也可以单独 apply 某个 patch：
+
+```bash
+# 0001: 修复 AlignTiling.cpp NDEBUG 模式下的语法错误
+# （std::ignore reasonCallback → std::ignore = reasonCallback）
+git -C ${ROCMLIR_DIR} am --3way \
+    < ${ROCM_PLUGIN_DIR}/patches/0001-rocmlir-fix-AlignTiling-build-error.patch
+```
+
+若 `git am` 因版本差异失败，可用 `git apply`：
+
+```bash
+git -C ${ROCMLIR_DIR} apply \
+    ${ROCM_PLUGIN_DIR}/patches/0001-rocmlir-fix-AlignTiling-build-error.patch
+```
+
+> **patches 目录说明**：
+> - `0001-rocmlir-fix-AlignTiling-build-error.patch`：修复 `AlignTiling.cpp` 在 g++ Release 构建时的语法错误（`std::ignore reasonCallback` 缺少赋值运算符，导致编译失败）。
+
+**已知编译问题及额外修复**（若 patch 未能完全覆盖）：
+
+1. **build.ninja 中 `_GLIBCXX_USE_CXX11_ABI` 宏重复**（HIP cmake config bug，cmake 之后执行）：
 ```bash
 python3 -c "
 import re, shutil
@@ -100,13 +134,7 @@ print('Fixed', len(re.findall(r' -D_GLIBCXX_USE_CXX11_ABI=\\\"', content)), 'occ
 "
 ```
 
-2. **AlignTiling.cpp 语法错误**（`std::ignore reasonCallback` → `std::ignore = reasonCallback`）：
-```bash
-sed -i 's/std::ignore reasonCallback;/std::ignore = reasonCallback;/' \
-    mlir/lib/Dialect/Rock/Transforms/AlignTiling.cpp
-```
-
-### 2.3 安装
+### 2.4 安装
 
 ```bash
 mkdir -p /home/rocmlir_install/bin
