@@ -471,25 +471,29 @@ bool ov::rocm_gpu::pass::rocmConvolutionFusion::run_on_model(const std::shared_p
         OPENVINO_RTTI("SinkSwishAddPass", "0");
         bool run_on_model(const std::shared_ptr<ov::Model>& model) override {
             bool changed = false;
-            // Collect candidates first to avoid modifying graph while iterating
-            std::vector<std::tuple<std::shared_ptr<FusedConvolution>,
+            // Collect candidates first to avoid modifying graph while iterating.
+            // Tuple: (conv_node, swish, add, skip_input, is_group_conv)
+            std::vector<std::tuple<std::shared_ptr<ov::Node>,
                                     std::shared_ptr<ov::op::v4::Swish>,
                                     std::shared_ptr<ov::op::v1::Add>,
-                                    ov::Output<ov::Node>>> candidates;
+                                    ov::Output<ov::Node>,
+                                    bool>> candidates;
 
             for (const auto& op : model->get_ordered_ops()) {
                 auto swish = std::dynamic_pointer_cast<ov::op::v4::Swish>(op);
                 if (!swish) continue;
 
-                // Check: FusedConvolution → Swish (exclusive consumer of FusedConv)
+                // Check: FusedConvolution or FusedGroupConvolution → Swish
                 auto fc_out = swish->input(0).get_source_output();
-                auto fused_conv = std::dynamic_pointer_cast<FusedConvolution>(fc_out.get_node_shared_ptr());
-                if (!fused_conv) continue;
-                if (fused_conv->has_add_node()) continue;
-                if (fused_conv->get_activation() != ActivationMode::NO_ACTIVATION) continue;
-                // FusedConv output might also feed the Swish detection logic; allow multiple consumers
-                // but check that this particular output feeds only Swish here
-                // (The only case where FusedConv→Swish is the right pattern)
+                auto fused_conv  = std::dynamic_pointer_cast<FusedConvolution>(fc_out.get_node_shared_ptr());
+                auto fused_gconv = std::dynamic_pointer_cast<FusedGroupConvolution>(fc_out.get_node_shared_ptr());
+                if (!fused_conv && !fused_gconv) continue;
+
+                const bool is_group = (fused_gconv != nullptr);
+                const bool has_add  = is_group ? fused_gconv->has_add_node()  : fused_conv->has_add_node();
+                const auto act      = is_group ? fused_gconv->get_activation() : fused_conv->get_activation();
+                if (has_add) continue;
+                if (act != ActivationMode::NO_ACTIVATION) continue;
 
                 // Check: Swish → Add (skip connection), Swish has exactly one consumer
                 auto swish_out = swish->output(0);
@@ -507,11 +511,6 @@ bool ov::rocm_gpu::pass::rocmConvolutionFusion::run_on_model(const std::shared_p
                     }
                 }
                 if (!skip_input.get_node()) continue;
-                // Previously excluded VariadicSplit skip inputs to avoid shape issues.
-                // Now allowed: the split output is already the correct size for the Add,
-                // so we can fuse Conv+Bias+SiLU+Add(split_out) directly.
-                // This enables the mlir_convolution_broadcast_slice_add_sigmoid_mul_add
-                // pattern (30 occurrences) where split provides the residual.
 
                 // Check shapes match
                 auto ps0 = add_node->input(0).get_partial_shape();
@@ -520,28 +519,44 @@ bool ov::rocm_gpu::pass::rocmConvolutionFusion::run_on_model(const std::shared_p
                 if (ps0.to_shape() != ps1.to_shape()) continue;
                 if (add_node->input(0).get_element_type() != add_node->input(1).get_element_type()) continue;
 
-                candidates.emplace_back(fused_conv, swish, add_node, skip_input);
+                std::shared_ptr<ov::Node> conv_node = is_group
+                    ? std::static_pointer_cast<ov::Node>(fused_gconv)
+                    : std::static_pointer_cast<ov::Node>(fused_conv);
+                candidates.emplace_back(conv_node, swish, add_node, skip_input, is_group);
             }
 
-            std::cerr << "[SinkSwishAdd] Fusing " << candidates.size() << " Conv+Bias+SiLU+Add patterns\n";
-            for (auto& [fc, sw, add, skip] : candidates) {
-                const ov::Output<ov::Node>& data    = fc->input(0).get_source_output();
-                const ov::Output<ov::Node>& filters = fc->input(1).get_source_output();
-                const ov::Output<ov::Node>& bias    = fc->input(2).get_source_output();
+            int n_group = 0;
+            for (auto& [conv, sw, add, skip, is_group] : candidates) {
+                if (is_group) n_group++;
+                const ov::Output<ov::Node>& data    = conv->input(0).get_source_output();
+                const ov::Output<ov::Node>& filters = conv->input(1).get_source_output();
+                const ov::Output<ov::Node>& bias    = conv->input(2).get_source_output();
 
-                auto fused = std::make_shared<FusedConvolution>(
-                    data, filters, bias, skip,
-                    fc->get_strides(), fc->get_pads_begin(), fc->get_pads_end(),
-                    fc->get_dilations(), fc->get_auto_pad(), ActivationMode::SWISH);
+                std::shared_ptr<ov::Node> fused;
+                if (!is_group) {
+                    auto fc = std::dynamic_pointer_cast<FusedConvolution>(conv);
+                    fused = std::make_shared<FusedConvolution>(
+                        data, filters, bias, skip,
+                        fc->get_strides(), fc->get_pads_begin(), fc->get_pads_end(),
+                        fc->get_dilations(), fc->get_auto_pad(), ActivationMode::SWISH);
+                } else {
+                    auto fgc = std::dynamic_pointer_cast<FusedGroupConvolution>(conv);
+                    fused = std::make_shared<FusedGroupConvolution>(
+                        data, filters, bias, skip,
+                        fgc->get_strides(), fgc->get_pads_begin(), fgc->get_pads_end(),
+                        fgc->get_dilations(), fgc->get_auto_pad(), ActivationMode::SWISH);
+                }
 
                 fused->set_friendly_name(add->get_friendly_name());
-                ov::copy_runtime_info({fc, sw, add}, fused);
+                ov::copy_runtime_info({conv, sw, add}, fused);
                 set_node_id(fused, get_node_id(add));
 
-                ov::replace_node(fc, fused);
+                ov::replace_node(conv, fused);
                 ov::replace_node(add, fused);
                 changed = true;
             }
+            std::cerr << "[SinkSwishAdd] Fusing " << candidates.size()
+                      << " Conv+Bias+SiLU+Add patterns (" << n_group << " group conv)\n";
             return changed;
         }
     };
@@ -871,9 +886,13 @@ bool ov::rocm_gpu::pass::rocmConvolutionFusion::run_on_model(const std::shared_p
             return changed;
         }
     };
-    // Only register when ROCMLIR_EPILOGUE_FUSION=1 (avoid overhead otherwise)
-    if (std::getenv("ROCMLIR_EPILOGUE_FUSION"))
-        manager.register_pass<MarkSwishAddEpiloguePass>();
+    // Register by default; disable with ROCMLIR_EPILOGUE_FUSION=0.
+    // MarkSwishAddEpiloguePass tags FC→Swish→Add(aux_silu) for 6-arg migraphx kernel.
+    {
+        const char* e = std::getenv("ROCMLIR_EPILOGUE_FUSION");
+        if (!(e && std::string(e) == "0"))
+            manager.register_pass<MarkSwishAddEpiloguePass>();
+    }
 
     // MarkConvReshapeEpiloguePass: detect FusedConvolution(bias_only) → Reshape pattern
     // and tag the FC for ROCMLIR_EPILOGUE_FUSION to compile as mlir_convolution_broadcast_add_reshape.
@@ -923,8 +942,12 @@ bool ov::rocm_gpu::pass::rocmConvolutionFusion::run_on_model(const std::shared_p
             return changed;
         }
     };
-    if (std::getenv("ROCMLIR_CONV_RESHAPE_FUSION") || std::getenv("ROCMLIR_EPILOGUE_FUSION"))
-        manager.register_pass<MarkConvReshapeEpiloguePass>();
+    // Register by default; disable with ROCMLIR_EPILOGUE_FUSION=0 (and no ROCMLIR_CONV_RESHAPE_FUSION).
+    {
+        const char* e = std::getenv("ROCMLIR_EPILOGUE_FUSION");
+        if (std::getenv("ROCMLIR_CONV_RESHAPE_FUSION") || !(e && std::string(e) == "0"))
+            manager.register_pass<MarkConvReshapeEpiloguePass>();
+    }
 
     // FuseVariadicSplitConvPass: replace FusedConvolution with FusedConvolutionSlice
     // to enable zero-copy Slice+Conv+SiLU fusion via MIGraphX-quality kernels.
@@ -1004,7 +1027,6 @@ bool ov::rocm_gpu::pass::rocmConvolutionFusion::run_on_model(const std::shared_p
     auto fuse_group_conv_bias_add_activation = manager.register_pass<ov::pass::GraphRewrite>();
     ADD_MATCHER(fuse_group_conv_bias_add_activation, FuseGroupConvolutionWithBiasAdd)
     ADD_MATCHER(fuse_group_conv_bias_add_activation, FuseGroupConvolutionWithBiasAddAdd)
-    // TODO: Activations, should check performance first
     fuse_group_conv_bias_add_activation->set_name("ov::rocm_gpu::pass::fuse_group_conv_bias_add_activation");
 
     manager.register_pass<rocmFuseConvBackpropDataAdd>();

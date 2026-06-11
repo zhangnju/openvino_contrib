@@ -236,8 +236,13 @@ FusedConvolutionRocMLIR::FusedConvolutionRocMLIR(
         kernel_ = &rocmlir::RocMLIRKernelCache::global()
                        .get_or_compile_slice_conv_bias_silu(conv_params_);  // will use NO_ACTIVATION
     } else if (activation_ == nodes::ActivationMode::SWISH && has_add_) {
-        // Check if migraphx dialect is requested (experimental: may differ from tuned v3:)
-        static const bool use_epilogue_fusion = []{ const char* e = std::getenv("ROCMLIR_EPILOGUE_FUSION"); return e && std::string(e)=="1"; }();
+        // migraphx dialect: conv+bias+silu+skip_add in one kernel (5 args).
+        // Default ON — uses MIGraphX-compatible MLIR pipeline for better GPU pipeline efficiency.
+        // Set ROCMLIR_EPILOGUE_FUSION=0 to fall back to rock dialect (v3: perf_config path).
+        static const bool use_epilogue_fusion = []{
+            const char* e = std::getenv("ROCMLIR_EPILOGUE_FUSION");
+            return !(e && std::string(e) == "0");
+        }();
         if (use_epilogue_fusion) {
             // migraphx dialect: conv+bias+silu+skip_add in one kernel (5 args)
             auto compiled = rocmlir::compile_conv_migraphx(conv_params_, "", /*with_skip=*/true);
@@ -249,7 +254,12 @@ FusedConvolutionRocMLIR::FusedConvolutionRocMLIR(
                        .get_or_compile_fused_bias_silu_add(conv_params_);
         }
     } else if (activation_ == nodes::ActivationMode::SWISH) {
-        static const bool use_epilogue_fusion2 = []{ const char* e = std::getenv("ROCMLIR_EPILOGUE_FUSION"); return e && std::string(e)=="1"; }();
+        // migraphx dialect: conv+bias+silu in one kernel (4 args). Default ON.
+        // Set ROCMLIR_EPILOGUE_FUSION=0 to use rock dialect (v3: perf_config path).
+        static const bool use_epilogue_fusion2 = []{
+            const char* e = std::getenv("ROCMLIR_EPILOGUE_FUSION");
+            return !(e && std::string(e) == "0");
+        }();
         if (use_epilogue_fusion2) {
             // migraphx dialect: conv+bias+silu in one kernel (4 args)
             auto compiled = rocmlir::compile_conv_migraphx(conv_params_, "", /*with_skip=*/false);
