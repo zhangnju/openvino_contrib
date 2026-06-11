@@ -567,10 +567,11 @@ struct HsacoKernelCache {
         const std::string hsaco_path = dir + "/" + hex + ".hsaco";
         const std::string meta_path  = dir + "/" + hex + ".meta";
 
-        // Read meta file: kernel_name\ngrid_x\nblock_x\n
+        // Meta format: kernel_name\ngrid_x\nblock_x\nflags\n
+        // flags = bias_fused | (silu_fused<<1) | (skip_add_fused<<2)
         std::ifstream mf(meta_path);
         if (!mf.is_open()) return false;
-        std::string kname, sgrid, sblock;
+        std::string kname, sgrid, sblock, sflags;
         if (!std::getline(mf, kname) || !std::getline(mf, sgrid) || !std::getline(mf, sblock))
             return false;
 
@@ -583,8 +584,17 @@ struct HsacoKernelCache {
         out.kernel_name = kname;
         out.grid_x  = std::stoi(sgrid);
         out.block_x = std::stoi(sblock);
-        out.bias_fused = true;
-        out.silu_fused = true;
+        if (std::getline(mf, sflags) && !sflags.empty()) {
+            int flags = std::stoi(sflags);
+            out.bias_fused     = (flags & 1) != 0;
+            out.silu_fused     = (flags & 2) != 0;
+            out.skip_add_fused = (flags & 4) != 0;
+        } else {
+            // Legacy cache without flags line: assume bias+silu (SliceConv default)
+            out.bias_fused = true;
+            out.silu_fused = true;
+            out.skip_add_fused = false;
+        }
         return true;
     }
 
@@ -600,10 +610,11 @@ struct HsacoKernelCache {
             std::ofstream hf(dir + "/" + hex + ".hsaco", std::ios::binary | std::ios::trunc);
             hf.write(c.hsaco.data(), (std::streamsize)c.hsaco.size());
         }
-        // Write meta
+        // Write meta: kernel_name\ngrid_x\nblock_x\nflags\n
         {
+            int flags = (c.bias_fused ? 1 : 0) | (c.silu_fused ? 2 : 0) | (c.skip_add_fused ? 4 : 0);
             std::ofstream mf(dir + "/" + hex + ".meta", std::ios::trunc);
-            mf << c.kernel_name << "\n" << c.grid_x << "\n" << c.block_x << "\n";
+            mf << c.kernel_name << "\n" << c.grid_x << "\n" << c.block_x << "\n" << flags << "\n";
         }
     }
 };
@@ -1857,6 +1868,13 @@ print('OK')
 
 CompiledConv compile_fused_conv_bias(const ConvParams& p, const std::string& drv) {
     const std::string driver = drv.empty() ? find_rocmlir_driver() : drv;
+
+    auto& kc = HsacoKernelCache::instance();
+    const size_t cache_key = p.hash() ^ static_cast<size_t>(0xB1A5B1A5B1A50001ULL);
+    { CompiledConv cached; if (kc.load(cache_key, p.arch, cached)) {
+        std::cerr << "[BiasIR-cache] loaded bias kernel=" << cached.kernel_name << "\n";
+        return cached; } }
+
     const std::string gen    = find_rocmlir_gen(driver);
     const std::string perf_cfg = get_tuned_perf_config(p, gen, driver);
     const std::string gen_cmd  = rocmlir_gen_cmd(p, gen, perf_cfg);
@@ -1882,17 +1900,30 @@ CompiledConv compile_fused_conv_bias(const ConvParams& p, const std::string& drv
             auto result = compile_mlir_ir(fused_ir, p.arch, driver);
             result.bias_fused = true;
             std::cerr << "[BiasIR] bias fusion OK kernel=" << result.kernel_name << "\n";
+            kc.save(cache_key, p.arch, result);
             return result;
         } catch (const std::exception& e) {
             std::cerr << "[BiasIR] compile failed: " << e.what() << "\n";
         }
     }
     // Fallback: plain conv kernel (caller applies bias separately)
-    return compile_mlir_ir(base_ir, p.arch, driver);
+    auto result = compile_mlir_ir(base_ir, p.arch, driver);
+    kc.save(cache_key, p.arch, result);
+    return result;
 }
 
 CompiledConv compile_fused_conv_bias_act(const ConvParams& p, Activation act, const std::string& drv) {
     const std::string driver = drv.empty() ? find_rocmlir_driver() : drv;
+    const bool with_silu = (act == Activation::Sigmoid);
+
+    auto& kc = HsacoKernelCache::instance();
+    // Use separate magic per silu/non-silu to avoid collision
+    const size_t cache_key = p.hash() ^ (with_silu ? static_cast<size_t>(0xB1A5B1A5B1A50002ULL)
+                                                    : static_cast<size_t>(0xB1A5B1A5B1A50008ULL));
+    { CompiledConv cached; if (kc.load(cache_key, p.arch, cached)) {
+        std::cerr << "[BiasIR-cache] loaded bias_act silu=" << with_silu
+                  << " kernel=" << cached.kernel_name << "\n";
+        return cached; } }
 
     const std::string gen    = find_rocmlir_gen(driver);
     const std::string perf_cfg = get_tuned_perf_config(p, gen, driver);
@@ -1904,7 +1935,6 @@ CompiledConv compile_fused_conv_bias_act(const ConvParams& p, Activation act, co
         OPENVINO_THROW("rocmlir-gen failed for fused_bias_act (exit ", exit_code, ")");
 
     // Conv+Bias+SiLU fusion (eliminates bias_add + SwishOpImpl — 21% of GPU time)
-    const bool with_silu = (act == Activation::Sigmoid);
     const std::string fused_ir = patch_ir_bias_silu(base_ir, p, with_silu);
     if (!fused_ir.empty()) {
         try {
@@ -1913,17 +1943,27 @@ CompiledConv compile_fused_conv_bias_act(const ConvParams& p, Activation act, co
             result.silu_fused = with_silu;
             std::cerr << "[BiasIR] fused_bias_act OK kernel=" << result.kernel_name
                       << " silu=" << with_silu << "\n";
+            kc.save(cache_key, p.arch, result);
             return result;
         } catch (const std::exception& e) {
             std::cerr << "[BiasIR] fused_bias_act FAIL silu=" << with_silu
                       << " : " << e.what() << "\n";
         }
     }
-    return compile_mlir_ir(base_ir, p.arch, driver);
+    auto result = compile_mlir_ir(base_ir, p.arch, driver);
+    kc.save(cache_key, p.arch, result);
+    return result;
 }
 
 CompiledConv compile_fused_conv_bias_silu_add(const ConvParams& p, const std::string& drv) {
     const std::string driver = drv.empty() ? find_rocmlir_driver() : drv;
+
+    auto& kc = HsacoKernelCache::instance();
+    const size_t cache_key = p.hash() ^ static_cast<size_t>(0xB1A5B1A5B1A50003ULL);
+    { CompiledConv cached; if (kc.load(cache_key, p.arch, cached)) {
+        std::cerr << "[BiasIR-cache] loaded bias_silu_add kernel=" << cached.kernel_name << "\n";
+        return cached; } }
+
     const std::string gen    = find_rocmlir_gen(driver);
     const std::string perf_cfg = get_tuned_perf_config(p, gen, driver);
     const std::string gen_cmd  = rocmlir_gen_cmd(p, gen, perf_cfg);
@@ -1941,13 +1981,16 @@ CompiledConv compile_fused_conv_bias_silu_add(const ConvParams& p, const std::st
             result.silu_fused    = true;
             result.skip_add_fused = true;
             std::cerr << "[BiasIR] fused_bias_silu_add OK kernel=" << result.kernel_name << "\n";
+            kc.save(cache_key, p.arch, result);
             return result;
         } catch (const std::exception& e) {
             std::cerr << "[BiasIR] fused_bias_silu_add FAIL: " << e.what() << "\n";
         }
     }
     // Fallback: plain Conv+Bias+SiLU (caller handles skip-add separately)
-    return compile_fused_conv_bias_act(p, Activation::Sigmoid, driver);
+    auto result = compile_fused_conv_bias_act(p, Activation::Sigmoid, driver);
+    // Note: fallback result is already cached by compile_fused_conv_bias_act
+    return result;
 }
 
 // ── Slice + Conv+Bias+SiLU compilation via MIGraphX ──────────────────────────
@@ -2207,8 +2250,25 @@ CompiledConv compile_conv_slice_out_silu_add(const ConvParams& p,
 CompiledConv compile_conv_migraphx(const ConvParams& p, const std::string& drv,
                                     bool with_skip, bool with_silu_add) {
     const std::string driver = drv.empty() ? find_rocmlir_driver() : drv;
+
+    auto& kc = HsacoKernelCache::instance();
+    // with_skip=false,with_silu_add=false → 0x04; with_skip=true → 0x05; with_silu_add=true → 0x09
+    const size_t variant = with_silu_add ? static_cast<size_t>(0x09ULL)
+                         : with_skip     ? static_cast<size_t>(0x05ULL)
+                                         : static_cast<size_t>(0x04ULL);
+    const size_t cache_key = p.hash() ^ (static_cast<size_t>(0xB1A5B1A5B1A50000ULL) | variant);
+    { CompiledConv cached; if (kc.load(cache_key, p.arch, cached)) {
+        std::cerr << "[MigraphX-cache] loaded skip=" << with_skip << " silu_add=" << with_silu_add
+                  << " kernel=" << cached.kernel_name << "\n";
+        return cached; } }
+
     const std::string mlir_ir = generate_migraphx_conv_bias_silu_ir(p, with_skip, with_silu_add);
-    return compile_migraphx_ir(mlir_ir, p.arch, driver);
+    auto result = compile_migraphx_ir(mlir_ir, p.arch, driver);
+    result.bias_fused     = true;
+    result.silu_fused     = true;
+    result.skip_add_fused = with_skip || with_silu_add;
+    kc.save(cache_key, p.arch, result);
+    return result;
 }
 
 // ── Conv+Bias+Reshape kernel (no SiLU): Q/K/V attention projection pattern ──
@@ -2219,12 +2279,22 @@ CompiledConv compile_conv_migraphx_reshape(const ConvParams& p,
                                             const std::vector<int>& reshape_dims,
                                             const std::string& drv) {
     const std::string driver = drv.empty() ? find_rocmlir_driver() : drv;
+
+    // Include reshape_dims in cache key to distinguish different reshape targets
+    auto& kc = HsacoKernelCache::instance();
+    size_t reshape_hash = 0;
+    for (int d : reshape_dims) reshape_hash = reshape_hash * 31 + static_cast<size_t>(d);
+    const size_t cache_key = (p.hash() ^ static_cast<size_t>(0xB1A5B1A5B1A50007ULL)) ^ reshape_hash;
+    { CompiledConv cached; if (kc.load(cache_key, p.arch, cached)) {
+        std::cerr << "[MigraphX-cache] loaded reshape kernel=" << cached.kernel_name << "\n";
+        return cached; } }
+
     const std::string mlir_ir = generate_migraphx_conv_bias_reshape_ir(p, reshape_dims);
     auto compiled = compile_migraphx_ir(mlir_ir, p.arch, driver);
-    // Conv+bias fused (no SiLU for this variant)
     compiled.bias_fused = true;
     compiled.silu_fused = false;
     compiled.skip_add_fused = false;
+    kc.save(cache_key, p.arch, compiled);
     return compiled;
 }
 
@@ -2233,11 +2303,19 @@ CompiledConv compile_conv_migraphx_reshape(const ConvParams& p,
 // Matches MIGraphX's 15-instance conv+bias+skip pattern in yolo26x.
 CompiledConv compile_conv_migraphx_skip(const ConvParams& p, const std::string& drv) {
     const std::string driver = drv.empty() ? find_rocmlir_driver() : drv;
+
+    auto& kc = HsacoKernelCache::instance();
+    const size_t cache_key = p.hash() ^ static_cast<size_t>(0xB1A5B1A5B1A50006ULL);
+    { CompiledConv cached; if (kc.load(cache_key, p.arch, cached)) {
+        std::cerr << "[MigraphX-cache] loaded skip_no_silu kernel=" << cached.kernel_name << "\n";
+        return cached; } }
+
     const std::string mlir_ir = generate_migraphx_conv_bias_skip_ir(p);
     auto compiled = compile_migraphx_ir(mlir_ir, p.arch, driver);
     compiled.bias_fused     = true;
     compiled.silu_fused     = false;
-    compiled.skip_add_fused = true;  // skip-add is fused in kernel
+    compiled.skip_add_fused = true;
+    kc.save(cache_key, p.arch, compiled);
     return compiled;
 }
 

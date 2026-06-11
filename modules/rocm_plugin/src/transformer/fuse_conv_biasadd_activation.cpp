@@ -462,6 +462,10 @@ bool ov::rocm_gpu::pass::rocmConvolutionFusion::run_on_model(const std::shared_p
     ADD_MATCHER(fuse_conv_bias_add_activation, FuseConvolutionWithBiasAdd)
     ADD_MATCHER(fuse_conv_bias_add_activation, FuseConvolutionWithBiasAddAdd)
     ADD_MATCHER(fuse_conv_bias_add_activation, SinkActivationToFusedConvolution)
+    // Group conv bias fusion runs in the same GraphRewrite pass so SinkSwishAddPass
+    // (next pass) can see FusedGroupConvolution and fuse Swish+Add into them.
+    ADD_MATCHER(fuse_conv_bias_add_activation, FuseGroupConvolutionWithBiasAdd)
+    ADD_MATCHER(fuse_conv_bias_add_activation, FuseGroupConvolutionWithBiasAddAdd)
     fuse_conv_bias_add_activation->set_name("ov::rocm_gpu::pass::fuse_conv_bias_add_activation");
 
     // Fuse FusedConvolution → Swish → Add(skip) into 5-arg Conv+Bias+SiLU+Add kernel.
@@ -995,9 +999,13 @@ bool ov::rocm_gpu::pass::rocmConvolutionFusion::run_on_model(const std::shared_p
                 auto fc_out = swish->input(0).get_source_output();
                 auto fc = std::dynamic_pointer_cast<FusedConvolution>(fc_out.get_node_shared_ptr());
                 auto fgc = std::dynamic_pointer_cast<FusedGroupConvolution>(fc_out.get_node_shared_ptr());
-                if (!fc && !fgc) continue;
+                auto fcs = std::dynamic_pointer_cast<nodes::FusedConvolutionSlice>(fc_out.get_node_shared_ptr());
+                if (!fc && !fgc && !fcs) continue;
 
-                const bool will_fuse_silu = fc
+                // FusedConvolutionSlice factory checks has_swish_consumer at Op creation time and
+                // compiles SiLU inline when true — so downstream Swish is always a no-op for these.
+                bool will_fuse_silu = fcs ? true
+                    : fc
                     ? ((fc->get_activation() == ActivationMode::SWISH) ||
                        (fc->get_activation() == ActivationMode::NO_ACTIVATION && !fc->has_add_node()))
                     : ((fgc->get_activation() == ActivationMode::SWISH) ||
@@ -1023,11 +1031,6 @@ bool ov::rocm_gpu::pass::rocmConvolutionFusion::run_on_model(const std::shared_p
         }
     };
     manager.register_pass<EliminateFusedSiluSwishPass>();
-
-    auto fuse_group_conv_bias_add_activation = manager.register_pass<ov::pass::GraphRewrite>();
-    ADD_MATCHER(fuse_group_conv_bias_add_activation, FuseGroupConvolutionWithBiasAdd)
-    ADD_MATCHER(fuse_group_conv_bias_add_activation, FuseGroupConvolutionWithBiasAddAdd)
-    fuse_group_conv_bias_add_activation->set_name("ov::rocm_gpu::pass::fuse_group_conv_bias_add_activation");
 
     manager.register_pass<rocmFuseConvBackpropDataAdd>();
     manager.register_pass<rocmFuseCleanUpNodesOrder>();
