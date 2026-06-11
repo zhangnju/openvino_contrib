@@ -25,6 +25,10 @@ public:
                  Outputs outputTensors,
                  const Workbuffers& workbuffers) const override;
 
+    rocmGraphCompatibility GetrocmGraphCompatibility() const override {
+        return rocmGraphCompatibility::FULL;
+    }
+
 private:
     std::vector<int64_t> data_shape_;
     int32_t axis_;

@@ -132,6 +132,18 @@ void rocmGraphTopologyRunner::UpdateContext(InferenceRequestContext& context, co
     if (context.getrocmGraphContext().is_initialized()) {
         UpdateCapture(context);
     } else {
+        // Warm-up run: execute all ops eagerly first so all hipModuleLoadData calls
+        // (which internally call hipMalloc) complete before hipStreamBeginCapture.
+        // hipMalloc is not allowed during stream capture (returns hipErrorStreamCaptureUnsupported)
+        // and would invalidate the capture, so kernels must be pre-loaded.
+        {
+            Workbuffers workbuffers{};
+            workbuffers.mutable_buffers.emplace_back(memoryBlock.view().data());
+            for (const auto& subgraph : subgraphs_) {
+                subgraph.Execute(context, {}, {}, workbuffers);
+            }
+            context.getThreadContext().stream().synchronize();
+        }
         Capture(context, memoryBlock);
     }
 }

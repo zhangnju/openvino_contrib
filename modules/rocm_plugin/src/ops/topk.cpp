@@ -188,7 +188,7 @@ void TopKOp::Execute(const InferenceRequestContext& context,
                static_cast<const void*>(kernel_param.get()));
 }
 
-rocmGraphCompatibility TopKOp::GetrocmGraphCompatibility() const { return rocmGraphCompatibility::FULL; }
+rocmGraphCompatibility TopKOp::GetrocmGraphCompatibility() const { return rocmGraphCompatibility::NONE; }
 
 void TopKOp::InitSharedImmutableWorkbuffers(const Buffers& buffers) {
     OPENVINO_ASSERT(buffers.size() == 1, "Node name: ", GetName());
