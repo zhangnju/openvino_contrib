@@ -168,7 +168,9 @@ static AttnKernelEntry compile_kernel(
     auto find_driver = []() -> std::string {
         if (auto e = std::getenv("ROCMLIR_DRIVER")) return e;
         for (const char* p : {"/root/rocmlir_install/bin/rocmlir-driver",
+                               "/home/rocmlir_install/bin/rocmlir-driver",
                                "/home/openvino/rocmlir_install/bin/rocmlir-driver",
+                               "/home/openvino/rocmlir-driver",
                                "/opt/rocmlir/bin/rocmlir-driver",
                                "/opt/rocm/bin/rocmlir-driver"}) {
             if (::access(p, X_OK) == 0) return p;
@@ -423,7 +425,9 @@ RocmAttentionMatMulOp::RocmAttentionMatMulOp(
     auto find_driver2 = []() -> std::string {
         if (auto e = std::getenv("ROCMLIR_DRIVER")) return e;
         for (const char* p : {"/root/rocmlir_install/bin/rocmlir-driver",
+                               "/home/rocmlir_install/bin/rocmlir-driver",
                                "/home/openvino/rocmlir_install/bin/rocmlir-driver",
+                               "/home/openvino/rocmlir-driver",
                                "/opt/rocmlir/bin/rocmlir-driver",
                                "/opt/rocm/bin/rocmlir-driver"}) {
             if (::access(p, X_OK) == 0) return p;

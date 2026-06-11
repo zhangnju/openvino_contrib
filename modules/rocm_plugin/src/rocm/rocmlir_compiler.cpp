@@ -254,7 +254,9 @@ std::string find_rocmlir_driver() {
         ROCMLIR_DRIVER_PATH,  // CMake-configured path (highest priority)
 #endif
         "/root/rocmlir_install/bin/rocmlir-driver",
+        "/home/rocmlir_install/bin/rocmlir-driver",
         "/home/openvino/rocmlir_install/bin/rocmlir-driver",
+        "/home/openvino/rocmlir-driver",
         "/opt/rocmlir/bin/rocmlir-driver",
         "/opt/rocm/bin/rocmlir-driver",
         nullptr
