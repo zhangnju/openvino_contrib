@@ -16,6 +16,7 @@
 
 #include "rocm_compiled_model.hpp"
 #include "rocm_graph_topology_runner.hpp"
+#include "ops/silu_tracking.hpp"
 #include "rocm_itt.hpp"
 #include "rocm_plugin.hpp"
 #include "rocm_profiler.hpp"
@@ -165,6 +166,11 @@ void rocmInferRequest::start_pipeline(const ThreadContext& threadContext) {
                                                     rocmGraphContext,
                                                     is_benchmark_mode_};
         topology_runner.UpdateContext(inferRequestContext, memory);
+        // Clear any leftover silu_tracking marks from the previous inference.
+        // Normally cleared by SwishOp::Execute, but skipped Swish nodes (rocm_swish_inplace)
+        // are removed from exec_sequence_ and never run, so marks may persist.
+        // Clearing here ensures each inference starts with a clean state.
+        g_silu_applied_buffers.clear();
         topology_runner.Run(inferRequestContext, memory);
         executionDelegator_->stop_stage(PerfStages::StartPipeline);
     } catch (...) {

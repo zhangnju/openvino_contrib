@@ -82,6 +82,14 @@ void SubGraph::initExecuteSequence(bool isStableParams, bool isStableResults) {
         if (dynamic_cast<NopOp*>(operation.get())) {
             continue;
         }
+        // Skip Swish nodes marked as in-place no-ops by EliminateFusedSiluSwishPass.
+        // The OperationBuffersExtractor already set their output = parent(input, offset=0),
+        // so input and output pointers will be identical at runtime. The preceding
+        // FusedConvolutionRocMLIR writes SiLU-activated values directly; no GPU work needed.
+        // Removing these from exec_sequence_ eliminates ~110 spurious kernel dispatches.
+        if (node->get_rt_info().count("rocm_swish_inplace")) {
+            continue;
+        }
         // For AV MatMul with pe(V) fusion: extend pe_work workspace lifespan by 1 step.
         // This prevents the memory model from reusing pe_work for the next op's output
         // buffer while pe_conv and pe_add (GPU-async) are still executing on the stream.
