@@ -1,0 +1,43 @@
+--- mlir/lib/Conversion/TosaToRock/TosaToRock.cpp.bak	2026-06-12 07:11:02.224478824 +0000
++++ mlir/lib/Conversion/TosaToRock/TosaToRock.cpp	2026-06-12 08:33:48.037049535 +0000
+@@ -220,7 +220,8 @@
+              Value filter, Value output, DenseI64ArrayAttr pad,
+              DenseI64ArrayAttr stride, DenseI64ArrayAttr dilation,
+              int64_t group, int64_t kernelID,
+-             std::optional<std::string> convBackwardKind) {
++             std::optional<std::string> convBackwardKind,
++             std::optional<rock::GemmFeatures> featuresOpt = std::nullopt) {
+   Location loc = op->getLoc();
+   ConvFields convFields =
+       commonConv(rw, op, input, filter, output, pad, stride, dilation, group);
+@@ -242,11 +243,16 @@
+     assert((!convBackwardKind.has_value() ||
+             convBackwardKind.value() != ROCK_CUSTOMOP_CONV_BWD_WEIGHT) &&
+            "bwd_weight currently not implemented");
+-    cop = rock::ConvOp::create(
+-        rw, loc, convFields.outputExp.getType(), convFields.filterExp,
+-        convFields.inputExp, convFields.outputExp, /*features=*/nullptr,
+-        /*blockSize=*/nullptr, /*gridSize=*/nullptr, convFields.pad,
+-        convFields.stride, convFields.dilation, /*params=*/nullptr);
++    {
++      rock::GemmFeaturesAttr featAttr;
++      if (featuresOpt.has_value())
++        featAttr = rock::GemmFeaturesAttr::get(rw.getContext(), *featuresOpt);
++      cop = rock::ConvOp::create(
++          rw, loc, convFields.outputExp.getType(), convFields.filterExp,
++          convFields.inputExp, convFields.outputExp, featAttr,
++          /*blockSize=*/nullptr, /*gridSize=*/nullptr, convFields.pad,
++          convFields.stride, convFields.dilation, /*params=*/nullptr);
++    }
+   }
+ 
+   addConvAttributes(rw, cop, convFields);
+@@ -663,7 +669,7 @@
+ 
+     FailureOr<rock::RockConvInterface> rockConv =
+         makeRockConv(rw, op, input, filter, output, padAttr, op.getStrideAttr(),
+-                     dilationAttr, group, /*kernelID=*/0, "");
++                     dilationAttr, group, /*kernelID=*/0, "", features);
+ 
+     if (failed(rockConv))
+       return failure();

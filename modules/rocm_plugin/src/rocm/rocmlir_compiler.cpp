@@ -304,8 +304,11 @@ static CompiledConv compile_mlir_with_pipeline(const std::string& mlir_ir,
         fclose(f);
     }
 
+    // Enable tuning fallback so injected perf_config gracefully degrades
+    // to heuristic when the config is invalid for the given conv shape.
     const std::string cmd = driver
         + " --arch " + arch
+        + " --tuning-fallback=true"
         + " --kernel-pipeline=" + pipeline
         + " " + ir_file;
 
@@ -1036,7 +1039,8 @@ CompiledConv compile_conv(const ConvParams& p, const std::string& drv) {
 // where FC is the existing 5-arg kernel output, and the outer silu+add become the epilogue.
 static std::string generate_fused_epilogue_ir(const ConvParams& p,
                                                          bool with_skip = false,
-                                                         bool with_silu_add = false) {
+                                                         bool with_silu_add = false,
+                                                         const std::string& perf_cfg = "") {
     const std::string dt = p.fp16 ? "f16" : "f32";
     const int OH = p.out_h(), OW = p.out_w();
     const size_t in_s  = (size_t)p.C * p.H * p.W;  // N stride
@@ -1090,8 +1094,10 @@ static std::string generate_fused_epilogue_ir(const ConvParams& p,
        << "padding = [" << p.pad_h << ", " << p.pad_h << ", "
                         << p.pad_w << ", " << p.pad_w << "], "
        << "padding_mode = 0 : i64, "
-       << "stride = [" << p.stride_h << ", " << p.stride_w << "]"
-       << "} : " << "!" << "migraphx.shaped" << in_sh << ", "
+       << "stride = [" << p.stride_h << ", " << p.stride_w << "]";
+    if (!perf_cfg.empty())
+       ir << ", perf_config = \"" << perf_cfg << "\"";
+    ir << "} : " << "!" << "migraphx.shaped" << in_sh << ", "
        << "!" << "migraphx.shaped" << flt_sh << " -> !" << "migraphx.shaped" << out_sh << "\n";
 
     // Broadcast bias along axis=1 (channel axis)
@@ -2251,18 +2257,28 @@ CompiledConv compile_conv_fused_epilogue(const ConvParams& p, const std::string&
                                     bool with_skip, bool with_silu_add) {
     const std::string driver = drv.empty() ? find_rocmlir_driver() : drv;
 
+    // Get tuned perf_config from cache (same cache as rock.conv path).
+    // Injected into migraphx.convolution attribute; propagates through
+    // MIGraphXToTosa→TosaToRock to rock.conv where rock-affix-params uses it.
+    // With --tuning-fallback=true, invalid configs gracefully degrade to heuristic.
+    const std::string gen = find_rocmlir_gen(driver);
+    const std::string perf_cfg = get_tuned_perf_config(p, gen, driver);
+
     auto& kc = HsacoKernelCache::instance();
     // with_skip=false,with_silu_add=false → 0x04; with_skip=true → 0x05; with_silu_add=true → 0x09
     const size_t variant = with_silu_add ? static_cast<size_t>(0x09ULL)
                          : with_skip     ? static_cast<size_t>(0x05ULL)
                                          : static_cast<size_t>(0x04ULL);
-    const size_t cache_key = p.hash() ^ (static_cast<size_t>(0xB1A5B1A5B1A50000ULL) | variant);
+    // Include perf_cfg hash in key: different configs → different kernels
+    const size_t perf_hash = std::hash<std::string>{}(perf_cfg);
+    const size_t cache_key = (p.hash() ^ (static_cast<size_t>(0xB1A5B1A5B1A50000ULL) | variant))
+                             ^ perf_hash;
     { CompiledConv cached; if (kc.load(cache_key, p.arch, cached)) {
         std::cerr << "[FusedEpilogue-cache] loaded skip=" << with_skip << " silu_add=" << with_silu_add
                   << " kernel=" << cached.kernel_name << "\n";
         return cached; } }
 
-    const std::string mlir_ir = generate_fused_epilogue_ir(p, with_skip, with_silu_add);
+    const std::string mlir_ir = generate_fused_epilogue_ir(p, with_skip, with_silu_add, perf_cfg);
     auto result = compile_migraphx_ir(mlir_ir, p.arch, driver);
     result.bias_fused     = true;
     result.silu_fused     = true;

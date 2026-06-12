@@ -1,0 +1,25 @@
+--- mlir/tools/rocmlir-driver/rocmlir-driver.cpp.bak	2026-06-12 08:45:19.639764206 +0000
++++ mlir/tools/rocmlir-driver/rocmlir-driver.cpp	2026-06-12 08:45:43.401176358 +0000
+@@ -85,6 +85,11 @@
+                            cl::desc("Optimization level for GPU compilation"),
+                            cl::value_desc("Integer from 0 to 3"), cl::init(3));
+ 
++static cl::opt<bool> tuningFallbackOpt(
++    "tuning-fallback",
++    cl::desc("Fall back to heuristic when injected perf_config is invalid"),
++    cl::init(true));  // Default true: safe for perf_config injection
++
+ static cl::opt<bool> barePointers(
+     "bare-ptr-memref-kernels",
+     cl::desc("Use bare pointers to represent memrefs when calling kernels"),
+@@ -193,7 +198,9 @@
+   }
+   if (kernelPipelineSet.contains("gpu")) {
+     // Set up the default lowering pipeline which goes down to GPU dialect.
+-    rock::buildKernelPipeline(pm);
++    rock::KernelOptions gpuOpts;
++    gpuOpts.tuningFallback = tuningFallbackOpt.getValue();
++    rock::buildKernelPipeline(pm, gpuOpts);
+   }
+   bool isRocdlOnly = kernelPipelineSet.contains("rocdl") &&
+                      !kernelPipelineSet.contains("binary");
