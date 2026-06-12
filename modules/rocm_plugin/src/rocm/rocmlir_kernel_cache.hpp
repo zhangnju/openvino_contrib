@@ -52,8 +52,8 @@ public:
 
     // Insert a pre-compiled migraphx kernel (conv+bias+silu or conv+bias+silu+add).
     // Used when ROCMLIR_EPILOGUE_FUSION=1 bypasses the standard compile path.
-    const KernelEntry& insert_migraphx_silu(const ConvParams& p, CompiledConv&& compiled);
-    const KernelEntry& insert_migraphx_silu_add(const ConvParams& p, CompiledConv&& compiled);
+    const KernelEntry& insert_fused_epilogue_silu(const ConvParams& p, CompiledConv&& compiled);
+    const KernelEntry& insert_fused_epilogue_silu_add(const ConvParams& p, CompiledConv&& compiled);
 
     void clear();
 
@@ -71,8 +71,8 @@ private:
     std::unordered_map<size_t, std::unique_ptr<KernelEntry>> fused_bias_sigmoid_cache_;
     std::unordered_map<size_t, std::unique_ptr<KernelEntry>> fused_bias_silu_add_cache_;
     std::unordered_map<size_t, std::unique_ptr<KernelEntry>> slice_conv_bias_silu_cache_;
-    std::unordered_map<size_t, std::unique_ptr<KernelEntry>> migraphx_silu_cache_;
-    std::unordered_map<size_t, std::unique_ptr<KernelEntry>> migraphx_silu_add_cache_;
+    std::unordered_map<size_t, std::unique_ptr<KernelEntry>> fused_epilogue_silu_cache_;
+    std::unordered_map<size_t, std::unique_ptr<KernelEntry>> fused_epilogue_silu_add_cache_;
 };
 
 } // namespace rocmlir

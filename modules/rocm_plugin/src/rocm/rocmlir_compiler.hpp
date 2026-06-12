@@ -151,7 +151,7 @@ CompiledConv compile_conv_slice_out_silu_add(const ConvParams& p,
 //   with_skip=true,  with_silu_add=false → 5-arg: conv+bias+silu+skip_add
 //   with_skip=true,  with_silu_add=true  → 6-arg: conv+bias+silu+skip_add+silu+aux_add
 //     (fuses C2f/C2PSA bottleneck: FC(silu+shortcut) → silu(fc_out) → add(silu, cv1_silu))
-CompiledConv compile_conv_migraphx(const ConvParams& p,
+CompiledConv compile_conv_fused_epilogue(const ConvParams& p,
                                     const std::string& rocmlir_driver_path = "",
                                     bool with_skip = false,
                                     bool with_silu_add = false);
@@ -160,14 +160,14 @@ CompiledConv compile_conv_migraphx(const ConvParams& p,
 // Fuses conv+bias+skip_add WITHOUT silu into one kernel.
 // Eliminates separate launch_bias_add for NO_ACTIVATION + has_add cases.
 // Matches MIGraphX's 15-instance mlir_convolution_broadcast_add_add pattern.
-CompiledConv compile_conv_migraphx_skip(const ConvParams& p,
+CompiledConv compile_conv_fused_skip(const ConvParams& p,
                                          const std::string& rocmlir_driver_path = "");
 
 // Conv+Bias+Reshape kernel: Q/K/V attention projection pattern.
 // reshape_dims: target shape after conv output, e.g. {N, K, OH*OW}.
 // Generates mlir_convolution_broadcast_add_reshape (3-arg kernel).
 // Matches MIGraphX's 168-instance pattern in yolo26x.
-CompiledConv compile_conv_migraphx_reshape(const ConvParams& p,
+CompiledConv compile_conv_fused_reshape(const ConvParams& p,
                                             const std::vector<int>& reshape_dims,
                                             const std::string& rocmlir_driver_path = "");
 

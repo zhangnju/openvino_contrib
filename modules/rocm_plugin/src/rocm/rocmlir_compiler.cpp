@@ -1011,7 +1011,7 @@ CompiledConv compile_conv(const ConvParams& p, const std::string& drv) {
 }
 
 // ── MIGraphX dialect compilation: Conv + Bias + SiLU epilogue ───────────────
-// Uses the migraphx MLIR dialect (same as MIGraphX uses) which supports
+// Uses rocMLIR's 'migraphx' MLIR dialect (internal to rocMLIR, unrelated to MIGraphX framework)
 // arbitrary elementwise epilogues. Compiled with:
 //   rocmlir-driver -kernel-pipeline=migraphx,highlevel,gpu,rocdl,binary
 //
@@ -1034,7 +1034,7 @@ CompiledConv compile_conv(const ConvParams& p, const std::string& drv) {
 // The 6-arg variant fuses the C2f/C2PSA bottleneck pattern:
 //   FC(conv+bias+silu+shortcut) → silu(fc_out) → add(silu, cv1_silu)
 // where FC is the existing 5-arg kernel output, and the outer silu+add become the epilogue.
-static std::string generate_migraphx_conv_bias_silu_ir(const ConvParams& p,
+static std::string generate_fused_epilogue_ir(const ConvParams& p,
                                                          bool with_skip = false,
                                                          bool with_silu_add = false) {
     const std::string dt = p.fp16 ? "f16" : "f32";
@@ -1134,7 +1134,7 @@ static std::string generate_migraphx_conv_bias_silu_ir(const ConvParams& p,
 // OV currently runs this as: conv+bias kernel + separate bias_add kernel (2 launches).
 // This fuses them into ONE kernel: conv → broadcast(bias) → add → add(skip) → output.
 // 4-arg kernel: (input, filter, bias, skip) → output
-static std::string generate_migraphx_conv_bias_skip_ir(const ConvParams& p) {
+static std::string generate_fused_skip_ir(const ConvParams& p) {
     const std::string dt = p.fp16 ? "f16" : "f32";
     const int OH = p.out_h(), OW = p.out_w();
     const size_t in_s   = (size_t)p.C * p.H * p.W;
@@ -1203,7 +1203,7 @@ static std::string generate_migraphx_conv_bias_skip_ir(const ConvParams& p) {
 // 3-arg kernel: (input, filter, bias) → reshaped_output
 //
 // reshape_dims: the target flat dimensions, e.g. {N, K, OH*OW}
-static std::string generate_migraphx_conv_bias_reshape_ir(
+static std::string generate_fused_reshape_ir(
         const ConvParams& p,
         const std::vector<int>& reshape_dims) {
     const std::string dt = p.fp16 ? "f16" : "f32";
@@ -1298,7 +1298,7 @@ static CompiledConv compile_migraphx_ir(const std::string& mlir_ir,
 }
 
 // ── Generate MIGraphX-format MLIR for Conv + Bias + SiLU ───────────────────
-// (defined below, after generate_migraphx_conv_bias_silu_ir)
+// (defined below, after generate_fused_epilogue_ir)
 //
 // Public entry: compile conv+bias+silu using migraphx dialect pipeline.
 // Generates mlir_convolution_broadcast_add_sigmoid_mul kernel (same as MIGraphX).
@@ -2247,7 +2247,7 @@ CompiledConv compile_conv_slice_out_silu_add(const ConvParams& p,
 }
 
 // ── Public migraphx dialect compilation entry ─────────────────────────────
-CompiledConv compile_conv_migraphx(const ConvParams& p, const std::string& drv,
+CompiledConv compile_conv_fused_epilogue(const ConvParams& p, const std::string& drv,
                                     bool with_skip, bool with_silu_add) {
     const std::string driver = drv.empty() ? find_rocmlir_driver() : drv;
 
@@ -2258,11 +2258,11 @@ CompiledConv compile_conv_migraphx(const ConvParams& p, const std::string& drv,
                                          : static_cast<size_t>(0x04ULL);
     const size_t cache_key = p.hash() ^ (static_cast<size_t>(0xB1A5B1A5B1A50000ULL) | variant);
     { CompiledConv cached; if (kc.load(cache_key, p.arch, cached)) {
-        std::cerr << "[MigraphX-cache] loaded skip=" << with_skip << " silu_add=" << with_silu_add
+        std::cerr << "[FusedEpilogue-cache] loaded skip=" << with_skip << " silu_add=" << with_silu_add
                   << " kernel=" << cached.kernel_name << "\n";
         return cached; } }
 
-    const std::string mlir_ir = generate_migraphx_conv_bias_silu_ir(p, with_skip, with_silu_add);
+    const std::string mlir_ir = generate_fused_epilogue_ir(p, with_skip, with_silu_add);
     auto result = compile_migraphx_ir(mlir_ir, p.arch, driver);
     result.bias_fused     = true;
     result.silu_fused     = true;
@@ -2275,7 +2275,7 @@ CompiledConv compile_conv_migraphx(const ConvParams& p, const std::string& drv,
 // Generates mlir_convolution_broadcast_add_reshape kernel.
 // reshape_dims: target tensor shape after flattening spatial dims.
 // Returns 3-arg kernel: (input, filter, bias) → reshaped output.
-CompiledConv compile_conv_migraphx_reshape(const ConvParams& p,
+CompiledConv compile_conv_fused_reshape(const ConvParams& p,
                                             const std::vector<int>& reshape_dims,
                                             const std::string& drv) {
     const std::string driver = drv.empty() ? find_rocmlir_driver() : drv;
@@ -2286,10 +2286,10 @@ CompiledConv compile_conv_migraphx_reshape(const ConvParams& p,
     for (int d : reshape_dims) reshape_hash = reshape_hash * 31 + static_cast<size_t>(d);
     const size_t cache_key = (p.hash() ^ static_cast<size_t>(0xB1A5B1A5B1A50007ULL)) ^ reshape_hash;
     { CompiledConv cached; if (kc.load(cache_key, p.arch, cached)) {
-        std::cerr << "[MigraphX-cache] loaded reshape kernel=" << cached.kernel_name << "\n";
+        std::cerr << "[FusedEpilogue-cache] loaded reshape kernel=" << cached.kernel_name << "\n";
         return cached; } }
 
-    const std::string mlir_ir = generate_migraphx_conv_bias_reshape_ir(p, reshape_dims);
+    const std::string mlir_ir = generate_fused_reshape_ir(p, reshape_dims);
     auto compiled = compile_migraphx_ir(mlir_ir, p.arch, driver);
     compiled.bias_fused = true;
     compiled.silu_fused = false;
@@ -2301,16 +2301,16 @@ CompiledConv compile_conv_migraphx_reshape(const ConvParams& p,
 // Conv+Bias+SkipAdd (NO SiLU): mlir_convolution_broadcast_add_add (4-arg kernel).
 // Eliminates the separate bias_add kernel launch for FC with NO_ACTIVATION + has_add.
 // Matches MIGraphX's 15-instance conv+bias+skip pattern in yolo26x.
-CompiledConv compile_conv_migraphx_skip(const ConvParams& p, const std::string& drv) {
+CompiledConv compile_conv_fused_skip(const ConvParams& p, const std::string& drv) {
     const std::string driver = drv.empty() ? find_rocmlir_driver() : drv;
 
     auto& kc = HsacoKernelCache::instance();
     const size_t cache_key = p.hash() ^ static_cast<size_t>(0xB1A5B1A5B1A50006ULL);
     { CompiledConv cached; if (kc.load(cache_key, p.arch, cached)) {
-        std::cerr << "[MigraphX-cache] loaded skip_no_silu kernel=" << cached.kernel_name << "\n";
+        std::cerr << "[FusedEpilogue-cache] loaded skip_no_silu kernel=" << cached.kernel_name << "\n";
         return cached; } }
 
-    const std::string mlir_ir = generate_migraphx_conv_bias_skip_ir(p);
+    const std::string mlir_ir = generate_fused_skip_ir(p);
     auto compiled = compile_migraphx_ir(mlir_ir, p.arch, driver);
     compiled.bias_fused     = true;
     compiled.silu_fused     = false;

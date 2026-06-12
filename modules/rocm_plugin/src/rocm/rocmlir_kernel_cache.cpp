@@ -156,11 +156,11 @@ const KernelEntry& RocMLIRKernelCache::get_or_compile_slice_conv_bias_silu(
     return *ptr;
 }
 
-const KernelEntry& RocMLIRKernelCache::insert_migraphx_silu(const ConvParams& p, CompiledConv&& compiled) {
+const KernelEntry& RocMLIRKernelCache::insert_fused_epilogue_silu(const ConvParams& p, CompiledConv&& compiled) {
     std::lock_guard<std::mutex> lk(mu_);
     const size_t key = p.hash();
-    auto it = migraphx_silu_cache_.find(key);
-    if (it != migraphx_silu_cache_.end()) return *it->second;
+    auto it = fused_epilogue_silu_cache_.find(key);
+    if (it != fused_epilogue_silu_cache_.end()) return *it->second;
     // migraphx conv+bias+silu: bias and silu are fused in the kernel
     compiled.bias_fused = true;
     compiled.silu_fused = true;
@@ -168,15 +168,15 @@ const KernelEntry& RocMLIRKernelCache::insert_migraphx_silu(const ConvParams& p,
     auto entry = std::make_unique<KernelEntry>(load_kernel(std::move(compiled)));
     entry->params = p;
     auto* ptr = entry.get();
-    migraphx_silu_cache_[key] = std::move(entry);
+    fused_epilogue_silu_cache_[key] = std::move(entry);
     return *ptr;
 }
 
-const KernelEntry& RocMLIRKernelCache::insert_migraphx_silu_add(const ConvParams& p, CompiledConv&& compiled) {
+const KernelEntry& RocMLIRKernelCache::insert_fused_epilogue_silu_add(const ConvParams& p, CompiledConv&& compiled) {
     std::lock_guard<std::mutex> lk(mu_);
     const size_t key = p.hash();
-    auto it = migraphx_silu_add_cache_.find(key);
-    if (it != migraphx_silu_add_cache_.end()) return *it->second;
+    auto it = fused_epilogue_silu_add_cache_.find(key);
+    if (it != fused_epilogue_silu_add_cache_.end()) return *it->second;
     // migraphx conv+bias+silu+add: bias, silu, and skip-add are all fused in the kernel
     compiled.bias_fused = true;
     compiled.silu_fused = true;
@@ -184,7 +184,7 @@ const KernelEntry& RocMLIRKernelCache::insert_migraphx_silu_add(const ConvParams
     auto entry = std::make_unique<KernelEntry>(load_kernel(std::move(compiled)));
     entry->params = p;
     auto* ptr = entry.get();
-    migraphx_silu_add_cache_[key] = std::move(entry);
+    fused_epilogue_silu_add_cache_[key] = std::move(entry);
     return *ptr;
 }
 
@@ -200,8 +200,8 @@ void RocMLIRKernelCache::clear() {
     unload(fused_bias_sigmoid_cache_);
     unload(fused_bias_silu_add_cache_);
     unload(slice_conv_bias_silu_cache_);
-    unload(migraphx_silu_cache_);
-    unload(migraphx_silu_add_cache_);
+    unload(fused_epilogue_silu_cache_);
+    unload(fused_epilogue_silu_add_cache_);
 }
 
 } // namespace rocmlir

@@ -138,7 +138,7 @@ FusedConvolutionRocMLIR::FusedConvolutionRocMLIR(
                 if (it2 != reshape_cache_.end()) {
                     kernel_ = &it2->second;
                 } else {
-                    auto compiled = rocmlir::compile_conv_migraphx_reshape(conv_params_, reshape_dims);
+                    auto compiled = rocmlir::compile_conv_fused_reshape(conv_params_, reshape_dims);
                     hipModule_t mod; hipFunction_t fn;
                     hipModuleLoadData(&mod, compiled.hsaco.data());
                     hipModuleGetFunction(&fn, mod, compiled.kernel_name.c_str());
@@ -177,7 +177,7 @@ FusedConvolutionRocMLIR::FusedConvolutionRocMLIR(
                 kernel_ = &it->second;
             } else {
                 // with_skip=true, with_silu_add=true → 6-arg kernel
-                auto compiled = rocmlir::compile_conv_migraphx(conv_params_, "",
+                auto compiled = rocmlir::compile_conv_fused_epilogue(conv_params_, "",
                     /*with_skip=*/true, /*with_silu_add=*/true);
                 compiled.bias_fused     = true;
                 compiled.silu_fused     = true;
@@ -245,9 +245,9 @@ FusedConvolutionRocMLIR::FusedConvolutionRocMLIR(
         }();
         if (use_epilogue_fusion) {
             // migraphx dialect: conv+bias+silu+skip_add in one kernel (5 args)
-            auto compiled = rocmlir::compile_conv_migraphx(conv_params_, "", /*with_skip=*/true);
+            auto compiled = rocmlir::compile_conv_fused_epilogue(conv_params_, "", /*with_skip=*/true);
             auto& stored = rocmlir::RocMLIRKernelCache::global()
-                               .insert_migraphx_silu_add(conv_params_, std::move(compiled));
+                               .insert_fused_epilogue_silu_add(conv_params_, std::move(compiled));
             kernel_ = &stored;
         } else {
         kernel_ = &rocmlir::RocMLIRKernelCache::global()
@@ -262,9 +262,9 @@ FusedConvolutionRocMLIR::FusedConvolutionRocMLIR(
         }();
         if (use_epilogue_fusion2) {
             // migraphx dialect: conv+bias+silu in one kernel (4 args)
-            auto compiled = rocmlir::compile_conv_migraphx(conv_params_, "", /*with_skip=*/false);
+            auto compiled = rocmlir::compile_conv_fused_epilogue(conv_params_, "", /*with_skip=*/false);
             auto& stored = rocmlir::RocMLIRKernelCache::global()
-                               .insert_migraphx_silu(conv_params_, std::move(compiled));
+                               .insert_fused_epilogue_silu(conv_params_, std::move(compiled));
             kernel_ = &stored;
         } else {
         kernel_ = &rocmlir::RocMLIRKernelCache::global()
@@ -287,7 +287,7 @@ FusedConvolutionRocMLIR::FusedConvolutionRocMLIR(
                 if (it != skip_cache_.end()) {
                     kernel_ = &it->second;
                 } else {
-                    auto compiled = rocmlir::compile_conv_migraphx_skip(conv_params_);
+                    auto compiled = rocmlir::compile_conv_fused_skip(conv_params_);
                     hipModule_t mod; hipFunction_t fn;
                     hipModuleLoadData(&mod, compiled.hsaco.data());
                     hipModuleGetFunction(&fn, mod, compiled.kernel_name.c_str());
