@@ -36,6 +36,7 @@ struct ElementTypesSwitch {
 };
 
 using AllElementTypesSwitch = ElementTypesSwitch<
+    Type_t::boolean,  // Added: support bool for attention masks and comparison results
     Type_t::f16,
     Type_t::f32,
     Type_t::i8,

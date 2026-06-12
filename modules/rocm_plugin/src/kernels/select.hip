@@ -70,38 +70,6 @@ void SelectKernelOp::operator()(const hipStream_t stream,
     const float* else_node_fp32  = nullptr;
     float* buffer_fp32 = nullptr;
     switch (operation_type_) {
-        /*
-        case Type_t::u8:
-            return callKernel<uint8_t>(stream,
-                                       condition,
-                                       then_node,
-                                       else_node,
-                                       cond_brcst_offsets,
-                                       then_brcst_offsets,
-                                       else_brcst_offsets,
-                                       output_sizes,
-                                       buffer);
-        case Type_t::i16:
-            return callKernel<int16_t>(stream,
-                                       condition,
-                                       then_node,
-                                       else_node,
-                                       cond_brcst_offsets,
-                                       then_brcst_offsets,
-                                       else_brcst_offsets,
-                                       output_sizes,
-                                       buffer);
-        case Type_t::f16:
-            return callKernel<__half>(stream,
-                                      condition,
-                                      then_node,
-                                      else_node,
-                                      cond_brcst_offsets,
-                                      then_brcst_offsets,
-                                      else_brcst_offsets,
-                                      output_sizes,
-                                      buffer);
-        */
         case Type_t::f32:
             then_node_fp32 = (const float*)then_node;
             else_node_fp32  = (const float*)else_node;

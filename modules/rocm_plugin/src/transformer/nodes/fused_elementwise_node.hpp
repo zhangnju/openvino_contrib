@@ -46,9 +46,24 @@ public:
     }
 
     void validate_and_infer_types() override {
-        // Output shape = primary input shape, same element type
+        // Output shape = BROADCAST of all inputs, same element type as primary input.
+        // Bug fix: the original code used only input[0] shape, which is wrong when
+        // the primary input is a scalar/constant and aux inputs have larger shapes.
+        // Example: Sub(scalar_1.0, mask_tensor[1,1,256]) → output must be [1,1,256],
+        // not [] or [1,1,1,1] (shape of the scalar). This caused BERT attention mask
+        // reshapes to fail because FusedElementwise reported the wrong output shape.
         OPENVINO_ASSERT(get_input_size() >= 1, "FusedElementwise: at least one input required");
-        set_output_type(0, get_input_element_type(0), get_input_partial_shape(0));
+        ov::PartialShape out_shape = get_input_partial_shape(0);
+        for (size_t i = 1; i < get_input_size(); ++i) {
+            const auto& aux = get_input_partial_shape(i);
+            if (!ov::PartialShape::broadcast_merge_into(
+                    out_shape, aux, ov::op::AutoBroadcastType::NUMPY)) {
+                // If shapes are incompatible, fall back to primary shape
+                // (will produce a runtime error if truly incompatible)
+                break;
+            }
+        }
+        set_output_type(0, get_input_element_type(0), out_shape);
     }
 
     std::shared_ptr<ov::Node> clone_with_new_inputs(const ov::OutputVector& new_inputs) const override {

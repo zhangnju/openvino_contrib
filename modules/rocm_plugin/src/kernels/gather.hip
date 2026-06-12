@@ -178,16 +178,9 @@ void Gather::CallByDataType(const hipStream_t stream,
     const int* src_index_int= nullptr;
     float* dst_data_fp32= nullptr;
     switch (element_type_) {
-        /*
-        case Type_t::boolean:
-            return Call<bool, IndexType>(stream, src_dict, src_index, dst_data);
-#ifdef rocm_HAS_BF16_TYPE
-        case Type_t::bf16:
-            return Call<hip_bfloat16, IndexType>(stream, src_dict, src_index, dst_data);
-#endif
         case Type_t::f16:
-            return Call<__half, IndexType>(stream, src_dict, src_index, dst_data);
-        */
+            // FP16 gather: use generic (element_size=2) path
+            return CallGeneric(stream, src_dict, (const int32_t*)src_index, dst_data, sizeof(__half));
         case Type_t::f32:
             return Call(stream, (const float*)src_dict, (const int*)src_index, (float*)dst_data);
         case Type_t::i64:
