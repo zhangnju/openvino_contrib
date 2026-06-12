@@ -963,6 +963,212 @@ static std::string get_tuned_perf_config(const ConvParams& p,
     return best_cfg;
 }
 
+
+// Forward declaration for fused_epilogue tuning
+static std::string generate_fused_epilogue_ir(const ConvParams& p,
+                                               bool with_skip,
+                                               bool with_silu_add,
+                                               const std::string& perf_cfg);
+
+// ── fused_epilogue (migraphx dialect) perf_config tuning ─────────────────────
+// Measures conv+bias+silu fused kernel time by compiling via generate_fused_epilogue_ir.
+// Returns average ms over n_runs, or 1e9 on failure.
+static float time_perf_config_fused_epilogue(const ConvParams& p,
+                                              const std::string& driver_path,
+                                              const std::string& cfg,
+                                              int n_warmup = 2, int n_runs = 5) {
+    // Compile fused_epilogue IR with the given perf_config
+    std::string mlir_ir;
+    try { mlir_ir = generate_fused_epilogue_ir(p, /*with_skip=*/false, /*with_silu_add=*/false, cfg); }
+    catch (...) { return 1e9f; }
+
+    CompiledConv compiled;
+    try { compiled = compile_mlir_with_pipeline(mlir_ir, p.arch, driver_path, "migraphx,highlevel,gpu,rocdl,binary", "ov_fused_tune"); }
+    catch (...) { return 1e9f; }
+    if (compiled.hsaco.empty()) return 1e9f;
+
+    const size_t elem_bytes = p.fp16 ? 2u : 4u;
+    const size_t in_bytes   = (size_t)p.N * p.C * p.H * p.W * elem_bytes;
+    const size_t flt_bytes  = (size_t)p.K * (p.C / p.groups) * p.R * p.S * elem_bytes;
+    const size_t bias_bytes = (size_t)p.K * elem_bytes;
+    const size_t out_bytes  = (size_t)p.N * p.K * p.out_h() * p.out_w() * elem_bytes;
+
+    void *d_in = nullptr, *d_flt = nullptr, *d_bias = nullptr, *d_out = nullptr;
+    auto cleanup = [&]() {
+        if (d_in)   hipFree(d_in);
+        if (d_flt)  hipFree(d_flt);
+        if (d_bias) hipFree(d_bias);
+        if (d_out)  hipFree(d_out);
+    };
+    if (hipMalloc(&d_in,   in_bytes)   != hipSuccess) { cleanup(); return 1e9f; }
+    if (hipMalloc(&d_flt,  flt_bytes)  != hipSuccess) { cleanup(); return 1e9f; }
+    if (hipMalloc(&d_bias, bias_bytes) != hipSuccess) { cleanup(); return 1e9f; }
+    if (hipMalloc(&d_out,  out_bytes)  != hipSuccess) { cleanup(); return 1e9f; }
+    hipMemset(d_in, 0, in_bytes); hipMemset(d_flt, 0, flt_bytes);
+    hipMemset(d_bias, 0, bias_bytes);
+
+    hipModule_t module = nullptr; hipFunction_t func = nullptr;
+    if (hipModuleLoadData(&module, compiled.hsaco.data()) != hipSuccess) { cleanup(); return 1e9f; }
+    if (hipModuleGetFunction(&func, module, compiled.kernel_name.c_str()) != hipSuccess) {
+        hipModuleUnload(module); cleanup(); return 1e9f;
+    }
+
+    // fused_epilogue kernel: (input, filter, bias, output) - legacy arg order
+    void* args[] = { &d_in, &d_flt, &d_bias, &d_out };
+    auto run_once = [&]() {
+        hipModuleLaunchKernel(func, compiled.grid_x, 1, 1, compiled.block_x, 1, 1,
+                              0, nullptr, args, nullptr);
+    };
+
+    for (int i = 0; i < n_warmup; ++i) run_once();
+    hipDeviceSynchronize();
+
+    hipEvent_t ev0, ev1;
+    hipEventCreate(&ev0); hipEventCreate(&ev1);
+    hipEventRecord(ev0, nullptr);
+    for (int i = 0; i < n_runs; ++i) run_once();
+    hipEventRecord(ev1, nullptr);
+    hipDeviceSynchronize();
+
+    float ms = 0.f;
+    hipEventElapsedTime(&ms, ev0, ev1);
+    hipEventDestroy(ev0); hipEventDestroy(ev1);
+    hipModuleUnload(module);
+    cleanup();
+    return ms / n_runs;
+}
+
+// Dedicated perf_config cache for fused_epilogue (conv+bias+silu) kernels.
+// Stored separately from plain rock.conv cache because the optimal tile config
+// may differ when SiLU epilogue is fused (changes compute/memory ratio).
+struct FusedEpiloguePerfCache {
+    std::mutex mu;
+    std::unordered_map<size_t, std::string> map;
+    bool loaded = false;
+    std::string arch_for_file;
+
+    static FusedEpiloguePerfCache& instance() { static FusedEpiloguePerfCache c; return c; }
+
+    static std::string get_path(const std::string& arch) {
+        const char* env = std::getenv("ROCMLIR_TUNING_CACHE_FUSED");
+        if (env && *env) return env;
+        const char* home = std::getenv("HOME");
+        std::string base = home ? std::string(home) : "/tmp";
+        std::string arch_clean = arch.substr(0, arch.find(':'));
+        return base + "/.cache/ov_rocmlir_tuning_" + arch_clean + "_fused.json";
+    }
+
+    void load(const std::string& arch) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (loaded) return;
+        loaded = true; arch_for_file = arch;
+        const std::string path = get_path(arch);
+        std::ifstream f(path);
+        if (!f.is_open()) return;
+        std::string line;
+        while (std::getline(f, line)) {
+            auto q1=line.find('"'); if(q1==std::string::npos) continue;
+            auto q2=line.find('"',q1+1); if(q2==std::string::npos) continue;
+            auto q3=line.find('"',q2+1); if(q3==std::string::npos) continue;
+            auto q4=line.find('"',q3+1); if(q4==std::string::npos) continue;
+            try { map[std::stoull(line.substr(q1+1,q2-q1-1),nullptr,16)] =
+                      line.substr(q3+1,q4-q3-1); }
+            catch (...) {}
+        }
+        std::cerr << "[fused-tune] Loaded " << map.size() << " configs from " << path << std::endl;
+    }
+
+    void save() {
+        const std::string path = get_path(arch_for_file);
+        ensure_dir(path);
+        std::ofstream f(path, std::ios::trunc);
+        f << "{\n";
+        bool first = true;
+        for (const auto& [key, cfg] : map) {
+            if (!first) f << ",\n";
+            char hex[32]; snprintf(hex, sizeof(hex), "%016zx", key);
+            f << "  \"" << hex << "\": \"" << cfg << "\"";
+            first = false;
+        }
+        f << "\n}\n";
+    }
+};
+
+// Get optimal perf_config for fused_epilogue (conv+bias+silu) kernel.
+// Called when ROCMLIR_ENABLE_TUNING_FUSED=1; otherwise returns "" (use default).
+// Uses the same candidate set as plain conv tuning (rdna_v3_candidates).
+static std::string get_tuned_perf_config_fused(const ConvParams& p,
+                                                const std::string& gen_path,
+                                                const std::string& driver_path) {
+    // Always attempt to load the fused cache (similar to plain conv cache behavior).
+    // When ROCMLIR_ENABLE_TUNING_FUSED=1, run tuning search if shape not in cache.
+    // When ROCMLIR_ENABLE_TUNING_FUSED=0 (default), use cached results from previous tuning.
+    auto& cache = FusedEpiloguePerfCache::instance();
+    cache.load(p.arch);
+
+    const size_t key = p.hash() ^ static_cast<size_t>(0xF0504DEF00ULL);
+    {
+        std::lock_guard<std::mutex> lk(cache.mu);
+        auto it = cache.map.find(key);
+        if (it != cache.map.end()) return it->second;
+    }
+
+    // Shape not in fused cache: run tuning if enabled, else return ""
+    const char* enable = std::getenv("ROCMLIR_ENABLE_TUNING_FUSED");
+    if (!enable || std::string(enable) != "1") return "";
+
+    // Use same v3 candidate set as plain conv (optimal for RDNA4 wave32)
+    // Only tune for RDNA3/4 FP16 (where v3 configs are validated)
+    const bool is_gfx1151 = p.arch.find("gfx1151") != std::string::npos;
+    const bool is_rdna = !is_gfx1151 && (p.arch.find("gfx12") != std::string::npos ||
+                                          p.arch.find("gfx11") != std::string::npos);
+    if (!is_rdna || !p.fp16) return "";
+
+    // Smaller candidate set focused on shapes common in fused conv+silu
+    // Avoiding very large tiles that may be invalid for migraphx rock.conv
+    static const std::vector<std::string> fused_candidates = {
+        "", // default (rocMLIR heuristic)
+        "v3:64,128,4,32,64,8,1,1,2,1,1",
+        "v3:64,256,4,32,64,8,1,1,2,1,1",
+        "v3:128,128,8,32,16,8,1,2,2,1,1",
+        "v3:128,64,8,32,64,8,1,1,2,1,1",
+        "v3:64,64,8,32,32,8,1,2,2,1,1",
+        "v3:128,128,8,64,64,8,1,1,2,1,1",
+        "v3:64,64,2,64,64,8,1,1,2,1,1",
+        "v3:64,128,8,64,64,8,1,1,2,1,1",
+        "v3:32,128,4,16,64,8,1,2,2,1,1",
+        "v3:64,64,4,32,32,8,1,2,2,1,1",
+        "v3:128,64,4,64,32,8,1,1,2,1,1",
+        "v3:32,64,8,32,16,8,1,2,2,1,1",
+        "v3:64,128,2,64,64,8,1,1,2,1,1",
+        "v3:128,256,4,128,64,4,1,2,2,1,1",
+        "v3:64,256,8,64,32,8,1,1,2,1,1",
+        "v3:32,256,4,16,128,4,1,2,2,1,1",
+        "v3:128,64,2,64,32,8,1,1,2,1,1",
+        "v3:128,128,2,64,64,8,1,1,2,1,1",
+        "v3:64,64,8,64,64,8,1,1,2,1,1",
+    };
+
+    std::string best_cfg;
+    float best_ms = 1e9f;
+    for (const auto& cfg : fused_candidates) {
+        float ms = time_perf_config_fused_epilogue(p, driver_path, cfg);
+        std::cerr << "[fused-tune] cfg=" << (cfg.empty() ? "default" : cfg)
+                  << " → " << ms << "ms\n";
+        if (ms < best_ms) { best_ms = ms; best_cfg = cfg; }
+    }
+
+    std::cerr << "[fused-tune] N=" << p.N << " C=" << p.C << " H=" << p.H
+              << " K=" << p.K << " R=" << p.R << " stride=" << p.stride_h
+              << " → best=" << (best_cfg.empty() ? "default" : best_cfg)
+              << " (" << best_ms << "ms)\n";
+
+    std::lock_guard<std::mutex> lk(cache.mu);
+    cache.map[key] = best_cfg;
+    cache.save();
+    return best_cfg;
+}
+
 static std::string rocmlir_gen_cmd(const ConvParams& p,
                                     const std::string& gen_path,
                                     const std::string& perf_config = "") {
@@ -2257,12 +2463,17 @@ CompiledConv compile_conv_fused_epilogue(const ConvParams& p, const std::string&
                                     bool with_skip, bool with_silu_add) {
     const std::string driver = drv.empty() ? find_rocmlir_driver() : drv;
 
-    // Get tuned perf_config from cache (same cache as rock.conv path).
-    // Injected into migraphx.convolution attribute; propagates through
-    // MIGraphXToTosa→TosaToRock to rock.conv where rock-affix-params uses it.
-    // With --tuning-fallback=true, invalid configs gracefully degrade to heuristic.
+    // Get tuned perf_config for fused_epilogue path.
+    // Priority: fused-specific tuning (ROCMLIR_ENABLE_TUNING_FUSED=1) >
+    //           plain rock.conv tuning cache > heuristic default.
+    // The fused path measures conv+bias+silu fused kernel time directly,
+    // giving more accurate results than reusing the plain conv cache.
     const std::string gen = find_rocmlir_gen(driver);
-    const std::string perf_cfg = get_tuned_perf_config(p, gen, driver);
+    std::string perf_cfg = get_tuned_perf_config_fused(p, gen, driver);
+    if (perf_cfg.empty()) {
+        // Fall back to plain conv tuning cache (close approximation)
+        perf_cfg = get_tuned_perf_config(p, gen, driver);
+    }
 
     auto& kc = HsacoKernelCache::instance();
     // with_skip=false,with_silu_add=false → 0x04; with_skip=true → 0x05; with_silu_add=true → 0x09
