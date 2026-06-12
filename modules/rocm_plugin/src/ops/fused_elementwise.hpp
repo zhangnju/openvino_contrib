@@ -29,6 +29,19 @@ public:
                  Outputs outputs,
                  const Workbuffers& workbuffers) const override;
 
+    // Capture: records H2D(pinned_pool_slot → device_wb) + kernel in the hipGraph.
+    void Capture(InferenceRequestContext& context,
+                 Inputs inputs,
+                 Outputs outputs,
+                 const Workbuffers& workbuffers) const override;
+
+    // ExecuteGraph: refreshes pinned slot BEFORE hipGraphLaunch so the captured H2D
+    // reads the current inference's aux input addresses.
+    void ExecuteGraph(InferenceRequestContext& context,
+                      Inputs inputs,
+                      Outputs outputs,
+                      const Workbuffers& workbuffers) const override;
+
     rocmGraphCompatibility GetrocmGraphCompatibility() const override {
         return rocmGraphCompatibility::FULL;
     }

@@ -132,8 +132,9 @@ std::unique_ptr<MemoryManager> SubGraph::createMemoryManager(const OperationBuff
     opBuffersExtractor.initConstantMemory(shared_constants_blob);
 
     auto immutable_workbuffers = std::make_shared<DeviceMemBlock>(immutable_workbuffer_model);
-    // Later on, for each infer request
-    return std::make_unique<MemoryManager>(shared_constants_blob, memory_model, immutable_workbuffers);
+    auto mgr = std::make_unique<MemoryManager>(shared_constants_blob, memory_model, immutable_workbuffers);
+    mgr->setPinnedPoolBytesPerRequest(opBuffersExtractor.totalPinnedPoolBytes());
+    return mgr;
 }
 
 std::size_t SubGraph::GetrocmGraphsCount() const {

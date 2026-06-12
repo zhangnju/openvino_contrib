@@ -40,7 +40,8 @@ MemoryManager::OutputTensors MemoryManager::outputTensorPointers(const IOperatio
 }
 
 Workbuffers MemoryManager::workBuffers(const IOperationExec& operation,
-                                       rocm::DevicePointer<void*> mutableBufferPtr) const {
+                                       rocm::DevicePointer<void*> mutableBufferPtr,
+                                       void* pinnedPool) const {
     Workbuffers result{};
     const auto& indices = operation.GetWorkbufferIds();
     for (const auto immutable_id : indices.immutableIds) {
@@ -52,6 +53,12 @@ Workbuffers MemoryManager::workBuffers(const IOperationExec& operation,
         void* ptr = mutable_tensors_model_->deviceBufferPtr(mutableBufferPtr.cast<uint8_t*>(), mutable_id);
         OPENVINO_ASSERT(ptr != nullptr, "Workbuffer not found. ID is " + std::to_string(mutable_id));
         result.mutable_buffers.emplace_back(ptr);
+    }
+    // Pinned host buffers: slice the per-request pinned pool by recorded offsets.
+    if (pinnedPool) {
+        for (const auto offset : indices.pinnedOffsets) {
+            result.pinned_buffers.push_back(static_cast<uint8_t*>(pinnedPool) + offset);
+        }
     }
     return result;
 }

@@ -70,7 +70,8 @@ public:
      *                    containing mutable/intermediate tensors".
      * @param immutableWorkbufferMemory Blob for immutable workbuffers
      */
-    MemoryPool(size_t num, std::shared_ptr<MemoryModel> memoryModel);
+    MemoryPool(size_t num, std::shared_ptr<MemoryModel> memoryModel,
+               size_t pinned_pool_bytes = 0);
 
     /**
      * Interrupt waiting of DeviceMemBlock Proxy object

@@ -52,7 +52,7 @@ public:
         for (auto& op : subGraphPtr->getExecSequence()) {
             const auto& inputTensors = memoryManager.inputTensorPointers(*op, buffer);
             const auto& outputTensors = memoryManager.outputTensorPointers(*op, buffer);
-            const auto& workBuffers = memoryManager.workBuffers(*op, buffer);
+            const auto& workBuffers = memoryManager.workBuffers(*op, buffer, context.getPinnedPool());
             op->Execute(context, inputTensors, outputTensors, workBuffers);
         }
     };
@@ -71,7 +71,7 @@ public:
         for (auto& op : subGraphPtr->getExecSequence()) {
             const auto& inputTensors = memoryManager.inputTensorPointers(*op, buffer);
             const auto& outputTensors = memoryManager.outputTensorPointers(*op, buffer);
-            const auto& workBuffers = memoryManager.workBuffers(*op, buffer);
+            const auto& workBuffers = memoryManager.workBuffers(*op, buffer, context.getPinnedPool());
             op->Capture(context, inputTensors, outputTensors, workBuffers);
         }
     };
@@ -90,7 +90,7 @@ public:
         for (auto& op : subGraphPtr->getExecSequence()) {
             const auto& inputTensors = memoryManager.inputTensorPointers(*op, buffer);
             const auto& outputTensors = memoryManager.outputTensorPointers(*op, buffer);
-            const auto& workBuffers = memoryManager.workBuffers(*op, buffer);
+            const auto& workBuffers = memoryManager.workBuffers(*op, buffer, context.getPinnedPool());
             op->ExecuteGraph(context, inputTensors, outputTensors, workBuffers);
         }
     };

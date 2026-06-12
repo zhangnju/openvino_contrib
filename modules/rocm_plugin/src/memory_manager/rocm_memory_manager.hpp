@@ -72,7 +72,9 @@ public:
      * @returns Work buffer pointers
      * @throws ov::Exception if any of tensor pointers is not found
      */
-    Workbuffers workBuffers(const IOperationExec& operation, rocm::DevicePointer<void*> mutableBufferPtr) const;
+    Workbuffers workBuffers(const IOperationExec& operation,
+                            rocm::DevicePointer<void*> mutableBufferPtr,
+                            void* pinnedPool = nullptr) const;
 
     /**
      * Returns immutable tensors
@@ -92,10 +94,15 @@ public:
      */
     [[nodiscard]] const DeviceMemBlock& immutableWorkbuffers() const { return *immutable_workbuffers_; }
 
+    // Total pinned host memory required per infer-request (computed by OperationBuffersExtractor).
+    size_t pinnedPoolBytesPerRequest() const { return pinned_pool_bytes_; }
+    void setPinnedPoolBytesPerRequest(size_t bytes) { pinned_pool_bytes_ = bytes; }
+
 private:
     DeviceMemBlock::Ptr immutable_tensors_;
     MemoryModel::Ptr mutable_tensors_model_;
     DeviceMemBlock::Ptr immutable_workbuffers_;
+    size_t pinned_pool_bytes_ = 0;
 };
 
 }  // namespace rocm_gpu

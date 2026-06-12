@@ -28,6 +28,16 @@ public:
                  Outputs outputTensors,
                  const Workbuffers& workbuffers) const override;
 
+    void Capture(InferenceRequestContext& context,
+                 Inputs inputTensors,
+                 Outputs outputTensors,
+                 const Workbuffers& workbuffers) const override;
+
+    void ExecuteGraph(InferenceRequestContext& context,
+                      Inputs inputTensors,
+                      Outputs outputTensors,
+                      const Workbuffers& workbuffers) const override;
+
     rocmGraphCompatibility GetrocmGraphCompatibility() const override;
 
 private:

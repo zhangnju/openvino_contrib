@@ -355,6 +355,14 @@ WorkbufferIds OperationBuffersExtractor::processWorkbufferRequest(int node_idx, 
         result.mutableIds.push_back(next_buffer_id_);
         next_buffer_id_++;
     }
+    // Pinned host buffers: allocate contiguous slots in the per-request pinned pool.
+    // We record byte offsets; the MemoryManager uses pinnedPool() + offset to produce void*.
+    for (auto size : request.pinned_sizes) {
+        // Align to pointer size for safety
+        const size_t aligned = (size + sizeof(void*) - 1) & ~(sizeof(void*) - 1);
+        result.pinnedOffsets.push_back(total_pinned_bytes_);
+        total_pinned_bytes_ += aligned;
+    }
     return result;
 }
 

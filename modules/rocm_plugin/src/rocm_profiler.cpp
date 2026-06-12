@@ -130,7 +130,7 @@ void Profiler::execute_sequence(const SubGraph* subGraphPtr,
     for (const auto& op : create_exec_sequence(subGraphPtr)) {
         const auto& inTensors = memoryManager.inputTensorPointers(*op, buffer);
         const auto& outTensors = memoryManager.outputTensorPointers(*op, buffer);
-        const auto& workBuffers = memoryManager.workBuffers(*op, buffer);
+        const auto& workBuffers = memoryManager.workBuffers(*op, buffer, context.getPinnedPool());
         op->execute(context, inTensors, outTensors, workBuffers);
     }
 }
@@ -142,7 +142,7 @@ void Profiler::capture_sequence(const SubGraph* subGraphPtr,
     for (const auto& op : create_exec_sequence(subGraphPtr)) {
         const auto& inputTensors = memoryManager.inputTensorPointers(*op, buffer);
         const auto& outputTensors = memoryManager.outputTensorPointers(*op, buffer);
-        const auto& workBuffers = memoryManager.workBuffers(*op, buffer);
+        const auto& workBuffers = memoryManager.workBuffers(*op, buffer, context.getPinnedPool());
         op->capture(context, inputTensors, outputTensors, workBuffers);
     }
 }
@@ -154,7 +154,7 @@ void Profiler::execute_graph_sequence(const SubGraph* subGraphPtr,
     for (const auto& op : create_exec_sequence(subGraphPtr)) {
         const auto& inTensors = memoryManager.inputTensorPointers(*op, buffer);
         const auto& outTensors = memoryManager.outputTensorPointers(*op, buffer);
-        const auto& workBuffers = memoryManager.workBuffers(*op, buffer);
+        const auto& workBuffers = memoryManager.workBuffers(*op, buffer, context.getPinnedPool());
         op->execute_graph(context, inTensors, outTensors, workBuffers);
     }
 }

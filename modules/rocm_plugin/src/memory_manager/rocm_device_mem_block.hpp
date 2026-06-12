@@ -56,10 +56,22 @@ public:
 
     ::ov::rocm_gpu::rocmGraphContext& rocmGraphContext() { return rocm_graph_context_; }
 
+    // Per-request pinned host memory pool (hipHostMalloc).
+    // Ops with pinned workbuffer requests receive offsets into this pool.
+    // The pool holds H2D source data (aux ptrs, output ptrs etc.) so hipGraph
+    // can record stable H2D addresses and replay them after ExecuteGraph() updates.
+    void* pinnedPool() const { return pinned_pool_; }
+    void  allocPinnedPool(size_t bytes);
+    size_t pinnedPoolSize() const { return pinned_pool_size_; }
+
+    ~DeviceMemBlock();
+
 private:
     MemoryModel::Ptr model_;
     rocm::DefaultAllocation device_mem_ptr_ = rocm::DefaultStream::stream().malloc(model_->deviceMemoryBlockSize());
     ::ov::rocm_gpu::rocmGraphContext rocm_graph_context_;
+    void*  pinned_pool_      = nullptr;
+    size_t pinned_pool_size_ = 0;
 };
 
 }  // namespace rocm_gpu

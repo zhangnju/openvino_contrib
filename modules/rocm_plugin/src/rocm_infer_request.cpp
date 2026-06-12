@@ -165,6 +165,8 @@ void rocmInferRequest::start_pipeline(const ThreadContext& threadContext) {
                                                     *executionDelegator_,
                                                     rocmGraphContext,
                                                     is_benchmark_mode_};
+        // Expose this request's pinned host pool so workBuffers() can resolve pinned slots.
+        inferRequestContext.setPinnedPool(memory.pinnedPool());
         topology_runner.UpdateContext(inferRequestContext, memory);
         // Clear any leftover silu_tracking marks from the previous inference.
         // Normally cleared by SwishOp::Execute, but skipped Swish nodes (rocm_swish_inplace)

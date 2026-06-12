@@ -115,6 +115,9 @@ public:
     WorkbufferIds processWorkbufferRequest(int node_idx, const WorkbufferRequest& request,
                                            int lifespan_extra = 0);
 
+    // Total pinned host memory needed per infer-request (sum of all ops' pinned_sizes).
+    size_t totalPinnedPoolBytes() const { return total_pinned_bytes_; }
+
     /**
      * @returns sizes of immutable workbuffers
      */
@@ -313,6 +316,7 @@ private:
     const bool is_stable_params_ = false;
     const bool is_stable_results_ = false;
     const unsigned long num_ordered_nodes_ = 0;
+    size_t total_pinned_bytes_{0};  // accumulated pinned pool bytes across all ops
 };
 
 }  // namespace rocm_gpu

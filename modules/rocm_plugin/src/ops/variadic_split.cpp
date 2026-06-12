@@ -160,7 +160,8 @@ WorkbufferRequest VariadicSplitOp::GetWorkBufferRequest() const {
     immutable_buffer_sizes.at(kSplitIdxIWBIdx) = sizeof(*split_idx_.data()) * split_idx_.size();
     immutable_buffer_sizes.at(kAxisSizesIWBIdx) = sizeof(*axis_sizes_.data()) * axis_sizes_.size();
     immutable_buffer_sizes.at(kAxisOffsetSizesIWBIdx) = sizeof(*axis_offset_sizes_.data()) * axis_offset_sizes_.size();
-    return {immutable_buffer_sizes, {sizeof(void*) * axis_sizes_.size()}};
+    const size_t ptr_bytes = sizeof(void*) * axis_sizes_.size();
+    return {immutable_buffer_sizes, {ptr_bytes}, {ptr_bytes}};
 }
 
 void VariadicSplitOp::InitSharedImmutableWorkbuffers(const IOperationExec::Buffers& buffers) {
@@ -188,7 +189,11 @@ void VariadicSplitOp::Execute(const InferenceRequestContext& context,
     auto all_split_idxs = buffers.immutable_buffers.at(kSplitIdxIWBIdx);
     auto all_num_splits = buffers.immutable_buffers.at(kAxisSizesIWBIdx);
     auto axis_offset_sizes = buffers.immutable_buffers.at(kAxisOffsetSizesIWBIdx);
-    stream.upload(output_ptrs, outputs.data(), sizeof(void*) * axis_sizes_.size());
+    // Write output device ptrs into pinned slot, then H2D to device workbuffer.
+    OPENVINO_ASSERT(!buffers.pinned_buffers.empty(), GetName(), ": need pinned wb");
+    auto* pinned = static_cast<const void**>(buffers.pinned_buffers[0]);
+    for (size_t i = 0; i < outputs.size(); ++i) pinned[i] = outputs[i].get();
+    stream.upload(output_ptrs, pinned, sizeof(void*) * axis_sizes_.size());
     auto in = inputs[0];
     (*variadic_split_kernel_)(stream.get(),
                               static_cast<const void*>(in.get()),
@@ -198,7 +203,41 @@ void VariadicSplitOp::Execute(const InferenceRequestContext& context,
                               static_cast<const void*>(axis_offset_sizes.get()));
 }
 
-rocmGraphCompatibility VariadicSplitOp::GetrocmGraphCompatibility() const { return rocmGraphCompatibility::NONE; }
+void VariadicSplitOp::Capture(InferenceRequestContext& context,
+                               Inputs inputs,
+                               Outputs outputs,
+                               const Workbuffers& buffers) const {
+    OPENVINO_ASSERT(variadic_split_kernel_, GetName());
+    auto& stream = context.getThreadContext().stream();
+    auto output_ptrs = buffers.mutable_buffers.at(kOutputPtrsMWBIdx);
+    auto all_split_idxs = buffers.immutable_buffers.at(kSplitIdxIWBIdx);
+    auto all_num_splits = buffers.immutable_buffers.at(kAxisSizesIWBIdx);
+    auto axis_offset_sizes = buffers.immutable_buffers.at(kAxisOffsetSizesIWBIdx);
+    // Pinned slot already has correct values from warmup Execute.
+    // H2D is captured in hipGraph with stable pinned address as source.
+    OPENVINO_ASSERT(!buffers.pinned_buffers.empty(), GetName(), ": need pinned wb");
+    stream.upload(output_ptrs, buffers.pinned_buffers[0], sizeof(void*) * axis_sizes_.size());
+    auto in = inputs[0];
+    (*variadic_split_kernel_)(stream.get(),
+                              static_cast<const void*>(in.get()),
+                              static_cast<void**>(output_ptrs.get()),
+                              static_cast<const void*>(all_split_idxs.get()),
+                              static_cast<const void*>(all_num_splits.get()),
+                              static_cast<const void*>(axis_offset_sizes.get()));
+}
+
+void VariadicSplitOp::ExecuteGraph(InferenceRequestContext& context,
+                                    Inputs inputs,
+                                    Outputs outputs,
+                                    const Workbuffers& buffers) const {
+    // Update pinned slot with current outputs before hipGraph replay executes H2D + kernel.
+    if (!buffers.pinned_buffers.empty()) {
+        auto* pinned = static_cast<const void**>(buffers.pinned_buffers[0]);
+        for (size_t i = 0; i < outputs.size(); ++i) pinned[i] = outputs[i].get();
+    }
+}
+
+rocmGraphCompatibility VariadicSplitOp::GetrocmGraphCompatibility() const { return rocmGraphCompatibility::FULL; }
 
 OPERATION_REGISTER(VariadicSplitOp, VariadicSplit);
 }  // namespace rocm_gpu

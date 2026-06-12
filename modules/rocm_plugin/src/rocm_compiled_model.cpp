@@ -274,7 +274,8 @@ std::shared_ptr<MemoryPool> CompiledModel::create_memory_pool() {
     const auto& memory_model = memory_manager.mutableTensorsMemoryModel();
     const auto memory_blob_size = memory_model->deviceMemoryBlockSize();
     const auto num_streams = get_optimal_number_of_streams(const_blob_size + immutable_work_buffers_size, memory_blob_size);
-    return std::make_shared<MemoryPool>(num_streams, memory_model);
+    const auto pinned_bytes = memory_manager.pinnedPoolBytesPerRequest();
+    return std::make_shared<MemoryPool>(num_streams, memory_model, pinned_bytes);
 }
 
 std::shared_ptr<ov::ISyncInferRequest> CompiledModel::create_benchmark_sync_infer_request() {

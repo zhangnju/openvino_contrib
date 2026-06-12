@@ -11,18 +11,17 @@
 namespace ov {
 namespace rocm_gpu {
 
-MemoryPool::MemoryPool(const size_t num, std::shared_ptr<MemoryModel> memoryModel) {
+MemoryPool::MemoryPool(const size_t num, std::shared_ptr<MemoryModel> memoryModel,
+                       size_t pinned_pool_bytes) {
     memory_blocks_.reserve(num);
     try {
         for (int i = 0; i < num; ++i) {
-            memory_blocks_.push_back(std::make_unique<DeviceMemBlock>(memoryModel));
+            auto blk = std::make_unique<DeviceMemBlock>(memoryModel);
+            if (pinned_pool_bytes > 0)
+                blk->allocPinnedPool(pinned_pool_bytes);
+            memory_blocks_.push_back(std::move(blk));
         }
     } catch (const std::exception& ex) {
-        // TODO: Added log message when logging mechanism will be supported
-        /**
-         * NOTE: It is not possible to allocate all memory of GPU that is why
-         *       we allocate as much as possible
-         */
         if (memory_blocks_.empty()) {
             throw;
         }

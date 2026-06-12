@@ -5,6 +5,7 @@
 #include "rocm_operation_registry.hpp"
 #include "rocm/runtime.hpp"
 
+#include <cstring>
 #include <openvino/core/except.hpp>
 #include <fmt/format.h>
 
@@ -78,9 +79,10 @@ FusedElementwiseOp::FusedElementwiseOp(
 WorkbufferRequest FusedElementwiseOp::GetWorkBufferRequest() const {
     const size_t ops_bytes    = chain_len_ * sizeof(uint8_t);
     const size_t params_bytes = chain_len_ * sizeof(float);
-    // Mutable: aux pointer array (chain_len_ void* entries, updated each Execute)
     const size_t aux_bytes    = chain_len_ * sizeof(void*);
-    return {{ops_bytes, params_bytes}, {aux_bytes}};
+    // pinned_sizes[0]: page-locked host mirror for aux_ptrs.
+    // hipGraph captures H2D from this stable address; ExecuteGraph() updates it before replay.
+    return {{ops_bytes, params_bytes}, {aux_bytes}, {aux_bytes}};
 }
 
 void FusedElementwiseOp::InitSharedImmutableWorkbuffers(const Buffers& buffers) {
@@ -91,6 +93,20 @@ void FusedElementwiseOp::InitSharedImmutableWorkbuffers(const Buffers& buffers) 
 
 // ─── Execute ─────────────────────────────────────────────────────────────────
 
+// Helper: write current aux input addresses into the pinned host slot.
+static void update_aux_ptrs(void* pinned_slot,
+                             const IOperationExec::Inputs& inputs,
+                             const std::vector<bool>& step_has_aux,
+                             int chain_len) {
+    auto* dst = static_cast<const void**>(pinned_slot);
+    int aux_idx = 1;
+    for (int s = 0; s < chain_len; ++s) {
+        dst[s] = (step_has_aux[s] && aux_idx < (int)inputs.size())
+                 ? inputs[aux_idx++].get()
+                 : nullptr;
+    }
+}
+
 void FusedElementwiseOp::Execute(const InferenceRequestContext& ctx,
                                   Inputs inputs,
                                   Outputs outputs,
@@ -99,38 +115,62 @@ void FusedElementwiseOp::Execute(const InferenceRequestContext& ctx,
     OPENVINO_ASSERT(!outputs.empty(), GetName(), ": no outputs");
     OPENVINO_ASSERT(wbs.immutable_buffers.size() == 2, GetName(), ": need 2 immutable wbs");
     OPENVINO_ASSERT(!wbs.mutable_buffers.empty(),       GetName(), ": need mutable wb for aux ptrs");
+    OPENVINO_ASSERT(!wbs.pinned_buffers.empty(),        GetName(), ": need pinned wb for aux ptrs");
 
-    // Build aux pointer array on host, then upload to the mutable workbuffer
-    // The mutable workbuffer holds chain_len_ void* entries
-    std::vector<const void*> aux_host(chain_len_, nullptr);
-    int aux_idx = 1;  // inputs[0] is primary; aux inputs start at [1]
-    for (int s = 0; s < chain_len_; ++s) {
-        if (step_has_aux_[s] && aux_idx < (int)inputs.size()) {
-            aux_host[s] = inputs[aux_idx].get();
-            aux_idx++;
-        }
-    }
-
-    // Upload aux pointer array to mutable workbuffer (D2H pointer values → D2D copy of pointers)
+    // Write aux ptrs into page-locked host slot, then H2D to device workbuffer.
+    // H2D source (wbs.pinned_buffers[0]) is a stable address in the per-request pinned pool,
+    // so hipGraph captures a valid persistent address (not a dangling stack pointer).
+    void* pinned = wbs.pinned_buffers[0];
+    update_aux_ptrs(pinned, inputs, step_has_aux_, chain_len_);
     void* aux_ptrs_device = wbs.mutable_buffers[0].get();
-    hipMemcpyAsync(aux_ptrs_device, aux_host.data(),
+    hipMemcpyAsync(aux_ptrs_device, pinned,
                    chain_len_ * sizeof(void*), hipMemcpyHostToDevice,
                    ctx.getThreadContext().stream().get());
 
-    // Launch fused kernel
     const uint8_t* ops_dev    = static_cast<const uint8_t*>(wbs.immutable_buffers[0].get());
     const float*   params_dev = static_cast<const float*>(wbs.immutable_buffers[1].get());
-
     kernel::launch_fused_elementwise(
         inputs[0].get(),
         static_cast<const void* const*>(aux_ptrs_device),
         outputs[0].get(),
-        num_elements_,
-        ops_dev,
-        params_dev,
-        chain_len_,
-        is_fp16_,
+        num_elements_, ops_dev, params_dev, chain_len_, is_fp16_,
         ctx.getThreadContext().stream().get());
+}
+
+void FusedElementwiseOp::Capture(InferenceRequestContext& ctx,
+                                  Inputs inputs,
+                                  Outputs outputs,
+                                  const Workbuffers& wbs) const {
+    // Warmup Execute already populated the pinned slot with correct addresses.
+    // During capture the hipMemcpyAsync H2D is recorded as a graph node.
+    // Source = wbs.pinned_buffers[0] (stable per-request pinned pool address),
+    // so replay reads from that same stable address — no dangling pointer.
+    OPENVINO_ASSERT(!wbs.pinned_buffers.empty(), GetName(), ": need pinned wb");
+    void* pinned = wbs.pinned_buffers[0];
+    void* aux_ptrs_device = wbs.mutable_buffers[0].get();
+    hipMemcpyAsync(aux_ptrs_device, pinned,
+                   chain_len_ * sizeof(void*), hipMemcpyHostToDevice,
+                   ctx.getThreadContext().stream().get());
+
+    const uint8_t* ops_dev    = static_cast<const uint8_t*>(wbs.immutable_buffers[0].get());
+    const float*   params_dev = static_cast<const float*>(wbs.immutable_buffers[1].get());
+    kernel::launch_fused_elementwise(
+        inputs[0].get(),
+        static_cast<const void* const*>(aux_ptrs_device),
+        outputs[0].get(),
+        num_elements_, ops_dev, params_dev, chain_len_, is_fp16_,
+        ctx.getThreadContext().stream().get());
+}
+
+void FusedElementwiseOp::ExecuteGraph(InferenceRequestContext& ctx,
+                                       Inputs inputs,
+                                       Outputs outputs,
+                                       const Workbuffers& wbs) const {
+    // Called BEFORE hipGraphLaunch() during replay. Update the pinned slot so that
+    // the captured H2D node copies fresh input addresses into the device workbuffer.
+    if (!wbs.pinned_buffers.empty())
+        update_aux_ptrs(wbs.pinned_buffers[0], inputs, step_has_aux_, chain_len_);
+    // H2D + kernel launch are handled by the hipGraph replay.
 }
 
 OPERATION_REGISTER(FusedElementwiseOp, FusedElementwise);

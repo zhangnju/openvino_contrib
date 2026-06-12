@@ -62,6 +62,11 @@ public:
     [[nodiscard]] const rocmGraphContext& getrocmGraphContext() const { return rocm_graph_context_; }
     [[nodiscard]] rocmGraphContext& getrocmGraphContext() { return rocm_graph_context_; }
 
+    // Per-request pinned host memory pool for hipGraph-safe H2D transfers.
+    // Set from DeviceMemBlock::pinnedPool() before each Execute/Capture sequence.
+    void setPinnedPool(void* pool) noexcept { pinned_pool_ = pool; }
+    [[nodiscard]] void* getPinnedPool() const noexcept { return pinned_pool_; }
+
     void setCurrentrocmGraphInfo(IrocmGraphInfo& info) { current_rocm_graph_info_ = &info; }
 
     IrocmGraphInfo& getCurrentrocmGraphInfo() {
@@ -77,6 +82,7 @@ private:
     rocmGraphContext& rocm_graph_context_;
     bool is_benchmark_mode_;
     IrocmGraphInfo* current_rocm_graph_info_ = nullptr;
+    void* pinned_pool_ = nullptr;
 };
 
 }  // namespace rocm_gpu

@@ -66,6 +66,11 @@ void rocmGraphTopologyRunner::Run(InferenceRequestContext& context, const Workbu
         auto compatibility = subgraph.GetrocmGraphCompatibility();
         if (compatibility == rocmGraphCompatibility::FULL) {
             graphPack.select_current_graph(graphIndex);
+            // Allow ops to refresh CPU-side data (pinned pool slots) before replay.
+            // ExecuteGraph() is a no-op for most ops; for FusedElementwise/Split it
+            // updates the pinned aux/output pointer arrays so the captured H2D nodes
+            // copy the current inference's GPU addresses into the device workbuffers.
+            subgraph.ExecuteGraph(context, {}, {}, workbuffers);
             graphPack.launch(stream);
             graphIndex++;
         } else if (compatibility == rocmGraphCompatibility::SPECIAL) {

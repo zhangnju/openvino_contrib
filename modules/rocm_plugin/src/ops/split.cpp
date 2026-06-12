@@ -70,7 +70,9 @@ SplitOp::SplitOp(const CreationContext& context,
                                   threads_per_block};
 }
 
-WorkbufferRequest SplitOp::GetWorkBufferRequest() const { return {{}, {mutableWbSize()}}; }
+WorkbufferRequest SplitOp::GetWorkBufferRequest() const {
+    return {{}, {mutableWbSize()}, {mutableWbSize()}};
+}
 
 void SplitOp::Execute(const InferenceRequestContext& context,
                       Inputs inputs,
@@ -83,12 +85,38 @@ void SplitOp::Execute(const InferenceRequestContext& context,
     auto& threadContext = context.getThreadContext();
     auto& stream = threadContext.stream();
     auto outputPtrs = buffers.mutable_buffers[0];
-    stream.upload(outputPtrs, outputs.data(), sizeof(void*) * num_splits_);
+    OPENVINO_ASSERT(!buffers.pinned_buffers.empty(), GetName(), ": need pinned wb");
+    auto* pinned = static_cast<const void**>(buffers.pinned_buffers[0]);
+    for (size_t i = 0; i < outputs.size(); ++i) pinned[i] = outputs[i].get();
+    stream.upload(outputPtrs, pinned, sizeof(void*) * num_splits_);
     auto in = inputs[0];
     (*split_kernel_)(stream.get(), reinterpret_cast<const void*>(in.get()), reinterpret_cast<void**>(outputPtrs.get()));
 }
 
-rocmGraphCompatibility SplitOp::GetrocmGraphCompatibility() const { return rocmGraphCompatibility::NONE; }
+void SplitOp::Capture(InferenceRequestContext& context,
+                       Inputs inputs,
+                       Outputs outputs,
+                       const Workbuffers& buffers) const {
+    OPENVINO_ASSERT(split_kernel_, GetName());
+    auto& stream = context.getThreadContext().stream();
+    auto outputPtrs = buffers.mutable_buffers[0];
+    OPENVINO_ASSERT(!buffers.pinned_buffers.empty(), GetName(), ": need pinned wb");
+    stream.upload(outputPtrs, buffers.pinned_buffers[0], sizeof(void*) * num_splits_);
+    auto in = inputs[0];
+    (*split_kernel_)(stream.get(), reinterpret_cast<const void*>(in.get()), reinterpret_cast<void**>(outputPtrs.get()));
+}
+
+void SplitOp::ExecuteGraph(InferenceRequestContext& context,
+                            Inputs inputs,
+                            Outputs outputs,
+                            const Workbuffers& buffers) const {
+    if (!buffers.pinned_buffers.empty()) {
+        auto* pinned = static_cast<const void**>(buffers.pinned_buffers[0]);
+        for (size_t i = 0; i < outputs.size(); ++i) pinned[i] = outputs[i].get();
+    }
+}
+
+rocmGraphCompatibility SplitOp::GetrocmGraphCompatibility() const { return rocmGraphCompatibility::FULL; }
 
 OPERATION_REGISTER(SplitOp, Split);
 }  // namespace rocm_gpu
