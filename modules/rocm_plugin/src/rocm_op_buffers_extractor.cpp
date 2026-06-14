@@ -570,7 +570,11 @@ void OperationBuffersExtractor::extractSplitAliasTensors(const NodePtr& node, in
     auto lens_const = std::dynamic_pointer_cast<ov::op::v0::Constant>(
         node->input(2).get_source_output().get_node_shared_ptr());
     OPENVINO_ASSERT(lens_const, "ZeroCopySplit: split_lengths not a constant");
-    const auto split_lens = lens_const->cast_vector<int64_t>();
+    std::vector<int64_t> split_lens;
+    { const auto& et=lens_const->get_element_type();
+      if(et==ov::element::i64) split_lens=lens_const->cast_vector<int64_t>();
+      else if(et==ov::element::i32) for(auto v:lens_const->cast_vector<int32_t>()) split_lens.push_back(v);
+      else for(auto v:lens_const->cast_vector<float>()) split_lens.push_back(static_cast<int64_t>(v)); }
 
     // Get element size and spatial dimensions (H×W) for computing byte offset
     const auto& in_shape = node->get_input_shape(0);  // [N, C, H, W]

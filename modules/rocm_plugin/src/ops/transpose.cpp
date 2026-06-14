@@ -59,6 +59,13 @@ std::optional<std::vector<int32_t>> TransposeOp::tryToExtractPermutation(const o
         auto src = node.input(1).get_source_output().get_node();
         if (ov::is_type<const ov::op::v0::Constant>(src)) {
             auto c = dynamic_cast<const ov::op::v0::Constant*>(src);
+            // Safe: permutation may be i32 or i64
+            const auto& _et = c->get_element_type();
+            if (_et == ov::element::i64) {
+                std::vector<int32_t> v;
+                for (auto x : c->cast_vector<int64_t>()) v.push_back(static_cast<int32_t>(x));
+                return v;
+            }
             return c->cast_vector<int32_t>();
         }
         return std::nullopt;

@@ -10,11 +10,12 @@
 1. [环境依赖](#1-环境依赖)
 2. [rocMLIR 编译安装](#2-rocmlir-编译安装)
 3. [构建步骤](#3-构建步骤)
-4. [Benchmark 复现](#4-benchmark-复现)
-5. [性能相关环境变量](#5-性能相关环境变量)
-6. [各架构性能对比](#6-各架构性能对比)
-7. [优化历程与技术细节](#7-优化历程与技术细节)
-8. [附录：常见问题](#8-附录常见问题)
+4. [Benchmark 复现 — yolo26x（视觉）](#4-benchmark-复现)
+5. [Benchmark 复现 — bertsquad-12（Transformer）](#5-benchmark-复现--bertsquad-12transformer)
+6. [性能相关环境变量](#6-性能相关环境变量)
+7. [各架构性能对比](#7-各架构性能对比)
+8. [优化历程与技术细节](#8-优化历程与技术细节)
+9. [附录：常见问题](#9-附录常见问题)
 
 ---
 
@@ -310,7 +311,152 @@ for r in rows[:10]:
 
 ---
 
-## 5. 性能相关环境变量
+## 5. Benchmark 复现 — bertsquad-12（Transformer）
+
+### 5.1 模型准备
+
+```bash
+# 下载 bertsquad-12.onnx（BERT-Base for SQuAD，TensorFlow 导出格式）
+pip install onnx_models  # 或从 ONNX Model Zoo 获取
+# 模型路径示例：/tmp/bert_model/bertsquad-12.onnx
+
+# 验证模型输入
+python3 -c "
+import onnx
+m = onnx.load('/tmp/bert_model/bertsquad-12.onnx')
+for inp in m.graph.input:
+    print(inp.name, [d.dim_value for d in inp.type.tensor_type.shape.dim])
+"
+# 输出示例：
+# unique_ids_raw_output___9:0 [1]
+# segment_ids:0 [1, 256]
+# input_mask:0  [1, 256]
+# input_ids:0   [1, 256]
+```
+
+### 5.2 复现 291 FPS（gfx1201）
+
+bertsquad-12 是动态形状模型，必须通过 `-shape` 指定输入尺寸。
+**无需 fused_epilogue 调优**，BERT 性能来自 Transformer-specific fusion pass，均在图变换阶段完成。
+
+```bash
+export OV_BIN=/home/openvino/bin/intel64/Release
+export BERT_MODEL=/tmp/bert_model/bertsquad-12.onnx
+
+# 标准复现命令（预期 ~291 FPS，median latency ~3.43ms）
+${OV_BIN}/benchmark_app \
+  -m ${BERT_MODEL} \
+  -d ROCM \
+  -niter 400 \
+  -nireq 1 \
+  -hint none \
+  -api sync \
+  -shape "unique_ids_raw_output___9:0[1],segment_ids:0[1,256],input_mask:0[1,256],input_ids:0[1,256]"
+```
+
+**预期输出：**
+```
+[ INFO ] Throughput:   291.17 FPS
+[ INFO ] Latency:
+[ INFO ]    Median:    3.43 ms
+[ INFO ]    Average:   3.43 ms
+[ INFO ]    Min:       3.35 ms
+[ INFO ]    Max:       3.81 ms
+```
+
+### 5.3 验证 Transformer Fusion Pass 是否生效
+
+推理时会在 stderr 输出 fusion 日志。通过以下命令验证：
+
+```bash
+${OV_BIN}/benchmark_app \
+  -m ${BERT_MODEL} -d ROCM -niter 2 -nireq 1 -hint none -api sync \
+  -shape "unique_ids_raw_output___9:0[1],segment_ids:0[1,256],input_mask:0[1,256],input_ids:0[1,256]" \
+  2>&1 | grep -E "BertAttn|LayerNorm|FusedLN|FusedMasked|FusedFC"
+```
+
+**应看到（截取关键行）：**
+```
+[BertAttnFuse]  Running on 12 Softmax nodes
+[BertAttnFuse]  Fused layer: seq=256 heads=12 dim=64    ← ×12 行
+[LayerNormFusion] TF-style fused at axis=2 eps=1e-12 inner=768  ← ×25 行
+[FusedLNPass]   Fused: rank=3 rows=256 hidden=768 axis=2        ← ×25 行
+[BertAttn] Constructor: seq=256 heads=12 dim=64 bias_elems=65536 ← ×12 行
+```
+
+**关键指标：**
+
+| Fusion | 期望数量 | 说明 |
+|--------|---------|------|
+| BertSelfAttention | 12 | 12 层 encoder attention，各编译为独立 rock.attention kernel |
+| TF LayerNorm (LayerNormFusion) | 25 | 1 embeddings + 12×2 encoder，全部识别 |
+| FusedLayerNorm (FusedLNPass) | 25 | 25 个 LayerNorm → native f16 HIP kernel |
+| FusedMaskedSoftmax | 0 | 被 BertSelfAttentionFusion 消费，不剩余 standalone softmax |
+
+### 5.4 与 MIGraphX 对比
+
+```bash
+# MIGraphX 参考（需安装 MIGraphX 2.15+）
+migraphx-driver perf --gpu ${BERT_MODEL} \
+  --input-dim @unique_ids_raw_output___9:0 1 \
+  --input-dim @segment_ids:0 1 256 \
+  --input-dim @input_mask:0 1 256 \
+  --input-dim @input_ids:0 1 256
+# gfx1201 预期：~194 FPS（约 5.14ms）
+# OV 约快 50%
+```
+
+### 5.5 rocprof Kernel 分析
+
+```bash
+rocprof --stats -o /tmp/bert_profile.csv \
+  ${OV_BIN}/benchmark_app \
+  -m ${BERT_MODEL} -d ROCM -niter 100 -nireq 1 -hint none -api sync \
+  -shape "unique_ids_raw_output___9:0[1],segment_ids:0[1,256],input_mask:0[1,256],input_ids:0[1,256]" \
+  2>/dev/null
+
+# 按总 GPU 时间排序，查看 top kernels
+sort -t, -k4 -rn /tmp/bert_profile.stats.csv | head -15
+```
+
+**gfx1201 典型 kernel 分布（per inference）：**
+
+| Kernel | 调用/inference | 占比 | 说明 |
+|--------|--------------|------|------|
+| GEMM Tensile (FC layers) | ~60 | ~25% | 12层×Q/K/V/Out+FFN×2 矩阵乘 |
+| broadcast_bias_add_h2 | ~49 | ~11% | FC bias add（__half2 向量化） |
+| rock_attention | 12 | ~5% | 12层 fused attention kernel |
+| layernorm_fused_kernel | 25 | ~6% | native f16 LayerNorm |
+| masked_softmax_fused_kernel | 0 | 0% | 已融入 rock_attention |
+| bias_gelu_fused | 12 | ~2% | FFN GELU activation |
+
+### 5.6 常见问题
+
+**问：模型加载时报 "Dynamic models are not supported"**
+
+```bash
+# 必须通过 -shape 指定所有输入的静态尺寸
+-shape "unique_ids_raw_output___9:0[1],segment_ids:0[1,256],input_mask:0[1,256],input_ids:0[1,256]"
+```
+
+**问：BertSelfAttentionFusion 报 "0 Softmax nodes found"**
+
+Pass 顺序错误导致 MaskedSoftmaxPass 先消费了 Softmax 节点。确认代码中 pass 顺序为：
+`BertSelfAttentionFusion` → `FusedMaskedSoftmaxPass`（参见 `rocm_graph_transformer.cpp`）。
+
+**问：LayerNormFusion 只匹配 1/25**
+
+OV 的 `ReshapeSinkingMatMul` 消除了 `[256,768]→[1,256,768]` Reshape 但未更新 ReduceMean axes。
+确认 `layer_norm_fusion.cpp` 包含"axis fixup"逻辑（搜索 `gamma_size != inner_size`）。
+
+**问：rock.attention 编译失败 "argument not found"**
+
+`make_mlir()` 中 `fmt::format` 参数数量与占位符不匹配。确认 `#xbias2d` 相关的
+dead code 已删除，`#xbias` 使用正确的参数数量（5 个 `{}`，传 5 个参数）。
+
+---
+
+## 6. 性能相关环境变量
 
 ### 5.1 核心融合变量（默认已开启）
 
@@ -387,9 +533,9 @@ benchmark_app -m model.onnx -d ROCM.0 \
 
 ---
 
-## 6. 各架构性能对比
+## 7. 各架构性能对比
 
-### 6.1 yolo26x FP16 吞吐量（Throughput, batch=1, 120s）
+### 7.1 yolo26x FP16 吞吐量（Throughput, batch=1, 120s）
 
 | GPU | 架构 | OV（无调优） | OV（plain tuning） | OV（fused tuning + hipGraph） | MIGraphX |
 |-----|------|------------|-------------------|------------------------------|---------|
@@ -399,7 +545,37 @@ benchmark_app -m model.onnx -d ROCM.0 \
 
 > ✅ = 超过 MIGraphX
 
-### 6.2 yolo26x FP16 单流延迟（nireq=1，fused 调优后）
+### 7.2 bertsquad-12 FP16 吞吐量（seq=256, batch=1, nireq=1, sync, 400 iters）
+
+| GPU | 架构 | OV ROCm Plugin | MIGraphX | OV 优势 |
+|-----|------|---------------|---------|---------|
+| **Radeon AI PRO R9700** | **gfx1201 / RDNA4** | **291 FPS ✅** | ~194 FPS | **+50%** |
+
+**OV bertsquad-12 启用的 fusion（无需手动配置，全部默认开启）：**
+
+| Fusion | 数量 | GPU 时间贡献 |
+|--------|------|------------|
+| `rock_attention`（BertSelfAttention） | 12 | ~5% |
+| `layernorm_fused_kernel`（native f16） | 25 | ~6% |
+| `bias_gelu_fused_kernel`（FC+GELU） | 12 | ~2% |
+| rocBLAS GEMM（FC layers） | ~60 | ~25% |
+
+**OV bertsquad-12 性能演进（gfx1201）：**
+
+| 阶段 | FPS | 关键改动 |
+|------|-----|---------|
+| 初始（crash） | — | 多处 type-cast bug |
+| Bug 修复后 | 136 | i32/f32 type-safe cast，MatMul transpose 恢复 |
+| FullyConnected fusion | 183 | FC pattern matcher 修复（3 处 bug） |
+| FusedFCGELU | 204 | FC+GELU → native HIP kernel |
+| FusedMaskedSoftmax | 222 | Add+Softmax → native f16 kernel |
+| MIGraphX 依赖移除 | 196 | 全替换为 native HIP + rocBLAS（重构期间） |
+| BertSelfAttentionFusion | 208 | rock.attention fused attention kernel |
+| TF LayerNorm 25/25 | 269 | axis fixup + 全匹配 native f16 kernel |
+| bias-add __half2 向量化 | **291** | v_pk_add_f16 指令，2× bias kernel 速度 |
+| **MIGraphX 参考** | 194 | — |
+
+### 7.3 yolo26x FP16 单流延迟（nireq=1，fused 调优后）
 
 | GPU | 架构 | OV 中位延迟 | OV 最小延迟 | MIGraphX 中位延迟 |
 |-----|------|------------|------------|-----------------|
@@ -429,9 +605,72 @@ Conv kernels: 80 + 30 = 110 launches/inference
 
 ---
 
-## 7. 优化历程与技术细节
+## 8. 优化历程与技术细节
 
-### 7.1 gfx1201 性能优化全历程（yolo26x FP16）
+### 8.0 BERT/Transformer 优化技术详解
+
+#### A. BertSelfAttentionFusion（最大单项收益，+33 FPS）
+
+**目标**：将 12 层 encoder attention 的 Q×K^T → mask_add → softmax → ×V 融合为单 kernel。
+
+**实现**：`BertSelfAttentionFusion` pass 从 Softmax 节点（v1/v8）反向追踪 Q、K、V 的 FullyConnected 输出，向前追踪 AV matmul → transpose → reshape，构建 `BertSelfAttention` 自定义 OV node。
+
+`BertSelfAttentionOp` 在构造时用 rocMLIR 生成 `rock.attention` MLIR 并通过 `rocmlir-driver --kernel-pipeline=full` 编译为 HSACO：
+
+```mlir
+// 核心结构（seq=256, heads=12, dim=64）
+rock.attention {
+  qk = %Q * %K : memref<12x256x64xf16>, memref<12x64x256xf16>
+  qk = elementwise otherIns(%B : memref<12x256x256xf16>) { ... }  // bias add
+  %O = softmax(qk) * %V : memref<12x256x64xf16> -> memref<12x256x64xf16>
+} {numHeadsQ = 12, softmaxType = f32, ...}
+```
+
+**Bias broadcast 方案**：attention mask 为 `[1,1,256,256]` flat，通过 affine_map `(h,sq,sk) → sq*256+sk` 广播到 `[12,256,256]`，实际 buffer 只有 65536 个 f16 元素。
+
+**Pass 顺序约束**：`BertSelfAttentionFusion` 必须在 `FusedMaskedSoftmaxPass` 之前执行，否则 Softmax 节点已被消费，attention pattern 无法匹配。
+
+#### B. TF LayerNorm 全融合（+61 FPS，最大收益）
+
+**问题根因**：TensorFlow 导出的 BERT 使用 pre-folded LayerNorm：`y = x*(γ/σ) + (β-μ*γ/σ)`，与标准 `(x-μ)/σ*γ+β` 不同。
+
+**检测算法**（`LayerNormFusionPass`）：从每个 `ReduceMean` 节点出发，BFS 追踪：
+`ReduceMean → [Convert]* → Sub(x, mean) → Mul(diff,diff) → ReduceMean → Add(eps) → Sqrt → Div(1,√) → Mul(γ) → [Mul(x,W), Mul(mean,W)] → Sub(β, mean*W) → Add(xW, B)`
+
+**Axis fixup bug**：OV 的 `ReshapeSinkingMatMul` 消除了 `[256,768]→[1,256,768]` 的 Reshape，但 ReduceMean 的 `axes=[1]` 未更新，导致 `inner_size=256` 而 gamma 有 768 个元素。修复：检测到 gamma 元素数与 `x.shape[axis]` 不符时，用 gamma 元素数反推正确 axis（最后维度）。
+
+**Native kernel**（`layernorm_fused_kernel`）：单 HIP kernel 完成 mean→variance→rsqrt→scale+shift，全程在寄存器/shared memory，支持可选 residual skip add：
+
+```
+block_reduce_sum(x+skip) → mean
+block_reduce_sum((x+skip-mean)²) → var
+inv_std = rsqrt(var/cols + eps)
+y[i] = ((x[i]+skip[i]) - mean) * inv_std * gamma[i] + beta[i]
+```
+
+消除了原来的 f16→f32→MIOpen→f32→f16 路径，节省约 25% GPU 时间（16.2% convert + 8.5% f32 subtract）。
+
+#### C. FusedFCGELU（FC+GELU 两步融合）
+
+**实现**：`FusedFCGELUPass` 识别 `FullyConnected → GELU` 模式。`FusedFCGELUOp::Execute` 分两步：
+1. `rocblas_gemm_ex`：`gemm_buf = x × W^T`（f16，构造时预分配 `gemm_buf`）
+2. `bias_gelu_fused_kernel`：`out[i] = (gemm_buf[i] + bias[col]) * 0.5 * (1 + erf(... * 0.7071))`
+
+**Pass 注意**：BERT 的 W 矩阵以 `[out_dim, in_dim]` 存储（transpose FC），`out_dim` 从 GELU 输出 shape 读取，不能从 W shape 读（方向可能相反）。
+
+#### D. bias-add __half2 向量化
+
+BERT FC 的 bias add 占总 GPU 时间 11%（49 次/inference）。原始标量 kernel：
+```cpp
+out[idx] += bias[idx % cols];  // 1 f16/thread
+```
+
+改为 `__half2` 向量化，每线程处理 2 个 f16（BERT hidden=768/3072 均为偶数）：
+```cpp
+out_h2[idx] = __hadd2(out_h2[idx], bias_h2[col2]);  // v_pk_add_f16
+```
+
+### 8.1 gfx1201 性能优化全历程（yolo26x FP16）
 
 | 阶段 | FPS | 关键改动 | commit |
 |------|-----|---------|--------|
@@ -537,7 +776,7 @@ MIGraphX GPU kernel 时间：~4.46ms/inference
 
 ---
 
-## 8. 附录：常见问题
+## 9. 附录：常见问题
 
 ### rocMLIR 构建失败：`_GLIBCXX_USE_CXX11_ABI` 宏重复
 

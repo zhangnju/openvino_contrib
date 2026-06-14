@@ -13,7 +13,17 @@
 namespace ov::rocm_gpu::Interpolate::Details {
 
 void getAxesAndScales(const ov::op::v4::Interpolate& node, std::vector<size_t>& axes, std::vector<float>& scales) {
-    axes = ov::as_type_ptr<op::v0::Constant>(node.input_value(3).get_node_shared_ptr())->cast_vector<size_t>();
+    {
+        auto axes_c = ov::as_type_ptr<op::v0::Constant>(node.input_value(3).get_node_shared_ptr());
+        const auto& at = axes_c->get_element_type();
+        if (at == ov::element::i64) {
+            for (auto v : axes_c->cast_vector<int64_t>()) axes.push_back(static_cast<size_t>(v));
+        } else if (at == ov::element::i32) {
+            for (auto v : axes_c->cast_vector<int32_t>()) axes.push_back(static_cast<size_t>(v));
+        } else {
+            axes = axes_c->cast_vector<size_t>();
+        }
+    }
     switch (node.get_attrs().shape_calculation_mode) {
         case ov::op::v4::Interpolate::ShapeCalcMode::SIZES: {
             const auto& input_shape = node.get_input_shape(0);

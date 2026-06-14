@@ -19,8 +19,23 @@ static bool isNCHWConvolutionPadding(const PadOp::NodeOp& node) {
     auto padsBegin = ov::as_type_ptr<op::v0::Constant>(node.get_input_node_shared_ptr(1));
     auto padsEnd = ov::as_type_ptr<op::v0::Constant>(node.get_input_node_shared_ptr(2));
     OPENVINO_ASSERT(padsBegin && padsEnd, "Non-constant paddings are unsupported!");
-    const auto padsBeginCoord = padsBegin->cast_vector<size_t>();
-    const auto padsEndCoord = padsEnd->cast_vector<size_t>();
+    // Safe reading: pads may be stored as int32 or int64, both need to work
+    auto safe_read_pads = [](const std::shared_ptr<ov::op::v0::Constant>& c) {
+        const auto& et = c->get_element_type();
+        if (et == ov::element::i32) {
+            std::vector<size_t> v;
+            for (auto x : c->cast_vector<int32_t>()) v.push_back(static_cast<size_t>(x));
+            return v;
+        }
+        if (et == ov::element::i64) {
+            std::vector<size_t> v;
+            for (auto x : c->cast_vector<int64_t>()) v.push_back(static_cast<size_t>(x));
+            return v;
+        }
+        return c->cast_vector<size_t>();
+    };
+    const auto padsBeginCoord = safe_read_pads(padsBegin);
+    const auto padsEndCoord = safe_read_pads(padsEnd);
     return node.get_input_shape(0).size() == 4 && padsBeginCoord[0] == 0 && padsBeginCoord[1] == 0 &&
            padsEndCoord[0] == 0 && padsEndCoord[1] == 0;
 }

@@ -22,7 +22,8 @@
 #include <openvino/op/sigmoid.hpp>
 #include <openvino/op/swish.hpp>
 #include <openvino/op/tanh.hpp>
-#include <openvino/op/gelu.hpp>
+#include <openvino/op/erf.hpp>
+#include <openvino/op/gelu.hpp>  // includes both v0::Gelu and v7::Gelu
 #include <openvino/op/hard_sigmoid.hpp>
 #include <openvino/op/hswish.hpp>
 #include <openvino/op/multiply.hpp>
@@ -56,6 +57,7 @@ static inline bool is_elementwise_fuseable(const std::shared_ptr<ov::Node>& n) {
         ov::is_type<ov::op::v4::Swish>(n)       ||
         ov::is_type<ov::op::v0::Tanh>(n)        ||
         ov::is_type<ov::op::v7::Gelu>(n)        ||
+        ov::is_type<ov::op::v0::Gelu>(n)        ||
         ov::is_type<ov::op::v4::Swish>(n)       ||
         ov::is_type<ov::op::v4::HSwish>(n)      ||
         ov::is_type<ov::op::v1::Multiply>(n)    ||
@@ -85,7 +87,8 @@ static inline bool to_fused_step(const std::shared_ptr<ov::Node>& n,
     else if (ov::is_type<ov::op::v0::Sigmoid>(n))  { step.op_type = "Sigmoid"; }
     else if (ov::is_type<ov::op::v4::Swish>(n))    { step.op_type = "Swish"; }
     else if (ov::is_type<ov::op::v0::Tanh>(n))     { step.op_type = "Tanh"; }
-    else if (ov::is_type<ov::op::v7::Gelu>(n))     { step.op_type = "Gelu"; }
+    else if (ov::is_type<ov::op::v7::Gelu>(n) ||
+             ov::is_type<ov::op::v0::Gelu>(n))    { step.op_type = "Gelu"; }
     else if (ov::is_type<ov::op::v4::HSwish>(n))   { step.op_type = "HardSwish"; }
     else if (ov::is_type<ov::op::v0::Abs>(n))      { step.op_type = "Abs"; }
     else if (ov::is_type<ov::op::v0::Negative>(n)) { step.op_type = "Neg"; }
@@ -169,7 +172,14 @@ public:
                     cur = next;
                 }
 
-                if (chain.size() < 2) continue;  // no fusion benefit for single op
+                // Fuse single-op chains for activation functions (Gelu/Erf/etc.) that
+                // cannot chain with their consumer but need to run in f16 (not standalone f32 kernel)
+                const bool is_activation_root =
+                    ov::is_type<ov::op::v7::Gelu>(root) ||
+                    ov::is_type<ov::op::v0::Gelu>(root) ||
+                    ov::is_type<ov::op::v0::Erf>(root)  ||
+                    ov::is_type<ov::op::v0::Tanh>(root);
+                if (chain.size() < 2 && !is_activation_root) continue;
 
                 // Build FusedElementwise node
                 std::vector<nodes::FusedEwStep> steps;

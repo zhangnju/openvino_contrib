@@ -78,28 +78,66 @@ void MvnOp::Execute(const InferenceRequestContext& context,
                     Inputs inputTensors,
                     Outputs outputTensors,
                     const Workbuffers& workbuffers) const {
-    Context opContext{context, workbuffers, *this};
     if (reduced_shape_.empty()) {
-        // this is not documented case, but valid case in reference implementation and tests are present for it
+        // Edge case: no axes to reduce → output = x - x = 0. Keep legacy path.
+        Context opContext{context, workbuffers, *this};
         opContext.subtract(
             {tensor_desc_, inputTensors[0]}, {tensor_desc_, inputTensors[0]}, {tensor_desc_, outputTensors[0]});
         return;
     }
-    auto reducedTensor = getReducedTensorBuffer(workbuffers);
-    opContext.reduceMean({tensor_desc_, inputTensors[0]}, {reduced_tensor_desc_, reducedTensor});
-    opContext.subtract({tensor_desc_, inputTensors[0]},
-                       {reduced_tensor_desc_, reducedTensor.cast<const void*>()},
-                       {tensor_desc_, outputTensors[0]});
-    if (!normalize_variance_) return;
-    auto tmpTensor = getTmpTensorBuffer(workbuffers);
-    opContext.multiply({tensor_desc_, outputTensors[0].cast<const void*>()},
-                       {tensor_desc_, outputTensors[0].cast<const void*>()},
-                       {tensor_desc_, tmpTensor});
-    opContext.reduceMean({tensor_desc_, tmpTensor.cast<const void*>()}, {reduced_tensor_desc_, reducedTensor});
-    opContext.computeVarianceNormalizationFactor({reduced_tensor_desc_, reducedTensor});
-    opContext.multiply({tensor_desc_, outputTensors[0].cast<const void*>()},
-                       {reduced_tensor_desc_, reducedTensor.cast<const void*>()},
-                       {tensor_desc_, outputTensors[0]});
+
+    // Use miopenLayerNormForward for the full MVN computation in a single call.
+    // This replaces: reduceMean → subtract → [multiply(sq) → reduceMean → varNormFactor → multiply]
+    // miopenLayerNormForward computes: y = (x - mean(x)) / sqrt(var(x) + eps)  [when normalize_variance_]
+    //                               or: y = x - mean(x)                         [when !normalize_variance_]
+    // weight=nullptr, bias=nullptr → MIOPEN_ELEMENTWISE_AFFINE (no scale/bias, matches MVN-1/MVN-6).
+    auto& handle = context.getThreadContext().dnnHandle();
+
+    // mean and rstd buffers (required by API even if we don't use them downstream)
+    auto mean_buf  = workbuffers.mutable_buffers[1];
+    auto rstd_buf  = workbuffers.mutable_buffers[2];
+
+    // normalized_dim: index of the first axis being normalized.
+    // The reduced_shape_ has 1s at reduced axes; normalized_dim = first reduced axis.
+    int32_t normalized_dim = 0;
+    for (size_t i = 0; i < shape_.size(); ++i) {
+        if (reduced_shape_[i] == 1 && shape_[i] > 1) {
+            normalized_dim = static_cast<int32_t>(i);
+            break;
+        }
+    }
+
+    auto status = miopenLayerNormForward(
+        handle.get(),
+        normalize_variance_ ? MIOPEN_ELEMENTWISE_AFFINE : MIOPEN_ELEMENTWISE_AFFINE,
+        tensor_desc_.get(), inputTensors[0].get(),       // x
+        nullptr, nullptr,                                 // weight (none)
+        nullptr, nullptr,                                 // bias (none)
+        static_cast<float>(epsilon_),
+        normalized_dim,
+        tensor_desc_.get(), outputTensors[0].get(),      // y
+        reduced_tensor_desc_.get(), mean_buf.get(),      // mean (temp)
+        reduced_tensor_desc_.get(), rstd_buf.get());     // rstd (temp)
+
+    if (status != miopenStatusSuccess) {
+        // Fallback to multi-step path on error
+        Context opContext{context, workbuffers, *this};
+        auto reducedTensor = workbuffers.mutable_buffers[1];
+        opContext.reduceMean({tensor_desc_, inputTensors[0]}, {reduced_tensor_desc_, reducedTensor});
+        opContext.subtract({tensor_desc_, inputTensors[0]},
+                           {reduced_tensor_desc_, reducedTensor.cast<const void*>()},
+                           {tensor_desc_, outputTensors[0]});
+        if (!normalize_variance_) return;
+        auto tmpTensor = workbuffers.mutable_buffers[2];
+        opContext.multiply({tensor_desc_, outputTensors[0].cast<const void*>()},
+                           {tensor_desc_, outputTensors[0].cast<const void*>()},
+                           {tensor_desc_, tmpTensor});
+        opContext.reduceMean({tensor_desc_, tmpTensor.cast<const void*>()}, {reduced_tensor_desc_, reducedTensor});
+        opContext.computeVarianceNormalizationFactor({reduced_tensor_desc_, reducedTensor});
+        opContext.multiply({tensor_desc_, outputTensors[0].cast<const void*>()},
+                           {reduced_tensor_desc_, reducedTensor.cast<const void*>()},
+                           {tensor_desc_, outputTensors[0]});
+    }
 }
 
 rocmGraphCompatibility MvnOp::GetrocmGraphCompatibility() const { return rocmGraphCompatibility::FULL; }
@@ -116,35 +154,33 @@ void MvnOp::Context::reduceMean(ConstTensor input, Tensor output) {
 }
 
 void MvnOp::Context::subtract(ConstTensor lhs, ConstTensor rhs, Tensor output) {
-    std::cout<<"fix me MvnOp::Context::subtract"<<std::endl;
-    /*
-    context.getThreadContext().dnnHandle().opTensor(op.sub_desc_,
-                                                    op.dOne,
-                                                    lhs.descriptor,
-                                                    lhs.data.get(),
-                                                    op.dMinusOne,
-                                                    rhs.descriptor,
-                                                    rhs.data.get(),
-                                                    op.dZero,
-                                                    output.descriptor,
-                                                    output.data.get());
-    */
+    // C = 1*A + (-1)*B + 0*C  →  C = A - B
+    context.getThreadContext().dnnHandle().opTensor(
+        miopenTensorOpAdd,
+        op.dOne,
+        lhs.descriptor,
+        lhs.data.get(),
+        op.dMinusOne,
+        rhs.descriptor,
+        rhs.data.get(),
+        op.dZero,
+        output.descriptor,
+        output.data.get());
 }
 
 void MvnOp::Context::multiply(ConstTensor lhs, ConstTensor rhs, Tensor output) {
-    std::cout<<"fix me MvnOp::Context::multiply"<<std::endl;
-    /*
-    context.getThreadContext().dnnHandle().opTensor(op.mul_desc_,
-                                                    op.dOne,
-                                                    lhs.descriptor,
-                                                    lhs.data.get(),
-                                                    op.dOne,
-                                                    rhs.descriptor,
-                                                    rhs.data.get(),
-                                                    op.dZero,
-                                                    output.descriptor,
-                                                    output.data.get());
-    */
+    // C = 1*A * 1*B + 0*C  →  C = A * B
+    context.getThreadContext().dnnHandle().opTensor(
+        miopenTensorOpMul,
+        op.dOne,
+        lhs.descriptor,
+        lhs.data.get(),
+        op.dOne,
+        rhs.descriptor,
+        rhs.data.get(),
+        op.dZero,
+        output.descriptor,
+        output.data.get());
 }
 
 void MvnOp::Context::computeVarianceNormalizationFactor(Tensor in_out) {
@@ -221,8 +257,22 @@ ov::Shape MvnOp::makeReducedShape(const ov::Node& node) {
         return reducedShape;
     }
     if (version_ == MvnV6) {
-        const auto signed_axes =
-            ov::as_type_ptr<op::v0::Constant>(node.get_input_node_shared_ptr(1))->cast_vector<int64_t>();
+        // Safely read axes constant - supports int32, int64, or float32 element types.
+        // ONNX ReduceMean axes may be stored as i32 or f32 in some models.
+        auto axes_const = ov::as_type_ptr<op::v0::Constant>(node.get_input_node_shared_ptr(1));
+        std::vector<int64_t> signed_axes;
+        if (axes_const) {
+            const auto& et = axes_const->get_element_type();
+            if (et == ov::element::i64) {
+                signed_axes = axes_const->cast_vector<int64_t>();
+            } else if (et == ov::element::i32) {
+                for (auto v : axes_const->cast_vector<int32_t>())
+                    signed_axes.push_back(static_cast<int64_t>(v));
+            } else {
+                for (auto v : axes_const->cast_vector<float>())
+                    signed_axes.push_back(static_cast<int64_t>(v));
+            }
+        }
         auto reducedShape = node.get_input_shape(0);
         ov::AxisSet axes;
         for (auto v : signed_axes) {

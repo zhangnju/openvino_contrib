@@ -592,14 +592,22 @@ bool ov::rocm_gpu::pass::rocmConvolutionFusion::run_on_model(const std::shared_p
                 auto axis_node = std::dynamic_pointer_cast<ov::op::v0::Constant>(
                     split->input(1).get_source_output().get_node_shared_ptr());
                 if (!axis_node) continue;
-                const auto axis_data = axis_node->cast_vector<int64_t>();
+                std::vector<int64_t> axis_data;
+                { const auto& _et=(axis_node)->get_element_type();
+                  if(_et==ov::element::i64) axis_data=(axis_node)->cast_vector<int64_t>();
+                  else if(_et==ov::element::i32) for(auto _v:(axis_node)->cast_vector<int32_t>()) axis_data.push_back(_v);
+                  else for(auto _v:(axis_node)->cast_vector<float>()) axis_data.push_back(static_cast<int64_t>(_v)); }
                 if (axis_data.empty() || axis_data[0] != 1) continue;  // must be axis=1
 
                 // Get split lengths
                 auto split_len_node = std::dynamic_pointer_cast<ov::op::v0::Constant>(
                     split->input(2).get_source_output().get_node_shared_ptr());
                 if (!split_len_node) continue;
-                const auto split_lens = split_len_node->cast_vector<int64_t>();
+                std::vector<int64_t> split_lens;
+                { const auto& _et=(split_len_node)->get_element_type();
+                  if(_et==ov::element::i64) split_lens=(split_len_node)->cast_vector<int64_t>();
+                  else if(_et==ov::element::i32) for(auto _v:(split_len_node)->cast_vector<int32_t>()) split_lens.push_back(_v);
+                  else for(auto _v:(split_len_node)->cast_vector<float>()) split_lens.push_back(static_cast<int64_t>(_v)); }
                 if (split_lens.size() != 2) continue;
 
                 // Get full input shape
@@ -707,13 +715,21 @@ bool ov::rocm_gpu::pass::rocmConvolutionFusion::run_on_model(const std::shared_p
                     auto axis_node = std::dynamic_pointer_cast<ov::op::v0::Constant>(
                         vsplit->input(1).get_source_output().get_node_shared_ptr());
                     if (!axis_node) continue;
-                    const auto axis_data = axis_node->cast_vector<int64_t>();
+                    std::vector<int64_t> axis_data;
+                    { const auto& _et=(axis_node)->get_element_type();
+                      if(_et==ov::element::i64) axis_data=(axis_node)->cast_vector<int64_t>();
+                      else if(_et==ov::element::i32) for(auto _v:(axis_node)->cast_vector<int32_t>()) axis_data.push_back(_v);
+                      else for(auto _v:(axis_node)->cast_vector<float>()) axis_data.push_back(static_cast<int64_t>(_v)); }
                     if (axis_data.empty() || axis_data[0] != 1) continue;
 
                     auto split_len_node = std::dynamic_pointer_cast<ov::op::v0::Constant>(
                         vsplit->input(2).get_source_output().get_node_shared_ptr());
                     if (!split_len_node) continue;
-                    const auto split_lens = split_len_node->cast_vector<int64_t>();
+                    std::vector<int64_t> split_lens;
+                    { const auto& _et=(split_len_node)->get_element_type();
+                      if(_et==ov::element::i64) split_lens=(split_len_node)->cast_vector<int64_t>();
+                      else if(_et==ov::element::i32) for(auto _v:(split_len_node)->cast_vector<int32_t>()) split_lens.push_back(_v);
+                      else for(auto _v:(split_len_node)->cast_vector<float>()) split_lens.push_back(static_cast<int64_t>(_v)); }
 
                     // Check each VariadicSplit output for → Swish → Add(skip) pattern
                     for (size_t out_idx = 0; out_idx < vsplit->get_output_size(); ++out_idx) {
@@ -764,7 +780,11 @@ bool ov::rocm_gpu::pass::rocmConvolutionFusion::run_on_model(const std::shared_p
                 // Compute c_out_start/end for this split output
                 auto split_len_node = std::dynamic_pointer_cast<ov::op::v0::Constant>(
                     vsplit->input(2).get_source_output().get_node_shared_ptr());
-                const auto split_lens = split_len_node->cast_vector<int64_t>();
+                std::vector<int64_t> split_lens;
+                { const auto& _et=(split_len_node)->get_element_type();
+                  if(_et==ov::element::i64) split_lens=(split_len_node)->cast_vector<int64_t>();
+                  else if(_et==ov::element::i32) for(auto _v:(split_len_node)->cast_vector<int32_t>()) split_lens.push_back(_v);
+                  else for(auto _v:(split_len_node)->cast_vector<float>()) split_lens.push_back(static_cast<int64_t>(_v)); }
                 int c_out_start = 0;
                 for (size_t i = 0; i < out_idx; ++i) c_out_start += static_cast<int>(split_lens[i]);
                 int c_out_end = c_out_start + static_cast<int>(split_lens[out_idx]);

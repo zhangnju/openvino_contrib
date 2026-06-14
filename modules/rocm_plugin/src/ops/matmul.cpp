@@ -5,6 +5,7 @@
 #include "matmul.hpp"
 
 #include <rocblas/rocblas.h>
+#include <rocblas/internal/rocblas-beta.h>
 #include <rocm/blas.hpp>
 #include <rocm/float16.hpp>
 #include <rocm_operation_registry.hpp>
@@ -13,9 +14,165 @@
 #include <openvino/op/matmul.hpp>
 #include <transformer/nodes/fully_connected.hpp>
 #include <utility>
+#include <atomic>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+#include <cstdlib>
+#include <chrono>
+#include <hip/hip_runtime.h>
 
 #include "converters.hpp"
 #include "rocm/constant_factory.hpp"
+
+// ── rocBLAS GEMM solution-index cache ────────────────────────────────────────
+// When ROCM_TUNE_GEMM=1 is set, the first call to a new GEMM shape enumerates
+// all available solutions and benchmarks them. The winning solution_index is
+// cached globally and used for all subsequent calls with the same shape.
+namespace {
+
+struct GemmKey {
+    int m, n, k, batch;
+    int transa, transb;
+    int dt, ct;   // rocblas_datatype enum values
+    bool operator==(const GemmKey& o) const {
+        return m==o.m && n==o.n && k==o.k && batch==o.batch &&
+               transa==o.transa && transb==o.transb &&
+               dt==o.dt && ct==o.ct;
+    }
+};
+
+struct GemmKeyHash {
+    size_t operator()(const GemmKey& k) const {
+        size_t h = 14695981039346656037ULL;
+        auto mix = [&](size_t v){ h ^= v; h *= 1099511628211ULL; };
+        mix(k.m); mix(k.n); mix(k.k); mix(k.batch);
+        mix(k.transa); mix(k.transb); mix(k.dt); mix(k.ct);
+        return h;
+    }
+};
+
+struct GemmCache {
+    std::mutex mtx;
+    std::unordered_map<GemmKey, rocblas_int, GemmKeyHash> best;
+
+    static GemmCache& instance() {
+        static GemmCache g;
+        return g;
+    }
+
+    // Returns the cached solution_index, or -1 if not yet tuned.
+    rocblas_int get(const GemmKey& key) {
+        std::lock_guard<std::mutex> lk(mtx);
+        auto it = best.find(key);
+        return (it != best.end()) ? it->second : -1;
+    }
+
+    void set(const GemmKey& key, rocblas_int sol) {
+        std::lock_guard<std::mutex> lk(mtx);
+        best[key] = sol;
+    }
+};
+
+// Tune a rocBLAS strided-batched GEMM and return the best solution_index.
+// Uses hipEvent timing over WARMUP+BENCH iterations for each solution.
+rocblas_int tuneBatchedGemm(
+        rocblas_handle handle,
+        rocblas_operation ta, rocblas_operation tb,
+        int m, int n, int k,
+        const void* alpha, const void* A, rocblas_datatype dt_a, int lda, long long sA,
+        const void* B, rocblas_datatype dt_b, int ldb, long long sB,
+        const void* beta, void* C, rocblas_datatype dt_c, int ldc, long long sC,
+        int batch, rocblas_datatype ct)
+{
+    constexpr int WARMUP = 2;
+    constexpr int BENCH  = 5;
+
+    // Enumerate solutions for strided-batched GEMM
+    rocblas_int list_size = 0;
+    rocblas_gemm_strided_batched_ex_get_solutions(
+        handle, ta, tb, m, n, k,
+        alpha,
+        A, dt_a, lda, sA,
+        B, dt_b, ldb, sB,
+        beta,
+        C, dt_c, ldc, sC,
+        C, dt_c, ldc, sC,
+        batch, ct,
+        rocblas_gemm_algo_solution_index, 0,
+        nullptr, &list_size);
+
+    if (list_size <= 0) return 0;
+
+    std::vector<rocblas_int> solutions(list_size);
+    rocblas_gemm_strided_batched_ex_get_solutions(
+        handle, ta, tb, m, n, k,
+        alpha,
+        A, dt_a, lda, sA,
+        B, dt_b, ldb, sB,
+        beta,
+        C, dt_c, ldc, sC,
+        C, dt_c, ldc, sC,
+        batch, ct,
+        rocblas_gemm_algo_solution_index, 0,
+        solutions.data(), &list_size);
+
+    hipEvent_t ev_start, ev_stop;
+    hipEventCreate(&ev_start);
+    hipEventCreate(&ev_stop);
+
+    rocblas_int best_sol = solutions[0];
+    float best_ms = 1e9f;
+
+    auto run_sol = [&](rocblas_int sol) -> bool {
+        return rocblas_gemm_strided_batched_ex(
+            handle, ta, tb, m, n, k, alpha,
+            A, dt_a, lda, sA,
+            B, dt_b, ldb, sB,
+            beta,
+            C, dt_c, ldc, sC,
+            C, dt_c, ldc, sC,
+            batch, ct,
+            rocblas_gemm_algo_solution_index, sol, 0) == rocblas_status_success;
+    };
+
+    for (rocblas_int sol : solutions) {
+        // warmup
+        bool ok = true;
+        for (int w = 0; w < WARMUP && ok; ++w) ok = run_sol(sol);
+        if (!ok) continue;
+
+        // benchmark
+        hipEventRecord(ev_start);
+        for (int r = 0; r < BENCH && ok; ++r) ok = run_sol(sol);
+        hipEventRecord(ev_stop);
+        hipEventSynchronize(ev_stop);
+        if (!ok) continue;
+
+        float ms = 0.f;
+        hipEventElapsedTime(&ms, ev_start, ev_stop);
+        ms /= BENCH;
+        if (ms < best_ms) { best_ms = ms; best_sol = sol; }
+    }
+
+    hipEventDestroy(ev_start);
+    hipEventDestroy(ev_stop);
+
+    fprintf(stderr, "[ROCM_TUNE_GEMM] m=%d n=%d k=%d batch=%d -> sol=%d (%.3f ms)\n",
+            m, n, k, batch, best_sol, best_ms);
+    return best_sol;
+}
+
+bool gemmTuningEnabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("ROCM_TUNE_GEMM");
+        v = (e && e[0] != '0') ? 1 : 0;
+    }
+    return v == 1;
+}
+
+}  // anonymous namespace
 
 namespace ov {
 namespace rocm_gpu {
@@ -59,10 +216,10 @@ MatMulOp::MatMulOp(const CreationContext& context,
     stride_a_ = (batchACount > 1) ? (m_ * k_) : 0;
     stride_b_ = (batchBCount > 1) ? (k_ * n_) : 0;
     stride_c_ = (m_ * n_);
-    #if 0
     rocblas_transpose_a_ = transposeA ? rocblas_operation_transpose : rocblas_operation_none;
     rocblas_transpose_b_ = transposeB ? rocblas_operation_transpose : rocblas_operation_none;
-    #endif 
+
+    // TODO: Read GEMM stride overrides from rt_info when BertAttentionTransposeFusion is ready.
     if constexpr (std::is_same_v<TOperation, nodes::FullyConnected>) {
         beta_ = &rocm::NumericConst<rocm::constants::one>(compute_type_);
     } else {
@@ -206,11 +363,36 @@ void MatMulOp::Execute(const InferenceRequestContext& context,
             default:        return rocblas_datatype_f32_r;
         }
     };
-    const rocblas_datatype dt       = to_rocblas_dt(data_type_);
-    const rocblas_datatype ct       = to_rocblas_dt(compute_type_);
+    const rocblas_datatype dt = to_rocblas_dt(data_type_);
+    const rocblas_datatype ct = to_rocblas_dt(compute_type_);
+    const void* alpha_ptr = &rocm::NumericConst<rocm::constants::one>(compute_type_);
 
-    // rocBLAS uses column-major internally.
-    // We compute Ct = Bt × At so the result C is row-major.
+    // rocBLAS uses column-major: compute Ct = Bt × At → C is row-major.
+    // transa/transb are swapped relative to math notation.
+    rocblas_gemm_algo algo = rocblas_gemm_algo_standard;
+    rocblas_int sol = 0;
+
+    if (gemmTuningEnabled()) {
+        GemmKey key{n_, m_, k_, batch_count_,
+                    (int)rocblas_transpose_b_, (int)rocblas_transpose_a_,
+                    (int)dt, (int)ct};
+        sol = GemmCache::instance().get(key);
+        if (sol < 0) {
+            sol = tuneBatchedGemm(
+                RocBlasHandle.get(),
+                rocblas_transpose_b_, rocblas_transpose_a_,
+                n_, m_, k_,
+                alpha_ptr,
+                matrixB.get(), dt, ld_b_, stride_b_,
+                matrixA.get(), dt, ld_a_, stride_a_,
+                beta_,
+                matrixC.get(), dt, ld_c_, stride_c_,
+                batch_count_, ct);
+            GemmCache::instance().set(key, sol);
+        }
+        algo = rocblas_gemm_algo_solution_index;
+    }
+
     throwIfError(rocblas_gemm_strided_batched_ex(
         RocBlasHandle.get(),
         rocblas_transpose_b_,   // transa for Bt
@@ -218,7 +400,7 @@ void MatMulOp::Execute(const InferenceRequestContext& context,
         n_,                     // m  (rows of Bt / Ct)
         m_,                     // n  (cols of At / Ct)
         k_,                     // k  (inner dimension)
-        &rocm::NumericConst<rocm::constants::one>(compute_type_),
+        alpha_ptr,
         matrixB.get(), dt, ld_b_, stride_b_,  // B (acts as A in col-major call)
         matrixA.get(), dt, ld_a_, stride_a_,  // A (acts as B in col-major call)
         beta_,
@@ -226,8 +408,8 @@ void MatMulOp::Execute(const InferenceRequestContext& context,
         matrixC.get(), dt, ld_c_, stride_c_,  // D (same as C for in-place)
         batch_count_,
         ct,
-        rocblas_gemm_algo_standard,
-        0,   // solution_index
+        algo,
+        sol,
         0)); // flags
 }
 

@@ -33,6 +33,13 @@ std::vector<int64_t> get_transpose_order(const std::shared_ptr<ov::op::v1::Trans
     if (transpose) {
         auto transpose_const = ov::as_type_ptr<op::v0::Constant>(transpose->input_value(1).get_node_shared_ptr());
         if (transpose_const) {
+            // Safe: permutation may be i32 or i64
+            const auto& _et = transpose_const->get_element_type();
+            if (_et == ov::element::i32) {
+                std::vector<int64_t> v;
+                for (auto x : transpose_const->cast_vector<int32_t>()) v.push_back(x);
+                return v;
+            }
             return transpose_const->cast_vector<int64_t>();
         }
     }

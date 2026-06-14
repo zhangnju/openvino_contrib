@@ -92,14 +92,14 @@ private:
 
 inline WorkbufferRequest MvnOp::GetWorkBufferRequest() const {
     if (!reduced_shape_.empty()) {
-        if (normalize_variance_) {
-            return {{},
-                    {reduce_workspace_size_,
-                     elementSize(comp_type_) * ov::shape_size(reduced_shape_),
-                     elementSize(comp_type_) * ov::shape_size(shape_)}};
-        } else {
-            return {{}, {reduce_workspace_size_, elementSize(comp_type_) * ov::shape_size(reduced_shape_)}};
-        }
+        const size_t reduced_bytes = elementSize(comp_type_) * ov::shape_size(reduced_shape_);
+        // Buffers: [0]=reduce_workspace, [1]=mean, [2]=rstd (or tmp)
+        // miopenLayerNormForward requires mean+rstd output buffers.
+        // Allocate [2] always (rstd for miopenLayerNormForward, tmp for fallback).
+        return {{},
+                {reduce_workspace_size_,
+                 reduced_bytes,
+                 reduced_bytes}};
     }
     return {};
 }

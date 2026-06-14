@@ -32,6 +32,9 @@ private:
     MatMulOp matmul_op_;
     size_t bias_size_ = 0;
     size_t batch_bias_count_ = 0;
+    size_t bias_cols_ = 0;  // number of bias elements (= output cols)
+    size_t bias_rows_ = 0;  // number of rows to broadcast bias over
+    bool   is_fp16_   = false;
 };
 
 }  // namespace rocm_gpu

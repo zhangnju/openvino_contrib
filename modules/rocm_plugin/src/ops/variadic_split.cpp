@@ -91,7 +91,17 @@ VariadicSplitOp::VariadicSplitOp(const CreationContext& context,
     const auto element_type = input_element_type;
 
     const auto& data_shape = variadic_split_node->get_input_shape(0);
-    auto axis = axis_node->cast_vector<int64_t>()[0];
+    // Safe axis reading: support int32 and int64 (and float fallback)
+    int64_t axis = 0;
+    {
+        const auto& at = axis_node->get_element_type();
+        if (at == ov::element::i64)
+            axis = axis_node->cast_vector<int64_t>()[0];
+        else if (at == ov::element::i32)
+            axis = static_cast<int64_t>(axis_node->cast_vector<int32_t>()[0]);
+        else
+            axis = static_cast<int64_t>(axis_node->cast_vector<float>()[0]);
+    }
     if (axis < 0) {
         axis += static_cast<int64_t>(variadic_split_node->get_input_partial_shape(0).rank().get_length());
     }

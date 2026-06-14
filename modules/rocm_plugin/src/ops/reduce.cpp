@@ -20,8 +20,8 @@ miopenDataType_t ReduceOp::reduceCompType(const ov::Node& node) {
     switch (in_type) {
         case miopenFloat:
         case miopenHalf:
-            // TODO: it's unclear from documentation, whether it can be half when both tensors are
-            // half, or int8 when both tensors are int8. we'll have to test it
+            // MIOpen ReduceTensor always computes in FP32 even for FP16 inputs.
+            // Using miopenHalf here causes errors on some MIOpen versions.
             return miopenFloat;
         case miopenDouble:
             return miopenDouble;

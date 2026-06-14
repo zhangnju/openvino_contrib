@@ -40,7 +40,11 @@ bool VariadicSplitZeroCopyPass::run_on_model(const std::shared_ptr<ov::Model>& m
         auto axis_const = std::dynamic_pointer_cast<ov::op::v0::Constant>(
             vsplit->input(1).get_source_output().get_node_shared_ptr());
         if (!axis_const) continue;
-        const auto axis_data = axis_const->cast_vector<int64_t>();
+        std::vector<int64_t> axis_data;
+        { const auto& at=axis_const->get_element_type();
+          if(at==ov::element::i64) axis_data=axis_const->cast_vector<int64_t>();
+          else if(at==ov::element::i32) for(auto v:axis_const->cast_vector<int32_t>()) axis_data.push_back(v);
+          else for(auto v:axis_const->cast_vector<float>()) axis_data.push_back(static_cast<int64_t>(v)); }
         if (axis_data.empty()) continue;
         // Support both positive and negative axis
         const int64_t rank = 4;
@@ -52,7 +56,11 @@ bool VariadicSplitZeroCopyPass::run_on_model(const std::shared_ptr<ov::Model>& m
         auto lens_const = std::dynamic_pointer_cast<ov::op::v0::Constant>(
             vsplit->input(2).get_source_output().get_node_shared_ptr());
         if (!lens_const) continue;
-        const auto lens = lens_const->cast_vector<int64_t>();
+        std::vector<int64_t> lens;
+        { const auto& et=lens_const->get_element_type();
+          if(et==ov::element::i64) lens=lens_const->cast_vector<int64_t>();
+          else if(et==ov::element::i32) for(auto v:lens_const->cast_vector<int32_t>()) lens.push_back(v);
+          else for(auto v:lens_const->cast_vector<float>()) lens.push_back(static_cast<int64_t>(v)); }
         bool all_positive = true;
         for (auto l : lens) if (l <= 0) { all_positive = false; break; }
         if (!all_positive) continue;

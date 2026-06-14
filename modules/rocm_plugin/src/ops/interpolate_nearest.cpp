@@ -24,7 +24,14 @@ std::vector<float> getScalesVector(const ov::rocm_gpu::InterpolateNearestOp::Nod
     if (node.inputs().size() > 3) {
         const auto axis_const = ov::as_type_ptr<op::v0::Constant>(node.input_value(3).get_node_shared_ptr());
         OPENVINO_ASSERT(axis_const);
-        axis = axis_const->cast_vector<int64_t>();
+        // Safe reading: axis may be i32 or i64
+        const auto& at = axis_const->get_element_type();
+        if (at == ov::element::i64)
+            axis = axis_const->cast_vector<int64_t>();
+        else if (at == ov::element::i32)
+            for (auto v : axis_const->cast_vector<int32_t>()) axis.push_back(v);
+        else
+            for (auto v : axis_const->cast_vector<float>()) axis.push_back(static_cast<int64_t>(v));
     } else {
         axis.resize(node.get_input_partial_shape(0).rank().get_length());
         std::iota(axis.begin(), axis.end(), 0);

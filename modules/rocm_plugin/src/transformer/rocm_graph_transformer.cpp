@@ -47,6 +47,12 @@
 #include "transformer/elementwise_fusion_transformation.hpp"
 #include "transformer/variadic_split_zero_copy.hpp"
 #include "transformer/rocm_attention_fusion.hpp"
+#include "transformer/layer_norm_fusion.hpp"
+#include "transformer/bert_attention_matmul_fusion.hpp"
+#include "transformer/bert_self_attention_fusion.hpp"
+#include "transformer/fused_layernorm_pass.hpp"
+#include "transformer/fused_fc_gelu_pass.hpp"
+#include "transformer/fused_masked_softmax_pass.hpp"
 
 using namespace ov::rocm_gpu;
 
@@ -108,6 +114,11 @@ void GraphTransformer::transform(const rocm::Device& device,
     [[maybe_unused]] const auto& originOpsSize = originOps.size();
 
     pass_manager.register_pass<ov::pass::InitNodeInfo>();
+    // Remove Identity (StopGradient) nodes BEFORE ConvertPrecision so that
+    // MVNFusion (inside CommonOptimizations) can match BERT-style LayerNorm.
+    // Without this, ConvertPrecision turns Identity→Convert(f16→f16), and
+    // MVNFusion's pattern does not skip through Convert nodes.
+    pass_manager.register_pass<ov::pass::NopElimination>();
     pass_manager.register_pass<ov::pass::ConvertPrecision>(fp_convert_precision_map, empty_fuse_map, true, false);
     pass_manager.register_pass<ov::pass::CommonOptimizations>();
     pass_manager.register_pass<ov::pass::ReshapePRelu>();
@@ -167,9 +178,44 @@ void GraphTransformer::transform(const rocm::Device& device,
     pass_manager.register_pass<ov::rocm_gpu::pass::FusedConvBackpropDataAsymPaddingTransformation>();
     pass_manager.register_pass<ov::rocm_gpu::pass::TransposeMatMulTransformation>();
     pass_manager.register_pass<ov::rocm_gpu::pass::FullyConnectedTransformation>();
+    // Remove MatMul nodes that became dead after FC fusion (original Q/K/V projection MatMuls)
+    pass_manager.register_pass<ov::rocm_gpu::pass::DeadMatMulElimination>();
     pass_manager.register_pass<ov::rocm_gpu::pass::ConcatTransformation>();
     pass_manager.register_pass<ov::rocm_gpu::pass::ReduceTransformation>();
     pass_manager.register_pass<ov::rocm_gpu::pass::DetectionOutputFixInputTypesTransformation>();
+
+    // Fuse Add(scores, mask) → Softmax into FusedMaskedSoftmax kernel.
+    // BertSelfAttentionFusion: fuses Q×K^T/scale + mask_add + softmax + ×V into
+    // a single rocMLIR rock.attention kernel. Bias [1,1,sq,sk] broadcast over heads
+    // via affine_map (h,sq,sk)→sq*seq+sk that ignores the head dimension.
+    // MUST run BEFORE FusedMaskedSoftmaxPass: both match Add+Softmax patterns.
+    // If MaskedSoftmax runs first it consumes the Softmax nodes leaving none for attention.
+    // MUST run AFTER FullyConnectedTransformation: needs FC nodes to identify Q/K/V.
+    pass_manager.register_pass<ov::rocm_gpu::pass::BertSelfAttentionFusion>();
+
+    // Fuse Add(scores, mask) + Softmax into a single kernel for non-attention softmaxes.
+    // Runs AFTER BertSelfAttentionFusion to avoid consuming Softmax nodes needed for attention.
+    // Must run BEFORE ElementwiseFusionPass which might absorb the mask Add.
+    pass_manager.register_pass<ov::rocm_gpu::pass::FusedMaskedSoftmaxPass>();
+
+    // Fuse FC+GELU pairs: FullyConnected → Gelu → FusedFCGELU kernel.
+    // Must run BEFORE ElementwiseFusionPass which absorbs Gelu into chains.
+    // Run AFTER FullyConnectedTransformation so FC nodes exist.
+    pass_manager.register_pass<ov::rocm_gpu::pass::FusedFCGELUPass>();
+
+    // Fuse TF-style pre-folded LayerNorm (after attention fusion so graph structure is stable).
+    pass_manager.register_pass<ov::rocm_gpu::pass::LayerNormFusionPass>();
+
+    // Upgrade LayerNorm nodes to fused LayerNorm+Residual native HIP kernel.
+    // Detects: Add(x, skip) → LayerNorm → FusedLayerNorm(x, skip, gamma, beta)
+    // Run AFTER LayerNormFusionPass (which creates the LayerNorm nodes we match on).
+    pass_manager.register_pass<ov::rocm_gpu::pass::FusedLayerNormPass>();
+
+    // After LayerNormFusion, downstream f32 ops may now receive f16 from LayerNorm output.
+    // Re-run RemoveRedundantConvert to eliminate the f16→f32 converts that ConvertPrecision
+    // had inserted around ops that needed f32 inputs (before LayerNorm returned f16).
+    // This is what causes 25 FusedElementwise ops to run in f32 unnecessarily.
+    pass_manager.register_pass<ov::rocm_gpu::pass::RemoveRedundantConvertTransformation>();
 
     // Fuse chains of elementwise ops (Swish, Mul, Add, Sigmoid, etc.) into a single
     // FusedElementwise kernel launch. Run AFTER conv fusion (which handles Conv+SiLU)

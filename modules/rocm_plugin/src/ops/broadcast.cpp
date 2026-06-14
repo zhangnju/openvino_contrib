@@ -18,7 +18,20 @@ namespace {
 ov::Shape shape_from_constant_value(const ov::Node* constant_node) {
     const ov::op::v0::Constant* constant = dynamic_cast<const ov::op::v0::Constant*>(constant_node);
     OPENVINO_ASSERT(constant);
-    return constant->cast_vector<ov::Shape::value_type>();
+    const auto& et = constant->get_element_type();
+    std::vector<size_t> result;
+    if (et == ov::element::i64) {
+        for (auto v : constant->cast_vector<int64_t>()) result.push_back(static_cast<size_t>(v));
+    } else if (et == ov::element::i32) {
+        for (auto v : constant->cast_vector<int32_t>()) result.push_back(static_cast<size_t>(v));
+    } else if (et == ov::element::u64) {
+        return constant->cast_vector<uint64_t>();
+    } else if (et == ov::element::u32) {
+        for (auto v : constant->cast_vector<uint32_t>()) result.push_back(static_cast<size_t>(v));
+    } else {
+        for (auto v : constant->cast_vector<float>()) result.push_back(static_cast<size_t>(v));
+    }
+    return result;
 }
 }  // namespace
 

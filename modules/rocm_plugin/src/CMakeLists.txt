@@ -75,6 +75,7 @@ target_link_libraries(${OBJ_NAME}
                       MIOpen
                       roc::rocblas
                       ${NGRAPH_LIBRARIES}
+                      dl
 )
 
 # CK WMMA: add include path for CK templates (header-only device code)

@@ -60,13 +60,21 @@ bool RocmAttentionFusionPass::run_on_model(const std::shared_ptr<ov::Model>& mod
         auto axis_c = std::dynamic_pointer_cast<ov::op::v0::Constant>(
             vsplit->input(1).get_source_output().get_node_shared_ptr());
         if (!axis_c) continue;
-        const auto axis_v = axis_c->cast_vector<int64_t>();
+        std::vector<int64_t> axis_v;
+        { const auto& _et=axis_c->get_element_type();
+          if(_et==ov::element::i64) axis_v=axis_c->cast_vector<int64_t>();
+          else if(_et==ov::element::i32) for(auto _v:axis_c->cast_vector<int32_t>()) axis_v.push_back(_v);
+          else for(auto _v:axis_c->cast_vector<float>()) axis_v.push_back(static_cast<int64_t>(_v)); }
         if (axis_v.empty() || axis_v[0] != 2) continue;
 
         auto lens_c = std::dynamic_pointer_cast<ov::op::v0::Constant>(
             vsplit->input(2).get_source_output().get_node_shared_ptr());
         if (!lens_c) continue;
-        const auto lens = lens_c->cast_vector<int64_t>();
+        std::vector<int64_t> lens;
+        { const auto& _et=lens_c->get_element_type();
+          if(_et==ov::element::i64) lens=lens_c->cast_vector<int64_t>();
+          else if(_et==ov::element::i32) for(auto _v:lens_c->cast_vector<int32_t>()) lens.push_back(_v);
+          else for(auto _v:lens_c->cast_vector<float>()) lens.push_back(static_cast<int64_t>(_v)); }
         if (lens.size() != 3 || lens[0] != lens[1]) continue;
         const int dim_q = static_cast<int>(lens[0]);
         const int dim_v = static_cast<int>(lens[2]);
