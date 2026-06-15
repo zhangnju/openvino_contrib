@@ -179,8 +179,8 @@ void Gather::CallByDataType(const hipStream_t stream,
     float* dst_data_fp32= nullptr;
     switch (element_type_) {
         case Type_t::f16:
-            // FP16 gather: use generic (element_size=2) path
-            return CallGeneric(stream, src_dict, (const int32_t*)src_index, dst_data, sizeof(__half));
+            // FP16 gather: vectorized wavefront-per-row kernel (float4/half2 loads)
+            return CallFP16(stream, (const __half*)src_dict, (const int32_t*)src_index, (__half*)dst_data);
         case Type_t::f32:
             return Call(stream, (const float*)src_dict, (const int*)src_index, (float*)dst_data);
         case Type_t::i64:
@@ -233,6 +233,79 @@ void Gather::Call(const hipStream_t stream, const float* src_dict, const int* sr
     }
 }
 
+// Optimized FP16 gather kernel: vectorized float4 loads (16 bytes = 8 halves per load)
+// Each wavefront (64 threads on RDNA) handles one (dict, indices_index) pair — one row of data_length elements.
+// float4 loads give coalesced 16-byte reads vs the generic_gather byte-at-a-time approach.
+//
+// Grid: x = ceil(indices_size / waves_per_block), y = num_dicts, z = batch_count
+// Block: 256 threads = 4 wavefronts of 64
+static __global__ void gather_fp16_vectorized(const __half* __restrict__ src_dict,
+                                               const int32_t* __restrict__ src_index,
+                                               __half* __restrict__ dst_data,
+                                               unsigned data_length,      // hidden dim (e.g. 768)
+                                               size_t index_range,        // vocab size (axis dim)
+                                               unsigned indices_size,     // seq length
+                                               unsigned dicts_batch_stride,
+                                               unsigned indices_batch_stride,
+                                               unsigned out_batch_stride) {
+    // 4 wavefronts of 64 threads per block = 256 threads
+    const int waves_per_block = blockDim.x / 64;
+    const int wave_id = threadIdx.x / 64;
+    const int lane    = threadIdx.x % 64;
+    const int indices_index = blockIdx.x * waves_per_block + wave_id;
+    const int dict    = blockIdx.y;
+    const int batch   = blockIdx.z;
+
+    if (indices_index >= indices_size) return;
+
+    int32_t dict_idx = src_index[batch * indices_batch_stride + indices_index];
+    if (dict_idx < 0) dict_idx += (int32_t)index_range;
+
+    // Output: dst[batch][dict * indices_size + indices_index][data_length]
+    __half* dst = dst_data + (size_t)batch * out_batch_stride
+                           + (size_t)(indices_index + dict * indices_size) * data_length;
+
+    if (dict_idx >= 0 && (size_t)dict_idx < index_range) {
+        // Source: src_dict[batch][dict_idx + dict * index_range][data_length]
+        const __half* src = src_dict + (size_t)batch * dicts_batch_stride
+                                     + (size_t)(dict_idx + dict * index_range) * data_length;
+
+        // Use float4 (16-byte) vectorized loads when data_length is divisible by 8
+        if ((data_length & 7) == 0) {
+            const unsigned len8 = data_length >> 3;
+            const float4* src4 = reinterpret_cast<const float4*>(src);
+            float4* dst4 = reinterpret_cast<float4*>(dst);
+            for (unsigned j = lane; j < len8; j += 64)
+                dst4[j] = src4[j];
+        }
+        // Use half2 (4-byte) vectorized loads when data_length is divisible by 2
+        else if ((data_length & 1) == 0) {
+            const unsigned len2 = data_length >> 1;
+            const __half2* src2 = reinterpret_cast<const __half2*>(src);
+            __half2* dst2 = reinterpret_cast<__half2*>(dst);
+            for (unsigned j = lane; j < len2; j += 64)
+                dst2[j] = src2[j];
+        }
+        // Scalar fallback for odd data_length
+        else {
+            for (unsigned j = lane; j < data_length; j += 64)
+                dst[j] = src[j];
+        }
+    } else {
+        // Out of range: zero fill
+        if ((data_length & 7) == 0) {
+            const unsigned len8 = data_length >> 3;
+            float4* dst4 = reinterpret_cast<float4*>(dst);
+            float4 zero4 = {0.f, 0.f, 0.f, 0.f};
+            for (unsigned j = lane; j < len8; j += 64)
+                dst4[j] = zero4;
+        } else {
+            for (unsigned j = lane; j < data_length; j += 64)
+                dst[j] = __float2half(0.f);
+        }
+    }
+}
+
 // Generic byte-level gather for any data type with int32 indices
 static __global__ void generic_gather(const char* __restrict__ src_dict,
                                        const int32_t* __restrict__ src_index,
@@ -254,6 +327,23 @@ static __global__ void generic_gather(const char* __restrict__ src_dict,
     for (unsigned b = threadIdx.y; b < data_length_bytes; b += blockDim.y) {
         dst[b] = (dict_idx >= 0 && (size_t)dict_idx < index_range) ? src[b] : 0;
     }
+}
+
+void Gather::CallFP16(const hipStream_t stream, const __half* src_dict, const int32_t* src_index,
+                       __half* dst_data) const {
+    // 4 wavefronts of 64 threads = 256 threads per block
+    constexpr int waves_per_block = 4;
+    constexpr int threads = waves_per_block * 64;  // 256
+    // grid_dim_x_ = indices_size * batch_count (from the op constructor)
+    unsigned batch_count = grid_dim_x_ / indices_size_;
+    if (batch_count == 0) batch_count = 1;
+    // Grid: x = ceil(indices_size / waves_per_block), y = num_dicts, z = batch_count
+    dim3 block(threads, 1, 1);
+    dim3 grid((indices_size_ + waves_per_block - 1) / waves_per_block, num_dicts_, batch_count);
+    hipLaunchKernelGGL(gather_fp16_vectorized, grid, block, 0, stream,
+                       src_dict, src_index, dst_data,
+                       data_length_, (size_t)index_range_,
+                       indices_size_, dicts_batch_stride_, indices_batch_stride_, out_batch_stride_);
 }
 
 void Gather::CallGeneric(const hipStream_t stream, const void* src_dict, const int32_t* src_index,

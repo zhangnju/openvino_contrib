@@ -19,10 +19,11 @@ OpenVINO™ ROCm GPU Plugin 使 AMD GPU 能够运行深度神经网络推理，
 
 | GPU | 架构 | OV ROCm Plugin | MIGraphX | 优势 |
 |-----|------|---------------|---------|------|
-| Radeon AI PRO R9700 | gfx1201 / RDNA4 | **~291 FPS** ✅ | ~194 FPS | +50% |
+| Radeon AI PRO R9700 | gfx1201 / RDNA4 | **~774 FPS** ✅ | ~700 FPS | **+10.6%** |
 
-> gfx1201 数据：batch=1，seq=256，nireq=1，sync 模式，400 次迭代。
-> OV 使用 rock.attention + native LayerNorm/Softmax/GELU HIP kernel 全融合路径。
+> gfx1201 数据：batch=1，seq=256，nireq=2，1000 次迭代。
+> OV 使用 3-input FusedLayerNorm + hipRTC JIT register-cached kernel + BertSelfAttention fusion。
+> nireq=1 约 723 FPS；nireq=2 约 774 FPS（推荐用于最高吞吐量）。
 
 > ✅ 超过 MIGraphX 水平。
 
@@ -90,12 +91,13 @@ ROCMLIR_EPILOGUE_FUSION=1 ROCM_FUSE_ATTENTION=1 \
 
 ### Transformer 模型（BERT / NLP）
 
-- **BertSelfAttentionFusion**：Q×K^T + mask + softmax + ×V 融合为单 `rock.attention` kernel（rocMLIR JIT 编译，12 层各特化）
-- **TF LayerNorm 全融合**：识别 TF pre-folded 代数形式（`y=x*W+B`），25/25 替换为 native f16 HIP kernel，消除 f16↔f32 转换开销
-- **FusedMaskedSoftmax**：`Add(scores, mask) + Softmax` → native f16 kernel
-- **FusedFCGELU**：`FullyConnected + GELU` → rocBLAS GEMM + native bias+GELU kernel
-- **bias-add 向量化**：`__half2` 指令，FC bias add 速度提升约 2×
-- 零 MIGraphX API 依赖：全部使用 native HIP + rocBLAS + rocMLIR
+- **BertSelfAttentionFusion**：Q×K^T + mask + softmax + ×V 融合为单 `rock.attention` kernel（rocMLIR JIT 编译）
+- **3-input FusedLayerNorm**：吸收整个 2-op Add 链（`LN(src+bias+residual)`），hipRTC 寄存器缓存 kernel（3.3µs plain / 5.7µs 3-input），消除全部 FusedElementwise overhead
+- **EliminateF16ToF32Convert**：精准删除 28 个 "解压" Convert 节点，让 FusedElementwise 全走 f16 path（最大单次优化）
+- **QKV 联合 GEMM**：Q/K/V 投影合并为单个 256×2304×768 hipBLASLt GEMM（`HIPBLASLT_EPILOGUE_BIAS`）
+- **hipBLASLt GELU_BIAS Epilogue**：FC+GELU 融合为单 kernel（GEMM+bias+GELU，消除独立 GELU kernel）
+- **TF GELU 模式识别**：Pow→Mul→Add→Tanh 链自动识别并融合
+- 零 MIGraphX API 依赖：全部使用 native HIP + hipBLASLt + rocMLIR + hipRTC
 
 ### 可选调优（视觉模型）
 

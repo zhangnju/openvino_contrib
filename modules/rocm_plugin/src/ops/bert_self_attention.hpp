@@ -37,9 +37,10 @@ private:
     hipModule_t        module_{nullptr};
 
     // Attention params
-    int64_t seq_len_   = 0;
-    int64_t num_heads_ = 0;
-    int64_t head_dim_  = 0;
+    int64_t seq_len_      = 0;
+    int64_t num_heads_    = 0;
+    int64_t head_dim_     = 0;
+    bool    combined_qkv_ = false;  // true when using FusedQKVProjection (ptr+offset, no D2D copy)
 
     // Grid/block dimensions (from compiled kernel metadata)
     unsigned grid_x_  = 0;

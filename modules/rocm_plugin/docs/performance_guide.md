@@ -863,3 +863,180 @@ benchmark_app -m model.onnx -d ROCM.0 -t 5 -nireq 1 \
 pip install cmake
 which cmake   # 应在 /opt/venv/bin/cmake 或 ~/.local/bin/cmake
 ```
+
+
+---
+
+## 10. BERT/Transformer 模型优化
+
+### 10.1 性能成就（gfx1201，FP16）
+
+| 配置 | OV ROCm Plugin | MIGraphX FP16 | 比较 |
+|---|---|---|---|
+| **bertsquad-12（nireq=2）** | **~774 FPS** | ~700 FPS | **OV 快 10.6%** |
+| bertsquad-12（nireq=1） | ~723 FPS | ~700 FPS | OV 快 3.3% |
+| **yolo26x（吞吐量模式）** | **~280 FPS** | ~224 FPS | OV 快 25% |
+
+测试条件：batch=1，seq_len=256，gfx1201/RDNA4，FP16，bertsquad-12.onnx，1000 次迭代
+
+### 10.2 复现最优性能（774 FPS）
+
+#### 环境要求
+
+```bash
+# 额外依赖（bertsquad-12 FP16 优化所需）
+# hipBLASLt: ROCm 7.2 自带，无需单独安装
+# hipRTC: ROCm 7.2 自带（/opt/rocm/lib/libhiprtc.so）
+ls /opt/rocm/lib/libhipblaslt.so /opt/rocm/lib/libhiprtc.so
+```
+
+#### 模型准备
+
+```bash
+# 下载 bertsquad-12.onnx（来自 ONNX Model Zoo）
+mkdir -p /tmp/bert_model
+# 或使用现有模型路径
+ls /tmp/bert_model/bertsquad-12.onnx
+```
+
+#### 一键复现
+
+```bash
+export OV_BIN=/home/openvino/bin/intel64/Release
+export BERT_MODEL=/tmp/bert_model/bertsquad-12.onnx
+
+# 方式 A：最高吞吐量（nireq=2，~774 FPS）
+${OV_BIN}/benchmark_app \
+  -m ${BERT_MODEL} -d ROCM \
+  -niter 800 -nireq 2 -hint none \
+  -shape "unique_ids_raw_output___9:0[1],segment_ids:0[1,256],input_mask:0[1,256],input_ids:0[1,256]"
+
+# 方式 B：最低单流延迟（nireq=1，~723 FPS，1.32ms）
+${OV_BIN}/benchmark_app \
+  -m ${BERT_MODEL} -d ROCM \
+  -niter 800 -nireq 1 -hint none -api sync \
+  -shape "unique_ids_raw_output___9:0[1],segment_ids:0[1,256],input_mask:0[1,256],input_ids:0[1,256]"
+```
+
+> **注意**：首次推理会触发 hipRTC JIT 编译（约 1-2 秒），之后性能稳定。
+
+#### 验证融合是否生效
+
+```bash
+${OV_BIN}/benchmark_app \
+  -m ${BERT_MODEL} -d ROCM -niter 2 -nireq 1 -hint none -api sync \
+  -shape "unique_ids_raw_output___9:0[1],segment_ids:0[1,256],input_mask:0[1,256],input_ids:0[1,256]" \
+  2>&1 | grep -E "FusedLN|BertAttn|QKV|FusedFC|LayerNorm|JIT"
+```
+
+预期输出（关键行）：
+```
+[BertAttnFuse] Fused layer: seq=256 heads=12 dim=64       <- x12 (attention fusion)
+[LayerNormFusion] 3-input FusedLN (src+bias+residual): rows=256 hidden=768  <- x24
+[FusedLNPass] Plain LN: rows=256 hidden=768               <- x1 (embedding LN)
+[FusedLN-JIT] Compiled rows=256 cols=768 ...              <- hipRTC kernel
+[FusedQKVPass] Fused Q+K+V: seq=256 hidden=768            <- x12 (QKV fusion)
+[FusedFCGELUPass] Fused FC+GELU: seq=256 ...              <- x12 (FFN fusion)
+```
+
+### 10.3 BERT 优化全历程（gfx1201）
+
+| 阶段 | FPS | 关键技术 |
+|------|-----|---------|
+| 初始（crash） | -- | 多处 type-cast bug |
+| Bug 修复后 | 136 | i32/f32 cast，MatMul transpose 恢复 |
+| FC Fusion + BugFix | 183 | FullyConnectedTransformation 修复 |
+| FC+GELU + Masked Softmax | 222 | FusedFCGELU，FusedMaskedSoftmax |
+| BertSelfAttention Fusion | 208 | rock.attention JIT kernel |
+| LayerNorm 25/25 全融合 | 291 | TF pre-folded 模式识别 + axis fixup |
+| EliminateF16ToF32Convert | **376** | 最大单次：消除 28 个 f16->f32 转换 |
+| hipBLASLt GEMM+bias | 411 | 单 kernel 替代双 kernel |
+| QKV fusion（256x2304x768） | 421 | 3 个 FC 合并为 1 个大 GEMM |
+| FusedFCGELU hipBLASLt | 482 | GELU_BIAS epilogue |
+| TF-style GELU 匹配 | 521 | Pow->Mul->Add->Tanh 链识别 |
+| Gather 47x加速 + nireq=2 | 552 | half2 向量化 warp-per-row gather |
+| rocMLIR vs hipBLASLt 选择 | 588 | 每种 shape 自动 benchmark 选最优 |
+| layernorm_fused_vec2 | 646 | half2 vectorized，warp-per-row |
+| hipRTC 寄存器缓存 kernel | **702** | 零第二次 HBM 读取，3.3us/LN |
+| **3-input FusedLayerNorm** | **~774** | LN(src+bias+residual) 单 pass，消除 FusedEW |
+
+### 10.4 关键优化技术说明
+
+#### A. 3-input FusedLayerNorm（最终大招）
+
+**原理**：BERT 的 FusedElementwise 链为 `Add(src, bias) -> Add(result, residual)`。直接把两个 Add 都吸入 FusedLayerNorm，hipRTC kernel 在寄存器内完成：
+
+```
+out = LayerNorm(src + bias + residual) * gamma + beta
+```
+
+单 kernel pass，数据从 HBM 读取一次，缓存在寄存器，归一化后直接输出。
+
+- **之前**：FusedEW(4.5us) + FusedLN(3.3us) = 7.8us x 24 层 = 187us
+- **之后**：3-input JIT LN(~5.7us) x 24 层 = 137us
+- 节省：50us/inference，消除 23 个 kernel launch
+
+#### B. hipRTC JIT 寄存器缓存 kernel
+
+BERT hidden=768，每 warp（32 线程）处理 1 行（12 个 half2 元素/线程）：
+
+```cuda
+// Pass 1: load src+bias+skip -> REGISTER CACHE, compute Welford
+__half2 val[12];  // register cache
+for (int i = 0; i < 12; i++) {
+    val[i] = src[lane+i*32] + bias[lane+i*32] + skip[lane+i*32];
+    // Welford online reduction (no cross-warp sync)
+}
+// Warp-only reduce (zero shared memory!)
+mean = warp_sum(sum) / N;
+inv_std = rsqrt(variance + eps);
+// Pass 2: normalize from REGISTER (zero HBM read!)
+for (int i = 0; i < 12; i++) {
+    out[...] = (val[i] - mean) * inv_std * gamma[...] + beta[...];
+}
+```
+
+vs 之前的 vec2 kernel（需 2 次 HBM 读），JIT 寄存器版本约快 1.5x（4.8us->3.3us）。
+
+#### C. EliminateF16ToF32Convert
+
+OV ConvertPrecision 在激活张量上插入 `Convert(f16->f32)` "解压" 节点，导致 FusedElementwise 跑 f32 kernel（2x 内存带宽浪费）。新增 Pass 精准删除这 28 个节点，让 FusedElementwise 全走 f16 path。
+
+#### D. BertSelfAttentionFusion
+
+用 rocMLIR `rock.attention` 把 Q*K^T + mask + softmax + *V 融合为单 kernel：
+
+```mlir
+rock.attention {
+  qk = %Q * %K   // Q[heads,seq,dim] x K[heads,dim,seq]
+  qk = elementwise(add_mask)  // fused mask add
+  out = softmax(qk) * %V     // flash-attention style
+} {numHeadsQ=12, softmaxType=f32}
+```
+
+偏置 `[1,1,256,256]` 通过 affine_map `(h,sq,sk)->sq*256+sk` 广播到 `[12,256,256]`，无额外内存。
+
+### 10.5 性能调优技巧
+
+#### 首选 nireq=2
+
+对于 BERT seq=256，nireq=2 是最优配置：GPU 利用率从 74% 提升到 ~90%，吞吐量约提升 7%。
+
+```bash
+# 高吞吐量配置
+benchmark_app -m bert.onnx -d ROCM -nireq 2 -hint none -shape ...
+```
+
+#### 预热后再测
+
+首次推理包含 hipRTC JIT 编译（~1-2s）和 hipBLASLt algo 选择（~2-3s）。测试前至少运行 5+ 次迭代预热：
+
+```bash
+# 先预热，再正式测试
+benchmark_app ... -niter 5  # 预热
+benchmark_app ... -niter 800  # 正式测试
+```
+
+#### 不使用 INT8
+
+bertsquad-12-int8.onnx 使用 `MatMulInteger` + `FusedMatMul` 格式，当前 OV ROCm 和 MIGraphX 均不支持，建议使用 FP16 版本。

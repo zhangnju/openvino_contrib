@@ -41,6 +41,7 @@
 
 #include "layer_norm_fusion.hpp"
 #include "nodes/layer_norm_node.hpp"
+#include "nodes/fused_layernorm_node.hpp"
 
 #include <optional>
 #include <openvino/op/constant.hpp>
@@ -340,28 +341,126 @@ static bool try_fuse_tf_layernorm(const std::shared_ptr<ov::op::v1::ReduceMean>&
     }
     if (!out_add) return false;
 
-    // ── All matched! Build LayerNorm replacement ───────────────────────────
-    // Use x from the Sub lhs (already has the right dtype after ConvertPrecision).
+    // ── All matched! Build LayerNorm (or FusedLayerNorm) replacement ──────────
     auto x_actual = sub_node->input_value(0);
 
-    // gamma/beta: use the graph values as-is (they carry the correct f16 dtype
-    // after ConvertPrecision wraps f32 constants in Convert nodes).
     auto gamma_out = W_mul->get_input_node_ptr(0) == recip.get()
                      ? W_mul->input_value(1) : W_mul->input_value(0);
     auto beta_out  = B_sub->get_input_node_ptr(0) == mW_mul.get()
                      ? B_sub->input_value(1) : B_sub->input_value(0);
 
-    // For the LayerNorm kernel, we always normalize over the last dimension
-    // (the hidden dim). Use the corrected axis which may differ from the
-    // ReduceMean's original axis after reshape elimination.
-    auto ln_node = std::make_shared<nodes::LayerNorm>(
-        x_actual, gamma_out, beta_out, (double)eps_val, axis);
-    ln_node->set_friendly_name(rm1->get_friendly_name() + "/TFLayerNorm");
+    // ── P1 optimisation: fuse 2-op Add chain + LayerNorm into single kernel ───
+    // Detect: x_actual = Add(Op1_result, residual)
+    //     where Op1 = Add(src, bias_const)  [2-op FusedElementwise chain root]
+    // Create: FusedLayerNorm(src, bias_const, residual, gamma, beta)
+    // This absorbs BOTH Adds, preventing the 1st Add from becoming a
+    // standalone broadcasting_add kernel when the 2nd is absorbed alone.
+    auto x_raw_node = skip_pass(x_actual.get_node_shared_ptr());
+    bool did_fused_ln = false;
 
-    ov::replace_node(out_add, ln_node);
+    if (x_raw_node &&
+        x_raw_node->get_type_info().name == std::string("Add") &&
+        x_raw_node->get_input_size() == 2) {
 
-    fprintf(stderr, "[LayerNormFusion] TF-style fused at axis=%lld eps=%g inner=%zu\n",
-            (long long)axis, (double)eps_val, inner_size);
+        // x_raw_node = Add(Op1_result, residual) -- second Add in chain
+        // Try both orderings: Op1 could be input 0 or 1
+        for (int swap = 0; swap < 2 && !did_fused_ln; ++swap) {
+            auto op1_result_val = x_raw_node->input_value(swap);
+            auto residual_val   = x_raw_node->input_value(1 - swap);
+            auto op1_node = skip_pass(op1_result_val.get_node_shared_ptr());
+
+            // Check if Op1 is also a plain Add (first Add in the chain)
+            if (!op1_node ||
+                op1_node->get_type_info().name != std::string("Add") ||
+                op1_node->get_input_size() != 2)
+                continue;
+
+            auto src_val  = op1_node->input_value(0);
+            auto bias_val = op1_node->input_value(1);
+
+            // bias must be a vector constant of size == hidden
+            size_t bias_sz = const_element_count(bias_val.get_node_shared_ptr());
+            if (bias_sz == 0) {
+                // Try swapping src and bias within Op1
+                std::swap(src_val, bias_val);
+                bias_sz = const_element_count(bias_val.get_node_shared_ptr());
+                if (bias_sz == 0)
+                    continue;
+            }
+
+            // Safety: x_raw_node (outer Add) consumers must all be TF-LN internal nodes
+            bool safe_outer = true;
+            for (const auto& inp : x_raw_node->output(0).get_target_inputs()) {
+                const std::string& ct = inp.get_node()->get_type_info().name;
+                if (ct != "ReduceMean" && ct != "Subtract" && ct != "Multiply" &&
+                    ct != "Add" && ct != "Convert" && ct != "Identity")
+                    safe_outer = false;
+            }
+            // Op1 (inner Add) must have exactly one live consumer (the outer Add)
+            bool safe_inner = (op1_node->output(0).get_target_inputs().size() == 1);
+
+            if (!safe_outer || !safe_inner)
+                continue;
+
+            if (!src_val.get_partial_shape().rank().is_static() ||
+                !bias_val.get_partial_shape().rank().is_static() ||
+                !residual_val.get_partial_shape().rank().is_static())
+                continue;
+
+            auto out_ps = out_add->get_output_partial_shape(0);
+            if (!out_ps.rank().is_static()) continue;
+
+            int64_t rank_o = out_ps.rank().get_length();
+            int64_t last   = out_ps[rank_o-1].is_static() ? out_ps[rank_o-1].get_length() : 0;
+            int64_t rows_f = 1;
+            bool ok = (last > 0);
+            for (int64_t d = 0; d < rank_o-1 && ok; ++d) {
+                if (!out_ps[d].is_static()) { ok = false; break; }
+                rows_f *= out_ps[d].get_length();
+            }
+            if (!ok) continue;
+
+            // Verify bias size matches hidden dim
+            if ((int64_t)bias_sz != last) continue;
+
+            // 3-input FusedLayerNorm: computes LN(src + bias + residual)
+            auto fused_node = std::make_shared<nodes::FusedLayerNorm>(
+                src_val, bias_val, residual_val, gamma_out, beta_out,
+                rows_f, last);
+            fused_node->set_friendly_name(rm1->get_friendly_name() + "/FusedLN_3input");
+            ov::replace_node(out_add, fused_node);
+
+            // Disconnect dead TF-LN chain nodes from x_raw_node to prevent
+            // ElementwiseFusionPass from forming chains through dead internals
+            auto* x_ptr = x_raw_node.get();
+            auto disc = [&](const std::shared_ptr<ov::Node>& n) {
+                for (size_t i = 0; i < n->get_input_size(); ++i) {
+                    if (skip_pass(n->get_input_node_shared_ptr(i)).get() == x_ptr) {
+                        auto et = n->get_input_element_type(i);
+                        auto dummy = ov::op::v0::Constant::create(et, ov::Shape{1}, {0.f});
+                        try { n->input(i).replace_source_output(dummy->output(0)); } catch (...) {}
+                        break;
+                    }
+                }
+            };
+            disc(rm1); disc(sub_node); disc(xW_mul);
+
+            fprintf(stderr,
+                "[LayerNormFusion] 3-input FusedLN (src+bias+residual): rows=%lld hidden=%lld\n",
+                (long long)rows_f, (long long)last);
+            did_fused_ln = true;
+        }
+    }
+
+    if (!did_fused_ln) {
+        // Fallback: plain intermediate LayerNorm (upgraded by FusedLayerNormPass)
+        auto ln_node = std::make_shared<nodes::LayerNorm>(
+            x_actual, gamma_out, beta_out, (double)eps_val, axis);
+        ln_node->set_friendly_name(rm1->get_friendly_name() + "/TFLayerNorm");
+        ov::replace_node(out_add, ln_node);
+        fprintf(stderr, "[LayerNormFusion] TF-style fused at axis=%lld eps=%g inner=%zu\n",
+                (long long)axis, (double)eps_val, inner_size);
+    }
     return true;
 }
 

@@ -31,7 +31,11 @@ public:
 
     rocmGraphCompatibility GetrocmGraphCompatibility() const override;
 
-    int GetBatchCount() const { return batch_count_; }
+    int GetBatchCount()  const { return batch_count_; }
+    int GetM()           const { return m_; }
+    int GetN()           const { return n_; }
+    int GetK()           const { return k_; }
+    rocblas_operation GetTransposeB() const { return rocblas_transpose_b_; }
 
     /**
      * Get number of batches that equals to product between dimensions in range [matrixShape.begin(),

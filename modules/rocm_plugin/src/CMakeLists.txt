@@ -74,6 +74,8 @@ target_link_libraries(${OBJ_NAME}
                       hip::device
                       MIOpen
                       roc::rocblas
+                      /opt/rocm/lib/libhipblaslt.so
+                      /opt/rocm/lib/libhiprtc.so
                       ${NGRAPH_LIBRARIES}
                       dl
 )

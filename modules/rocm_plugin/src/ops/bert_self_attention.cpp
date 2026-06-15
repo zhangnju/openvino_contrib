@@ -119,17 +119,23 @@ BertSelfAttentionOp::BertSelfAttentionOp(
     auto attn = std::dynamic_pointer_cast<nodes::BertSelfAttention>(node);
     OPENVINO_ASSERT(attn, "BertSelfAttentionOp: expected BertSelfAttention node");
 
-    seq_len_   = attn->get_seq_len();
-    num_heads_ = attn->get_num_heads();
-    head_dim_  = attn->get_head_dim();
-    fprintf(stderr, "[BertAttn] Constructor: seq=%lld heads=%lld dim=%lld bias_elems=%lld\n",
-            (long long)seq_len_, (long long)num_heads_, (long long)head_dim_,
-            (long long)ov::shape_size(node->get_input_partial_shape(3).to_shape()));
+    seq_len_      = attn->get_seq_len();
+    num_heads_    = attn->get_num_heads();
+    head_dim_     = attn->get_head_dim();
+    combined_qkv_ = attn->is_combined_qkv();
+
+    // In combined QKV mode: inputs = [QKV_combined, attn_bias]
+    // In standard mode:     inputs = [Q, K, V, attn_bias]
+    const size_t bias_input_idx = combined_qkv_ ? 1 : 3;
+    fprintf(stderr, "[BertAttn] Constructor: seq=%lld heads=%lld dim=%lld combined_qkv=%d\n",
+            (long long)seq_len_, (long long)num_heads_, (long long)head_dim_, (int)combined_qkv_);
 
     const auto& props = context.device().props();
     std::string arch = props.gcnArchName;
     if (auto pos = arch.find(':'); pos != std::string::npos) arch = arch.substr(0, pos);
     int64_t num_cu = props.multiProcessorCount;
+
+    (void)bias_input_idx;  // suppress unused warning; used in Execute
 
     // Generate and compile MLIR
     const std::string mlir_src = make_mlir(seq_len_, num_heads_, head_dim_, num_cu, arch);
@@ -229,14 +235,28 @@ void BertSelfAttentionOp::Execute(const InferenceRequestContext& context,
                                    Inputs inputs,
                                    Outputs outputs,
                                    const Workbuffers&) const {
-    OPENVINO_ASSERT(inputs.size() == 4 && outputs.size() == 1);
-    // Kernel args: a0=q[seq*heads*dim], a1=k[seq*heads*dim], a2=v[seq*heads*dim],
-    //              a3=bias[seq*seq] (flat, broadcast over heads via affine_map), a4=out
-    void* q_ptr    = const_cast<void*>(inputs[0].get());
-    void* k_ptr    = const_cast<void*>(inputs[1].get());
-    void* v_ptr    = const_cast<void*>(inputs[2].get());
-    void* bias_ptr = const_cast<void*>(inputs[3].get());
-    void* out_ptr  = outputs[0].get();
+    void* q_ptr, * k_ptr, * v_ptr, * bias_ptr;
+
+    if (combined_qkv_) {
+        // Combined QKV mode: inputs[0] = QKV_combined[seq, 3*hidden], inputs[1] = bias
+        // Q at offset 0, K at offset seq*hidden, V at offset 2*seq*hidden (in f16)
+        OPENVINO_ASSERT(inputs.size() == 2 && outputs.size() == 1);
+        const size_t hidden_bytes = (size_t)seq_len_ * num_heads_ * head_dim_ * sizeof(__half);
+        char* qkv = static_cast<char*>(const_cast<void*>(inputs[0].get()));
+        q_ptr    = qkv;
+        k_ptr    = qkv + hidden_bytes;
+        v_ptr    = qkv + 2 * hidden_bytes;
+        bias_ptr = const_cast<void*>(inputs[1].get());
+    } else {
+        // Standard mode: inputs[0..2] = Q, K, V; inputs[3] = bias
+        OPENVINO_ASSERT(inputs.size() == 4 && outputs.size() == 1);
+        q_ptr    = const_cast<void*>(inputs[0].get());
+        k_ptr    = const_cast<void*>(inputs[1].get());
+        v_ptr    = const_cast<void*>(inputs[2].get());
+        bias_ptr = const_cast<void*>(inputs[3].get());
+    }
+
+    void* out_ptr = outputs[0].get();
 
     void* args[] = { &q_ptr, &k_ptr, &v_ptr, &bias_ptr, &out_ptr };
     hipError_t err = hipModuleLaunchKernel(

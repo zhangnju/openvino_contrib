@@ -53,6 +53,9 @@
 #include "transformer/fused_layernorm_pass.hpp"
 #include "transformer/fused_fc_gelu_pass.hpp"
 #include "transformer/fused_masked_softmax_pass.hpp"
+#include "transformer/force_f16_matmul_pass.hpp"
+#include "transformer/fused_qkv_pass.hpp"
+#include "transformer/dead_code_elimination.hpp"
 
 using namespace ov::rocm_gpu;
 
@@ -193,29 +196,60 @@ void GraphTransformer::transform(const rocm::Device& device,
     // MUST run AFTER FullyConnectedTransformation: needs FC nodes to identify Q/K/V.
     pass_manager.register_pass<ov::rocm_gpu::pass::BertSelfAttentionFusion>();
 
+    // Fuse Q+K+V FullyConnected projections into a single 256×2304×768 hipBLASLt GEMM+bias.
+    // Runs AFTER BertSelfAttentionFusion: detects BertSelfAttention nodes whose Q/K/V inputs
+    // share the same FC input x, then merges them into FusedQKVProjection.
+    // BertSelfAttentionOp reads Q, K, V via ptr+offset — no D2D copy overhead.
+    pass_manager.register_pass<ov::rocm_gpu::pass::FusedQKVProjectionPass>();
+
     // Fuse Add(scores, mask) + Softmax into a single kernel for non-attention softmaxes.
     // Runs AFTER BertSelfAttentionFusion to avoid consuming Softmax nodes needed for attention.
     // Must run BEFORE ElementwiseFusionPass which might absorb the mask Add.
     pass_manager.register_pass<ov::rocm_gpu::pass::FusedMaskedSoftmaxPass>();
 
-    // Fuse FC+GELU pairs: FullyConnected → Gelu → FusedFCGELU kernel.
-    // Must run BEFORE ElementwiseFusionPass which absorbs Gelu into chains.
-    // Run AFTER FullyConnectedTransformation so FC nodes exist.
+    // Fuse FC+GELU pairs into FusedFCGELU (hipBLASLt GEMM+bias+GELU single kernel).
+    // Matches: (A) explicit ov::op::v7/v0::Gelu after FullyConnected
+    //          (B) TF-style tanh GELU decomposition (Pow→Mul→Add→Mul→Tanh→Add→Mul→Mul)
+    // Must run BEFORE ElementwiseFusionPass (which absorbs elementwise ops into chains).
+    // Run AFTER FullyConnectedTransformation (FC nodes must exist).
     pass_manager.register_pass<ov::rocm_gpu::pass::FusedFCGELUPass>();
+    // Clean up dead intermediate nodes left by TF-style GELU pattern replacement
+    // (Pow, Mul, Add, Tanh nodes become unreachable after FusedFCGELU replaces final_mul)
+    pass_manager.register_pass<ov::pass::NopElimination>();
 
     // Fuse TF-style pre-folded LayerNorm (after attention fusion so graph structure is stable).
     pass_manager.register_pass<ov::rocm_gpu::pass::LayerNormFusionPass>();
 
-    // Upgrade LayerNorm nodes to fused LayerNorm+Residual native HIP kernel.
-    // Detects: Add(x, skip) → LayerNorm → FusedLayerNorm(x, skip, gamma, beta)
-    // Run AFTER LayerNormFusionPass (which creates the LayerNorm nodes we match on).
+    // Clean up identity/no-op nodes after LayerNormFusionPass.
+    pass_manager.register_pass<ov::pass::NopElimination>();
+
+    // pass_manager.register_pass<ov::rocm_gpu::pass::RocmDCE>();
+
+    // Upgrade LayerNorm nodes to FusedLayerNorm (native f16 HIP kernel).
+    // Uses Welford online algorithm for single-pass mean+variance computation.
     pass_manager.register_pass<ov::rocm_gpu::pass::FusedLayerNormPass>();
 
-    // After LayerNormFusion, downstream f32 ops may now receive f16 from LayerNorm output.
-    // Re-run RemoveRedundantConvert to eliminate the f16→f32 converts that ConvertPrecision
-    // had inserted around ops that needed f32 inputs (before LayerNorm returned f16).
-    // This is what causes 25 FusedElementwise ops to run in f32 unnecessarily.
+    // Force MatMul/FullyConnected outputs to f16 when both inputs are f16.
+    // ConvertPrecision keeps MatMul outputs as f32 for accumulation accuracy, which
+    // inserts Convert(f32→f16) downstream and causes FusedElementwise to run in f32.
+    // Using TypeRelaxed<MatMul> with f16 output type makes those Converts no-ops,
+    // eliminated by the subsequent RemoveRedundantConvert pass.
+    // Trade-off: f32 accumulation → f16 writeback (same as MIGraphX --fp16 behavior).
+    pass_manager.register_pass<ov::rocm_gpu::pass::ForceF16MatMulOutput>();
+
+    // Re-run RemoveRedundantConvert after ForceF16MatMulOutput changes output types.
+    // This eliminates Convert(f16→f16) no-ops and Convert(f32→f16) that now receive f16.
     pass_manager.register_pass<ov::rocm_gpu::pass::RemoveRedundantConvertTransformation>();
+
+    // Eliminate Convert(f16→f32) "decompression" nodes that widen f16 MatMul outputs
+    // back to f32. Without this, FusedElementwise sees f32 primary inputs and runs
+    // the f32 kernel (2x bandwidth, 2x slower). Must run BEFORE ElementwiseFusionPass.
+    if (downscale_precision()) {
+        pass_manager.register_pass<ov::rocm_gpu::pass::EliminateF16ToF32Convert>();
+        // Re-run RemoveRedundantConvert to clean up any Convert(f16->f16) no-ops
+        // that may appear after type changes.
+        pass_manager.register_pass<ov::rocm_gpu::pass::RemoveRedundantConvertTransformation>();
+    }
 
     // Fuse chains of elementwise ops (Swish, Mul, Add, Sigmoid, etc.) into a single
     // FusedElementwise kernel launch. Run AFTER conv fusion (which handles Conv+SiLU)
