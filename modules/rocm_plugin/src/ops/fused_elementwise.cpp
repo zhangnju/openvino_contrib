@@ -127,21 +127,15 @@ void FusedElementwiseOp::Execute(const InferenceRequestContext& ctx,
     void* aux_ptrs_device = wbs.mutable_buffers[0].get();
 
     const size_t aux_bytes = chain_len_ * sizeof(void*);
-    bool ptrs_changed = true;
-    {
-        // Compare new ptrs with last uploaded (stored in a second pinned buffer half)
-        // We use the second half of the pinned buffer as a shadow copy.
-        // If pinned_buffers has a second slot, use it; otherwise always upload.
-        if (wbs.pinned_buffers.size() >= 2) {
-            void* shadow = wbs.pinned_buffers[1];
-            ptrs_changed = (std::memcmp(pinned, shadow, aux_bytes) != 0);
-            if (ptrs_changed) std::memcpy(shadow, pinned, aux_bytes);
-        }
-    }
-    if (ptrs_changed) {
-        hipMemcpyAsync(aux_ptrs_device, pinned, aux_bytes, hipMemcpyHostToDevice,
-                       ctx.getThreadContext().stream().get());
-    }
+    // NOTE: aux_ptrs_device is a MUTABLE workbuffer; OV's memory model may recycle
+    // this device region for other ops between inferences. The previous P3
+    // "skip H2D if unchanged" optimization assumed the device buffer kept its
+    // contents across inferences, which is false under buffer reuse — a skipped
+    // upload then leaves stale/garbage pointers on device, causing the
+    // fused_elementwise kernel to dereference bad addresses (GPU shader fault on
+    // the 2nd+ inference, observed on gfx1100). Always upload for correctness.
+    hipMemcpyAsync(aux_ptrs_device, pinned, aux_bytes, hipMemcpyHostToDevice,
+                   ctx.getThreadContext().stream().get());
 
     const uint8_t* ops_dev    = static_cast<const uint8_t*>(wbs.immutable_buffers[0].get());
     const float*   params_dev = static_cast<const float*>(wbs.immutable_buffers[1].get());
