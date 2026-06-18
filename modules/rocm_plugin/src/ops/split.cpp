@@ -46,7 +46,11 @@ SplitOp::SplitOp(const CreationContext& context,
     const auto element_type = input_element_type;
 
     auto& data_shape = splitOp->get_input_shape(0);
-    const int64_t axis = *axisNode->get_data_ptr<int64_t>();
+    // axis constant may be i32 or i64; cast_vector converts from the actual
+    // stored element type safely (raw get_data_ptr<int64_t> over-reads an i32 const).
+    const auto axis_values = axisNode->cast_vector<int64_t>();
+    OPENVINO_ASSERT(!axis_values.empty(), "Node name: ", GetName());
+    const int64_t axis = axis_values[0];
     OPENVINO_ASSERT(axis >= 0 && axis < data_shape.size(), "Node name: ", GetName());
     OPENVINO_ASSERT(data_shape[axis] % num_splits_ == 0, "Node name: ", GetName());
     const size_t split_step_size =
