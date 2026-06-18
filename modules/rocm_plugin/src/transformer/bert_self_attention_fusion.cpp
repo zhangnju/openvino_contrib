@@ -54,6 +54,7 @@ static std::shared_ptr<ov::Node> single_consumer(const std::shared_ptr<ov::Node>
     return ts.begin()->get_node()->shared_from_this();
 }
 
+
 // Trace from a FullyConnected/MatMul output back to the flat [seq, hidden] buffer.
 // Returns the FC/MatMul node if found within 2 hops.
 static std::shared_ptr<ov::Node> find_qkv_source(const std::shared_ptr<ov::Node>& transpose_node) {
@@ -259,6 +260,21 @@ bool BertSelfAttentionFusion::run_on_model(const std::shared_ptr<ov::Model>& mod
     }
 
     fprintf(stderr, "[BertAttnFuse] Running on %zu Softmax nodes\n", softmaxes.size());
+    if (!softmaxes.empty() && std::getenv("ATTN_DEBUG")) {
+        // Backward BFS dump from the first Softmax to reveal the INT8 attention structure.
+        auto sm0 = softmaxes.front();
+        fprintf(stderr, "[ATTN_DEBUG] backward from Softmax '%s'\n", sm0->get_friendly_name().c_str());
+        std::vector<std::pair<std::shared_ptr<ov::Node>,int>> st{{sm0,0}};
+        int printed = 0;
+        while (!st.empty() && printed < 40) {
+            auto [n,d] = st.back(); st.pop_back();
+            fprintf(stderr, "  d%-2d %-16s '%s'\n", d, n->get_type_name(), n->get_friendly_name().c_str());
+            ++printed;
+            if (d >= 12) continue;
+            for (size_t i=0;i<n->get_input_size();++i)
+                st.push_back({n->input_value(i).get_node_shared_ptr(), d+1});
+        }
+    }
     for (auto& sm : softmaxes) {
         try {
             auto info = match_attention(sm);

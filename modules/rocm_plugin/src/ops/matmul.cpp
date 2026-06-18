@@ -12,6 +12,8 @@
 #include <openvino/core/except.hpp>
 #include <openvino/op/constant.hpp>
 #include <openvino/op/matmul.hpp>
+#include <openvino/op/result.hpp>
+#include <openvino/core/model.hpp>
 #include <transformer/nodes/fully_connected.hpp>
 #include <utility>
 #include <atomic>
@@ -24,6 +26,33 @@
 
 #include "converters.hpp"
 #include "rocm/constant_factory.hpp"
+
+// Cast int32 → float16 for rocBLAS (which doesn't support i32×i32→i32 GEMM).
+// INT8-derived MatMul operands (A−zpA ∈ [−255,255], B ∈ [−127,127]) are exactly
+// representable in f16; the GEMM accumulates in f32, so this is numerically
+// identical to the f32-input path but runs on the much faster f16 tensor cores.
+static __global__ void cast_i32_to_f16(const int* __restrict__ src, __half* __restrict__ dst, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(static_cast<float>(src[i]));
+}
+static __global__ void cast_i32_to_f32(const int* __restrict__ src, float* __restrict__ dst, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = static_cast<float>(src[i]);
+}
+static __global__ void cast_f32_to_i32(const float* __restrict__ src, int* __restrict__ dst, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = static_cast<int>(rintf(src[i]));
+}
+
+// Verification/fallback switch: ROCM_I32_GEMM_PREC=f32 forces the legacy f32-input
+// GEMM path so the f16 path can be A/B compared. Default (unset) = f16.
+static bool i32GemmUseF16() {
+    static const bool v = [] {
+        const char* p = std::getenv("ROCM_I32_GEMM_PREC");
+        return !(p && std::string(p) == "f32");
+    }();
+    return v;
+}
 
 // ── rocBLAS GEMM solution-index cache ────────────────────────────────────────
 // When ROCM_TUNE_GEMM=1 is set, the first call to a new GEMM shape enumerates
@@ -55,9 +84,12 @@ struct GemmKeyHash {
 struct GemmCache {
     std::mutex mtx;
     std::unordered_map<GemmKey, rocblas_int, GemmKeyHash> best;
+    bool dirty_ = false;  // written since last save
 
     static GemmCache& instance() {
         static GemmCache g;
+        static bool loaded = false;
+        if (!loaded) { loaded = true; g.load(); }
         return g;
     }
 
@@ -71,7 +103,38 @@ struct GemmCache {
     void set(const GemmKey& key, rocblas_int sol) {
         std::lock_guard<std::mutex> lk(mtx);
         best[key] = sol;
+        dirty_ = true;
     }
+
+    // Load cache from file at ROCM_TUNE_GEMM_CACHE path (binary: N × (8 ints + 1 int sol))
+    void load() {
+        const char* path = std::getenv("ROCM_TUNE_GEMM_CACHE");
+        if (!path) return;
+        FILE* f = fopen(path, "rb");
+        if (!f) return;
+        GemmKey k;
+        rocblas_int sol;
+        while (fread(&k, sizeof(k), 1, f) == 1 && fread(&sol, sizeof(sol), 1, f) == 1)
+            best[k] = sol;
+        fclose(f);
+        fprintf(stderr, "[ROCM_TUNE_GEMM] Loaded %zu solutions from %s\n", best.size(), path);
+    }
+
+    void save() {
+        const char* path = std::getenv("ROCM_TUNE_GEMM_CACHE");
+        if (!path || !dirty_) return;
+        FILE* f = fopen(path, "wb");
+        if (!f) return;
+        for (const auto& [k, sol] : best) {
+            fwrite(&k, sizeof(k), 1, f);
+            fwrite(&sol, sizeof(sol), 1, f);
+        }
+        fclose(f);
+        dirty_ = false;
+        fprintf(stderr, "[ROCM_TUNE_GEMM] Saved %zu solutions to %s\n", best.size(), path);
+    }
+
+    ~GemmCache() { save(); }
 };
 
 // Tune a rocBLAS strided-batched GEMM and return the best solution_index.
@@ -190,7 +253,21 @@ MatMulOp::MatMulOp(const CreationContext& context,
                     "Node name: ",
                     GetName());
     data_type_ = convertDataType<hipDataType>(op.get_input_element_type(0));
-    compute_type_ = GetComputeType(data_type_, convertDataType<hipDataType>(op.get_output_element_type(0)));
+    auto out_dt = convertDataType<hipDataType>(op.get_output_element_type(0));
+    // rocBLAS does not support i32×i32→i32 GEMM. INT8-derived operands are small
+    // integers (A−zpA ∈ [−255,255], B ∈ [−127,127]) and exactly representable in
+    // f16. Cast A,B to f16 and accumulate in f32 — same result as f32 inputs but
+    // on the much faster f16 tensor cores. Output cast back to i32 at Execute time.
+    if (data_type_ == HIP_R_32I) {
+        needs_i32_cast_ = true;
+        data_type_ = i32GemmUseF16() ? HIP_R_16F : HIP_R_32F;
+        // If MatMulDequantConvertPass already retyped this MatMul's output to f32
+        // (eliminating the downstream Convert(i32->f32)), write the f32 GEMM result
+        // straight to the op output — skip the cast_f32_to_i32 round-trip entirely.
+        i32_out_is_f32_ = (op.get_output_element_type(0) == ov::element::f32);
+        out_dt = HIP_R_32F;
+    }
+    compute_type_ = GetComputeType(data_type_, out_dt);
     auto inputAShape = op.get_input_shape(0);
     auto inputBShape = op.get_input_shape(1);
     auto outputCShape = op.get_output_shape(0);
@@ -218,6 +295,98 @@ MatMulOp::MatMulOp(const CreationContext& context,
     stride_c_ = (m_ * n_);
     rocblas_transpose_a_ = transposeA ? rocblas_operation_transpose : rocblas_operation_none;
     rocblas_transpose_b_ = transposeB ? rocblas_operation_transpose : rocblas_operation_none;
+    if (needs_i32_cast_) {
+        i32_use_f16_ = i32GemmUseF16();
+        const size_t ab_elem = i32_use_f16_ ? sizeof(__half) : sizeof(float);
+        a_elems_ = ov::shape_size(op.get_input_shape(0));
+        b_elems_ = ov::shape_size(op.get_input_shape(1));
+        c_elems_ = ov::shape_size(op.get_output_shape(0));
+        auto err_a = hipMalloc(&d_a_ab_, a_elems_ * ab_elem);
+        OPENVINO_ASSERT(err_a == hipSuccess && d_a_ab_ != nullptr,
+            "hipMalloc failed for i32 GEMM A buffer: ", hipGetErrorString(err_a));
+        // When the output stays i32, the GEMM accumulates into a private f32 buffer
+        // then casts to i32. When the Convert was eliminated (output is f32), the
+        // GEMM writes straight to the op output and no scratch buffer is needed.
+        if (!i32_out_is_f32_) {
+            auto err_c = hipMalloc(&d_c_f32_, c_elems_ * sizeof(float));
+            OPENVINO_ASSERT(err_c == hipSuccess && d_c_f32_ != nullptr,
+                "hipMalloc failed for i32 GEMM f32 C buffer: ", hipGetErrorString(err_c));
+        }
+
+        // Try to pre-cast constant B (weight) at compile time — avoids cast kernel per inference.
+        // B is constant if its upstream subgraph consists only of Constant/Parameter-free ops.
+        // Quantized weight subgraphs (DequantizeLinear → Convert/Subtract/Multiply/...)
+        // can be deeper than a handful of hops, so use a generous depth limit. Reaching
+        // a Parameter means genuinely dynamic → not const. Empty-input nodes that aren't
+        // Constant (shouldn't happen for a pure const subgraph) → treat as non-const.
+        auto is_const_subgraph = [](const auto& self, const ov::Node* n, int depth) -> bool {
+            if (n->get_type_name() == std::string("Constant")) return true;
+            if (n->get_type_name() == std::string("Parameter"))  return false;
+            if (depth > 32) return false;
+            if (n->get_input_size() == 0) return false;
+            for (size_t i = 0; i < n->get_input_size(); ++i)
+                if (!self(self, n->input(i).get_source_output().get_node_shared_ptr().get(), depth + 1))
+                    return false;
+            return true;
+        };
+        const auto* b_node = op.get_input_node_ptr(1);
+        b_is_const_ = is_const_subgraph(is_const_subgraph, b_node, 0);
+        if (std::getenv("ROCM_I32_NO_CONST_B")) b_is_const_ = false;  // bisect: force runtime cast
+        if (std::getenv("ROCM_I32_DEBUG")) {
+            auto bshape = op.get_input_shape(1);
+            std::string sh; for (auto d : bshape) sh += std::to_string(d) + ",";
+            fprintf(stderr, "[Bsrc] %s B_node=%s shape=[%s] b_elems=%zu bConst=%d\n",
+                    GetName().c_str(), b_node->get_type_name(), sh.c_str(), b_elems_, (int)b_is_const_);
+            fflush(stderr);
+        }
+
+        hipMalloc(&d_b_ab_, b_elems_ * ab_elem);
+        if (b_is_const_) {
+            // Materialize B's i32 values on host, cast to f16/f32, upload once (permanent).
+            // PREFER reading a direct Constant node via cast_vector (no evaluate()):
+            // these weights are commonly a folded Constant, and Model::evaluate() can
+            // THROW on this build (missing CPU-reference for some op) — that throw was
+            // silently turning b_is_const_ off and forcing a runtime cast that read B
+            // out of bounds → GPU fault/hang. Fall back to evaluate() only for deeper
+            // const subgraphs; verify size == b_elems_ before use.
+            bool precast_ok = false;
+            try {
+                std::vector<int32_t> bvals;
+                if (auto bc = dynamic_cast<const ov::op::v0::Constant*>(b_node)) {
+                    bvals = bc->cast_vector<int32_t>();   // direct constant, no evaluate
+                } else {
+                    ov::TensorVector out_tensors;  // empty — evaluate allocates
+                    auto b_model_output = std::make_shared<ov::op::v0::Result>(op.input_value(1));
+                    auto b_subgraph = std::make_shared<ov::Model>(ov::ResultVector{b_model_output},
+                                                                  ov::ParameterVector{});
+                    if (b_subgraph->evaluate(out_tensors, {}) && out_tensors.size() == 1 &&
+                        out_tensors[0].get_element_type() == ov::element::i32) {
+                        const int32_t* p = out_tensors[0].data<int32_t>();
+                        bvals.assign(p, p + out_tensors[0].get_size());
+                    }
+                }
+                if (std::getenv("ROCM_I32_DEBUG")) {
+                    fprintf(stderr, "[precast] %s got=%zu expect=%zu\n",
+                            GetName().c_str(), bvals.size(), b_elems_); fflush(stderr);
+                }
+                if (bvals.size() == b_elems_) {
+                    if (i32_use_f16_) {
+                        std::vector<__half> b_f16(b_elems_);
+                        for (size_t i = 0; i < b_elems_; ++i) b_f16[i] = __float2half(static_cast<float>(bvals[i]));
+                        precast_ok = (hipMemcpy(d_b_ab_, b_f16.data(), b_elems_ * sizeof(__half),
+                                                hipMemcpyHostToDevice) == hipSuccess);
+                    } else {
+                        std::vector<float> b_f32(b_elems_);
+                        for (size_t i = 0; i < b_elems_; ++i) b_f32[i] = static_cast<float>(bvals[i]);
+                        precast_ok = (hipMemcpy(d_b_ab_, b_f32.data(), b_elems_ * sizeof(float),
+                                                hipMemcpyHostToDevice) == hipSuccess);
+                    }
+                }
+            } catch (...) { precast_ok = false; }
+            if (!precast_ok) b_is_const_ = false;  // fall back: cast B at Execute time
+        }
+        // else: B is dynamic — buffer allocated, cast at Execute time
+    }
 
     // TODO: Read GEMM stride overrides from rt_info when BertAttentionTransposeFusion is ready.
     if constexpr (std::is_same_v<TOperation, nodes::FullyConnected>) {
@@ -232,6 +401,11 @@ MatMulOp::MatMulOp(const CreationContext& context,
     OPENVINO_ASSERT(ld_b_ != 0, "Node name: ", GetName());
     OPENVINO_ASSERT(ld_c_ != 0, "Node name: ", GetName());
     OPENVINO_ASSERT(batch_count_ != 0, "Node name: ", GetName());
+
+    // For the i32 GEMM (cast to f16), route through hipBLASLt to avoid a rocBLAS
+    // gemm_strided_batched_ex GPU hang on gfx1201 for certain shapes.
+    if (needs_i32_cast_ && i32_use_f16_)
+        setup_hipblaslt_i32();
 }
 template MatMulOp::MatMulOp(const CreationContext& context,
                             const ov::op::v0::MatMul&,
@@ -241,6 +415,79 @@ template MatMulOp::MatMulOp(const CreationContext& context,
                             const nodes::FullyConnected&,
                             IndexCollection&&,
                             IndexCollection&&);
+
+// Set up a hipBLASLt matmul for the i32 (cast-to-f16) GEMM. Mirrors the col-major
+// convention used elsewhere: rocBLAS computes Ct[N,M] = Bt[N,K] × At[K,M], i.e. the
+// hipBLASLt "A" operand is our B (f16, ldB, transB), "B" operand is our A (f16, ldA,
+// transA), output C is f32 (ldC). Batched dims use BATCH_COUNT + STRIDED_BATCH_OFFSET.
+void MatMulOp::setup_hipblaslt_i32() {
+    do {
+        if (hipblasLtCreate(&lt_handle_) != HIPBLAS_STATUS_SUCCESS) break;
+        if (hipblasLtMatmulDescCreate(&lt_desc_, HIPBLAS_COMPUTE_32F, HIP_R_32F)
+                != HIPBLAS_STATUS_SUCCESS) break;
+
+        // transa applies to our B operand, transb to our A operand (col-major swap).
+        hipblasOperation_t ta = (rocblas_transpose_b_ == rocblas_operation_transpose)
+                                    ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+        hipblasOperation_t tb = (rocblas_transpose_a_ == rocblas_operation_transpose)
+                                    ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+        hipblasLtMatmulDescSetAttribute(lt_desc_, HIPBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta));
+        hipblasLtMatmulDescSetAttribute(lt_desc_, HIPBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb));
+
+        // Layouts: B(f16) as "A": rows=n_, cols=k_, ld=ld_b_; A(f16) as "B": rows=k_,
+        // cols=m_, ld=ld_a_; C(f32): rows=n_, cols=m_, ld=ld_c_. For transposed
+        // operands the layout's (rows,cols) is the physical storage, ld stays.
+        auto mk = [](hipblasLtMatrixLayout_t& L, hipDataType dt, int rows, int cols, int ld,
+                     hipblasOperation_t tr) -> bool {
+            int r = (tr == HIPBLAS_OP_T) ? cols : rows;
+            int c = (tr == HIPBLAS_OP_T) ? rows : cols;
+            return hipblasLtMatrixLayoutCreate(&L, dt, r, c, ld) == HIPBLAS_STATUS_SUCCESS;
+        };
+        if (!mk(lt_lb_, HIP_R_16F, n_, k_, ld_b_, ta)) break;
+        if (!mk(lt_la_, HIP_R_16F, k_, m_, ld_a_, tb)) break;
+        if (hipblasLtMatrixLayoutCreate(&lt_lc_, HIP_R_32F, n_, m_, ld_c_)
+                != HIPBLAS_STATUS_SUCCESS) break;
+
+        if (batch_count_ > 1) {
+            int32_t bc = batch_count_;
+            int64_t sB = stride_b_, sA = stride_a_, sC = stride_c_;
+            for (auto L : {lt_lb_, lt_la_, lt_lc_})
+                hipblasLtMatrixLayoutSetAttribute(L, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                                                  &bc, sizeof(bc));
+            hipblasLtMatrixLayoutSetAttribute(lt_lb_,
+                HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &sB, sizeof(sB));
+            hipblasLtMatrixLayoutSetAttribute(lt_la_,
+                HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &sA, sizeof(sA));
+            hipblasLtMatrixLayoutSetAttribute(lt_lc_,
+                HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &sC, sizeof(sC));
+        }
+
+        hipblasLtMatmulPreference_t pref;
+        hipblasLtMatmulPreferenceCreate(&pref);
+        lt_workspace_bytes_ = 32 * 1024 * 1024;
+        hipblasLtMatmulPreferenceSetAttribute(pref,
+            HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &lt_workspace_bytes_, sizeof(lt_workspace_bytes_));
+
+        hipblasLtMatmulHeuristicResult_t result;
+        int returned = 0;
+        auto st = hipblasLtMatmulAlgoGetHeuristic(lt_handle_, lt_desc_,
+            lt_lb_, lt_la_, lt_lc_, lt_lc_, pref, 1, &result, &returned);
+        hipblasLtMatmulPreferenceDestroy(pref);
+        if (st != HIPBLAS_STATUS_SUCCESS || returned == 0) break;
+        lt_algo_ = result.algo;
+        if (lt_workspace_bytes_ > 0) hipMalloc(&lt_workspace_, lt_workspace_bytes_);
+
+        use_lt_i32_ = true;
+        if (std::getenv("ROCM_I32_DEBUG"))
+            fprintf(stderr, "[i32 hipBLASLt] %s m=%d n=%d k=%d batch=%d OK\n",
+                    GetName().c_str(), m_, n_, k_, batch_count_);
+    } while (false);
+
+    if (!use_lt_i32_ && std::getenv("ROCM_I32_DEBUG"))
+        fprintf(stderr, "[i32 hipBLASLt] %s setup FAILED — falling back to rocBLAS\n",
+                GetName().c_str());
+}
 
 hipDataType MatMulOp::GetComputeType(const hipDataType abDataType, const hipDataType cDataType) {
     constexpr auto SwitchCase = [](hipDataType a, hipDataType b) constexpr { return (a << 16) + b; };
@@ -252,7 +499,8 @@ hipDataType MatMulOp::GetComputeType(const hipDataType abDataType, const hipData
         case SwitchCase(HIP_R_16F, HIP_R_16F): {
             return HIP_R_16F;
         }
-        case SwitchCase(HIP_R_8I, HIP_R_32I): {
+        case SwitchCase(HIP_R_8I, HIP_R_32I):
+        case SwitchCase(HIP_R_32I, HIP_R_32I): {
             return HIP_R_32I;
         }
 #ifdef rocm_HAS_BF16_TYPE
@@ -352,6 +600,54 @@ void MatMulOp::Execute(const InferenceRequestContext& context,
     auto matrixA = inputs[0];
     auto matrixB = inputs[1];
     auto matrixC = outputs[0];
+    const auto& stream = context.getThreadContext().stream();
+
+    if (needs_i32_cast_ && std::getenv("ROCM_I32_DEBUG")) {
+        static int idx = 0;
+        fprintf(stderr, "[i32MM #%d] %s m=%d n=%d k=%d batch=%d ldA=%d ldB=%d ldC=%d "
+                "strideA=%lld strideB=%lld strideC=%lld a_elems=%zu b_elems=%zu c_elems=%zu f16=%d bConst=%d\n",
+                idx++, GetName().c_str(), m_, n_, k_, batch_count_, ld_a_, ld_b_, ld_c_,
+                (long long)stride_a_, (long long)stride_b_, (long long)stride_c_,
+                a_elems_, b_elems_, c_elems_, (int)i32_use_f16_, (int)b_is_const_);
+        hipStreamSynchronize(stream.get());
+    }
+
+    // For i32 GEMM: cast i32→f16/f32 (A,B) using pre-allocated device buffers, run an
+    // f32-accumulate GEMM into d_c_f32_, then cast the f32 result back to i32.
+    if (needs_i32_cast_) {
+        constexpr unsigned kBlock = 256;
+        auto cast_a = [&](size_t n, const void* src, void* dst) {
+            const unsigned g = (n + kBlock - 1) / kBlock;
+            if (i32_use_f16_)
+                cast_i32_to_f16<<<g, kBlock, 0, stream.get()>>>((const int*)src, (__half*)dst, n);
+            else
+                cast_i32_to_f32<<<g, kBlock, 0, stream.get()>>>((const int*)src, (float*)dst, n);
+        };
+        if (std::getenv("ROCM_I32_DEBUG")) {
+            fprintf(stderr, "[i32 pre-castA] %s A=%p a_elems=%zu d_a=%p\n",
+                    GetName().c_str(), matrixA.get(), a_elems_, d_a_ab_); fflush(stderr);
+        }
+        cast_a(a_elems_, matrixA.get(), d_a_ab_);
+        if (std::getenv("ROCM_I32_DEBUG")) {
+            auto e = hipStreamSynchronize(stream.get());
+            fprintf(stderr, "[i32 castA done] %s %s\n", GetName().c_str(),
+                    e==hipSuccess?"OK":hipGetErrorString(e)); fflush(stderr);
+        }
+        if (!b_is_const_) cast_a(b_elems_, matrixB.get(), d_b_ab_);
+        // b_is_const_: d_b_ab_ pre-loaded at compile time, skip cast
+    }
+
+    if (needs_i32_cast_ && std::getenv("ROCM_I32_DEBUG")) {
+        auto e = hipStreamSynchronize(stream.get());
+        fprintf(stderr, "[i32 cast-AB done] %s %s\n", GetName().c_str(),
+                e == hipSuccess ? "OK" : hipGetErrorString(e)); fflush(stderr);
+    }
+
+    const void* pA = needs_i32_cast_ ? (const void*)d_a_ab_ : matrixA.get();
+    const void* pB = needs_i32_cast_ ? (const void*)d_b_ab_ : matrixB.get();
+    // i32 path normally accumulates into d_c_f32_ then casts to i32. If the output
+    // was retyped to f32 (Convert eliminated), write the f32 result to matrixC directly.
+    void*       pC = (needs_i32_cast_ && !i32_out_is_f32_) ? (void*)d_c_f32_ : matrixC.get();
 
     // Map hipDataType → rocblas_datatype
     auto to_rocblas_dt = [](hipDataType dt) -> rocblas_datatype {
@@ -360,10 +656,13 @@ void MatMulOp::Execute(const InferenceRequestContext& context,
             case HIP_R_32F: return rocblas_datatype_f32_r;
             case HIP_R_64F: return rocblas_datatype_f64_r;
             case HIP_R_8I:  return rocblas_datatype_i8_r;
+            case HIP_R_32I: return rocblas_datatype_i32_r;
             default:        return rocblas_datatype_f32_r;
         }
     };
     const rocblas_datatype dt = to_rocblas_dt(data_type_);
+    // C/D datatype: for the i32 path A,B are f16 but C accumulates in f32; otherwise C == A,B type.
+    const rocblas_datatype dt_c = needs_i32_cast_ ? rocblas_datatype_f32_r : dt;
     const rocblas_datatype ct = to_rocblas_dt(compute_type_);
     const void* alpha_ptr = &rocm::NumericConst<rocm::constants::one>(compute_type_);
 
@@ -372,7 +671,7 @@ void MatMulOp::Execute(const InferenceRequestContext& context,
     rocblas_gemm_algo algo = rocblas_gemm_algo_standard;
     rocblas_int sol = 0;
 
-    if (gemmTuningEnabled()) {
+    if (gemmTuningEnabled() && !needs_i32_cast_) {
         GemmKey key{n_, m_, k_, batch_count_,
                     (int)rocblas_transpose_b_, (int)rocblas_transpose_a_,
                     (int)dt, (int)ct};
@@ -393,24 +692,48 @@ void MatMulOp::Execute(const InferenceRequestContext& context,
         algo = rocblas_gemm_algo_solution_index;
     }
 
-    throwIfError(rocblas_gemm_strided_batched_ex(
-        RocBlasHandle.get(),
-        rocblas_transpose_b_,   // transa for Bt
-        rocblas_transpose_a_,   // transb for At
-        n_,                     // m  (rows of Bt / Ct)
-        m_,                     // n  (cols of At / Ct)
-        k_,                     // k  (inner dimension)
-        alpha_ptr,
-        matrixB.get(), dt, ld_b_, stride_b_,  // B (acts as A in col-major call)
-        matrixA.get(), dt, ld_a_, stride_a_,  // A (acts as B in col-major call)
-        beta_,
-        matrixC.get(), dt, ld_c_, stride_c_,  // C
-        matrixC.get(), dt, ld_c_, stride_c_,  // D (same as C for in-place)
-        batch_count_,
-        ct,
-        algo,
-        sol,
-        0)); // flags
+    if (use_lt_i32_) {
+        // hipBLASLt path for the i32 (cast-to-f16) GEMM — avoids the rocBLAS hang.
+        // f32 alpha/beta (compute type is f32); C accumulates in f32 (d_c_f32_).
+        const float lt_alpha = 1.0f, lt_beta = 0.0f;
+        auto st = hipblasLtMatmul(lt_handle_, lt_desc_, &lt_alpha,
+            pB, lt_lb_, pA, lt_la_, &lt_beta,
+            pC, lt_lc_, pC, lt_lc_,
+            &lt_algo_, lt_workspace_, lt_workspace_bytes_, stream.get());
+        OPENVINO_ASSERT(st == HIPBLAS_STATUS_SUCCESS,
+            "hipBLASLt i32 GEMM failed, status=", (int)st, ", node: ", GetName());
+    } else {
+        throwIfError(rocblas_gemm_strided_batched_ex(
+            RocBlasHandle.get(),
+            rocblas_transpose_b_,   // transa for Bt
+            rocblas_transpose_a_,   // transb for At
+            n_,                     // m  (rows of Bt / Ct)
+            m_,                     // n  (cols of At / Ct)
+            k_,                     // k  (inner dimension)
+            alpha_ptr,
+            pB, dt, ld_b_, stride_b_,  // B (acts as A in col-major call)
+            pA, dt, ld_a_, stride_a_,  // A (acts as B in col-major call)
+            beta_,
+            pC, dt_c, ld_c_, stride_c_,  // C
+            pC, dt_c, ld_c_, stride_c_,  // D (same as C for in-place)
+            batch_count_,
+            ct,
+            algo,
+            sol,
+            0)); // flags
+    }
+
+    if (needs_i32_cast_ && !i32_out_is_f32_) {
+        constexpr unsigned kBlock = 256;
+        cast_f32_to_i32<<<(c_elems_ + kBlock - 1) / kBlock, kBlock, 0, stream.get()>>>(
+            d_c_f32_, (int*)matrixC.get(), c_elems_);
+    }
+
+    if (needs_i32_cast_ && std::getenv("ROCM_I32_DEBUG")) {
+        auto e = hipStreamSynchronize(stream.get());
+        fprintf(stderr, "[i32MM DONE] %s sync=%s\n", GetName().c_str(),
+                e == hipSuccess ? "OK" : hipGetErrorString(e));
+    }
 }
 
 rocmGraphCompatibility MatMulOp::GetrocmGraphCompatibility() const { return rocmGraphCompatibility::FULL; }

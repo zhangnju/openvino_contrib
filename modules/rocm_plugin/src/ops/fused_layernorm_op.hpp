@@ -7,6 +7,7 @@
 #include <rocm_operation_base.hpp>
 #include <transformer/nodes/fused_layernorm_node.hpp>
 #include "kernels/fused_reduce.hpp"
+#include "kernels/layer_norm.hpp"
 #include <memory>
 
 namespace ov {
@@ -39,6 +40,7 @@ private:
     bool  has_bias_{false};      // LN beta parameter (always true)
     bool  has_residual_{false};  // has skip/residual input
     bool  has_add_bias_{false};  // 3-input mode: has additive bias constant
+    bool  is_f32_{false};        // input is f32 (INT8 model dequant path) → fp16 JIT/fallback unusable
     std::shared_ptr<LNKernel> jit_kernel_;  // hipRTC JIT kernel (nullptr = use fallback)
 };
 

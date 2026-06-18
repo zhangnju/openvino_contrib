@@ -45,6 +45,7 @@
 #include "transformations/common_optimizations/reshape_prelu.hpp"
 #include "transformer/rocmlir_conv_decompose_transformation.hpp"
 #include "transformer/elementwise_fusion_transformation.hpp"
+#include "transformer/quantize_convert_elision_pass.hpp"
 #include "transformer/variadic_split_zero_copy.hpp"
 #include "transformer/rocm_attention_fusion.hpp"
 #include "transformer/layer_norm_fusion.hpp"
@@ -56,6 +57,7 @@
 #include "transformer/force_f16_matmul_pass.hpp"
 #include "transformer/fused_qkv_pass.hpp"
 #include "transformer/dead_code_elimination.hpp"
+#include "transformer/dynamic_quantize_fusion_pass.hpp"
 
 using namespace ov::rocm_gpu;
 
@@ -64,6 +66,22 @@ void GraphTransformer::transform(const rocm::Device& device,
                                  const Configuration& config) const {
     auto inference_precision = config.get_inference_precision();
     if (inference_precision == ov::element::f16 && !isHalfSupported(device)) {
+        inference_precision = ov::element::f32;
+    }
+
+    // For INT8 quantized models, do not downscale f32→f16: the quantization path
+    // uses f32 for scale/bias nodes (Round, Maximum, Minimum, Gather) whose HIP
+    // kernels don't support f16.  Force f32 inference precision in this case.
+    bool has_int8_matmul = false;
+    for (const auto& node : model->get_ordered_ops()) {
+        if (node->get_type_name() == std::string("MatMul") &&
+            (node->get_input_element_type(0) == ov::element::i8 ||
+             node->get_input_element_type(0) == ov::element::i32)) {
+            has_int8_matmul = true;
+            break;
+        }
+    }
+    if (has_int8_matmul && inference_precision == ov::element::f16) {
         inference_precision = ov::element::f32;
     }
 
@@ -125,6 +143,11 @@ void GraphTransformer::transform(const rocm::Device& device,
     pass_manager.register_pass<ov::pass::ConvertPrecision>(fp_convert_precision_map, empty_fuse_map, true, false);
     pass_manager.register_pass<ov::pass::CommonOptimizations>();
     pass_manager.register_pass<ov::pass::ReshapePRelu>();
+    // Fuse the onnx DynamicQuantizeLinear decomposition (ReduceMin/Max/Sub/Div/
+    // Round/Clamp/Convert → single nodes::DynamicQuantize) for INT8 models.
+    // Gated by env (default ON); set ROCM_DISABLE_DQL_FUSION=1 to bisect crashes.
+    if (!std::getenv("ROCM_DISABLE_DQL_FUSION"))
+        pass_manager.register_pass<ov::rocm_gpu::pass::DynamicQuantizeFusionPass>();
     // Do we actually need this transformations in plugin?
     // Having duplicated results seems to be rare case in real world.
     // But currently it affects the rocmInferRequest which implementation
@@ -258,6 +281,12 @@ void GraphTransformer::transform(const rocm::Device& device,
     // NOTE: ElementwiseFusionPass correctly handles pe(V) Add nodes (attention pe Add) via
     // a fixed aux-input calculation for binary-op chain roots.
     pass_manager.register_pass<ov::rocm_gpu::pass::ElementwiseFusionPass>();
+
+    // Elide the redundant u8 round-trip in the INT8 activation-quantize epilogue:
+    // Round+Clamp(0,255) already produce integer-valued f32, so Convert(f32->u8)->
+    // Convert(u8->f32) is a no-op and Convert(u8->i32) == Convert(f32->i32). The
+    // GEMM casts i32 operands to f16 anyway, so the u8 intermediate is pure overhead.
+    pass_manager.register_pass<ov::rocm_gpu::pass::QuantizeConvertElisionPass>();
 
     // Fuse Attention MatMul patterns (Reshape+Split+Transpose+MatMul) via MIGraphX MLIR.
     // Replaces rocBLAS Q*K^T (0.644ms/iter) with fused kernel (0.020ms/iter) = 32× speedup.

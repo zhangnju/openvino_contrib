@@ -31,6 +31,9 @@ enum class FusedEwOp : uint8_t {
     Mul         = 14,
     Div         = 15,
     LeakyRelu   = 16,  // param = alpha
+    Round       = 17,  // round-half-to-even
+    Clamp       = 18,  // clamp to [param_min, param_max]; param = min, param2 = max
+    Cast        = 19,  // dtype cast (no-op in kernel: primary already read as float)
 };
 
 static constexpr int kFusedEwMaxChain = 16;
@@ -41,6 +44,11 @@ static constexpr int kFusedEwMaxChain = 16;
 // params_device: float parameters per op (0.0f if unused), length = chain_len
 // aux_ptrs_device: device pointer to array of device pointers (const void*[chain_len])
 //                  aux_ptrs_device[s] == nullptr for unary ops
+// ops_device: each byte = FusedEwOp kind in the low 7 bits; bit 7 set means the
+//             step's aux tensor is a 1-element scalar → broadcast (read aux[0]).
+// prim_is_i32: primary input tensor is int32 (a Convert(i32->f32) chain head); the
+//              kernel reads it as int32 and converts to float on load. aux/out stay
+//              f32/f16 per is_fp16. Mutually exclusive with is_fp16.
 void launch_fused_elementwise(
     const void* primary_in,
     const void* const* aux_ptrs_device,
@@ -50,6 +58,7 @@ void launch_fused_elementwise(
     const float* params_device,
     int chain_len,
     bool is_fp16,
+    bool prim_is_i32,
     hipStream_t stream);
 
 }  // namespace kernel

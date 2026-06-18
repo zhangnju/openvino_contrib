@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <hip/hip_fp16.h>
+#include <hipblaslt/hipblaslt.h>
 #include <rocm/device_pointers.hpp>
 #include <rocm_operation_base.hpp>
 #include <transformer/nodes/fully_connected.hpp>
@@ -75,6 +77,18 @@ private:
 
     hipDataType data_type_ = hipDataType::HIP_R_32F;
     hipDataType compute_type_ = hipDataType::HIP_R_32F;
+    bool needs_i32_cast_ = false;  // i32 inputs cast to f16/f32 (A,B) + f32 accumulate (C) for rocBLAS
+    bool i32_use_f16_    = true;   // cast i32 operands to f16 (fast) vs f32 (legacy/verify)
+    bool i32_out_is_f32_ = false;  // output retyped to f32 (Convert eliminated) → GEMM writes matrixC directly, no cast back
+    bool b_is_const_     = false;  // B is constant — pre-cast at compile time, skip at Execute
+    size_t a_elems_ = 0;           // number of elements in A (for i32 cast)
+    size_t b_elems_ = 0;           // number of elements in B (for i32 cast)
+    size_t c_elems_ = 0;           // number of elements in C (for i32 cast)
+    // Pre-allocated device buffers for the i32 GEMM path. A,B are cast to f16 or f32
+    // (elem size = i32_use_f16_ ? 2 : 4); C always accumulates in f32.
+    mutable void*  d_a_ab_  = nullptr;
+    mutable void*  d_b_ab_  = nullptr;
+    mutable float* d_c_f32_ = nullptr;
     int m_ = 0;
     int k_ = 0;
     int n_ = 0;
@@ -88,6 +102,21 @@ private:
     const rocm::constants::AnyNumeric* beta_ = nullptr;
     rocblas_operation rocblas_transpose_a_ = rocblas_operation_none;
     rocblas_operation rocblas_transpose_b_ = rocblas_operation_none;
+
+    // ── hipBLASLt path for the i32 GEMM ──────────────────────────────────────
+    // rocBLAS's gemm_strided_batched_ex hangs on gfx1201 for some shapes (e.g.
+    // m=256,n=768,k=3072). hipBLASLt does not, so the i32 (cast-to-f16) GEMM runs
+    // through hipBLASLt. Set up at construction; falls back to rocBLAS if unavailable.
+    void setup_hipblaslt_i32();
+    bool                      use_lt_i32_{false};
+    mutable hipblasLtHandle_t lt_handle_{nullptr};
+    mutable hipblasLtMatmulDesc_t   lt_desc_{nullptr};
+    mutable hipblasLtMatrixLayout_t lt_lb_{nullptr};  // B (acts as col-major A)
+    mutable hipblasLtMatrixLayout_t lt_la_{nullptr};  // A (acts as col-major B)
+    mutable hipblasLtMatrixLayout_t lt_lc_{nullptr};  // C (f32)
+    mutable hipblasLtMatmulAlgo_t   lt_algo_{};
+    mutable void*  lt_workspace_{nullptr};
+    size_t lt_workspace_bytes_{0};
 };
 
 }  // namespace rocm_gpu

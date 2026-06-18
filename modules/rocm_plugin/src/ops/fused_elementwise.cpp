@@ -6,6 +6,8 @@
 #include "rocm/runtime.hpp"
 
 #include <cstring>
+#include <cstdlib>
+#include <cstdio>
 #include <openvino/core/except.hpp>
 #include <fmt/format.h>
 
@@ -30,6 +32,9 @@ FusedElementwiseOp::FusedElementwiseOp(
         "FusedElementwiseOp: chain length out of range: ", chain_len_);
 
     is_fp16_ = (node->get_input_element_type(0) == ov::element::f16);
+    // i32 primary input = the chain head is a Convert(i32->f32). The kernel reads
+    // the primary as int32 and converts to float on load; aux/out stay f32.
+    prim_is_i32_ = (node->get_input_element_type(0) == ov::element::i32);
 
     // Compute output element count
     const auto& shape = node->get_output_shape(0);
@@ -61,12 +66,43 @@ FusedElementwiseOp::FusedElementwiseOp(
         else if (s.op_type == "Multiply")   op_code = uint8_t(Op::Mul);
         else if (s.op_type == "Divide")     op_code = uint8_t(Op::Div);
         else if (s.op_type == "LeakyRelu")  { op_code = uint8_t(Op::LeakyRelu); param = s.param; }
+        else if (s.op_type == "Round")      op_code = uint8_t(Op::Round);
+        else if (s.op_type == "Clamp")      op_code = uint8_t(Op::Clamp);
+        else if (s.op_type == "Convert")    op_code = uint8_t(Op::Cast);
         else OPENVINO_THROW("FusedElementwiseOp: unknown op '", s.op_type, "'");
 
         host_ops_.push_back(op_code);
         host_params_.push_back(param);
         step_has_aux_.push_back(s.has_aux);
         if (s.has_aux) num_aux_++;
+    }
+
+    // Determine, per step, how its aux input must be indexed by the kernel:
+    //   * scalar (1 element)            → read aux[0]      → ops bit 7
+    //   * last-dim/per-channel [C]      → read aux[i % C]  → ops bit 6, C in params
+    //   * full (== output element count)→ read aux[i]      → no flag
+    // Aux inputs are appended to the node inputs in chain order (input 0 = primary).
+    // The flags are packed into the high bits of the ops byte (op codes are < 32).
+    const auto& out_shape = node->get_output_shape(0);
+    const size_t channel = out_shape.empty() ? 1 : out_shape.back();
+    host_aux_scalar_.assign(chain_len_, 0);
+    {
+        int aux_in = 1;
+        for (int s = 0; s < chain_len_; ++s) {
+            if (!step_has_aux_[s]) continue;
+            if (aux_in < static_cast<int>(node->get_input_size())) {
+                const auto& aux_shape = node->get_input_shape(aux_in);
+                size_t aux_elems = 1;
+                for (auto d : aux_shape) aux_elems *= d;
+                if (aux_elems == 1) {
+                    host_aux_scalar_[s] = 1; host_ops_[s] |= 0x80;        // scalar broadcast
+                } else if (aux_elems == channel && channel > 1 && num_elements_ != (int64_t)channel) {
+                    host_ops_[s] |= 0x40;                                 // per-channel broadcast
+                    host_params_[s] = static_cast<float>(channel);        // C (exact for C < 2^24)
+                }
+                ++aux_in;
+            }
+        }
     }
 }
 
@@ -82,6 +118,8 @@ WorkbufferRequest FusedElementwiseOp::GetWorkBufferRequest() const {
     const size_t aux_bytes    = chain_len_ * sizeof(void*);
     // pinned_sizes[0]: page-locked host mirror for aux_ptrs (stable address for hipGraph).
     // pinned_sizes[1]: shadow copy for change detection (P3 optimisation: skip H2D if unchanged).
+    // The per-step aux-is-scalar flag is packed into bit 7 of each ops byte (see
+    // constructor), so no extra immutable buffer is needed.
     return {{ops_bytes, params_bytes}, {aux_bytes}, {aux_bytes, aux_bytes}};
 }
 
@@ -127,21 +165,12 @@ void FusedElementwiseOp::Execute(const InferenceRequestContext& ctx,
     void* aux_ptrs_device = wbs.mutable_buffers[0].get();
 
     const size_t aux_bytes = chain_len_ * sizeof(void*);
-    bool ptrs_changed = true;
-    {
-        // Compare new ptrs with last uploaded (stored in a second pinned buffer half)
-        // We use the second half of the pinned buffer as a shadow copy.
-        // If pinned_buffers has a second slot, use it; otherwise always upload.
-        if (wbs.pinned_buffers.size() >= 2) {
-            void* shadow = wbs.pinned_buffers[1];
-            ptrs_changed = (std::memcmp(pinned, shadow, aux_bytes) != 0);
-            if (ptrs_changed) std::memcpy(shadow, pinned, aux_bytes);
-        }
-    }
-    if (ptrs_changed) {
-        hipMemcpyAsync(aux_ptrs_device, pinned, aux_bytes, hipMemcpyHostToDevice,
-                       ctx.getThreadContext().stream().get());
-    }
+    // Always upload the aux-pointer table. (A previous "skip H2D if unchanged"
+    // optimization compared against an uninitialized shadow buffer and left stale
+    // device pointers in steady state → GPU memory-access faults on the INT8
+    // dequant chains. The saved ~50µs is not worth the correctness hazard.)
+    hipMemcpyAsync(aux_ptrs_device, pinned, aux_bytes, hipMemcpyHostToDevice,
+                   ctx.getThreadContext().stream().get());
 
     const uint8_t* ops_dev    = static_cast<const uint8_t*>(wbs.immutable_buffers[0].get());
     const float*   params_dev = static_cast<const float*>(wbs.immutable_buffers[1].get());
@@ -149,7 +178,7 @@ void FusedElementwiseOp::Execute(const InferenceRequestContext& ctx,
         inputs[0].get(),
         static_cast<const void* const*>(aux_ptrs_device),
         outputs[0].get(),
-        num_elements_, ops_dev, params_dev, chain_len_, is_fp16_,
+        num_elements_, ops_dev, params_dev, chain_len_, is_fp16_, prim_is_i32_,
         ctx.getThreadContext().stream().get());
 }
 
@@ -174,7 +203,7 @@ void FusedElementwiseOp::Capture(InferenceRequestContext& ctx,
         inputs[0].get(),
         static_cast<const void* const*>(aux_ptrs_device),
         outputs[0].get(),
-        num_elements_, ops_dev, params_dev, chain_len_, is_fp16_,
+        num_elements_, ops_dev, params_dev, chain_len_, is_fp16_, prim_is_i32_,
         ctx.getThreadContext().stream().get());
 }
 

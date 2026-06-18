@@ -8,6 +8,11 @@
 #include <ops/result.hpp>
 #include <ops/tensor_iterator.hpp>
 
+#include <cmath>
+#include <vector>
+#include <cstdio>
+#include <hip/hip_runtime.h>
+
 #include "rocm_iexecution_delegator.hpp"
 
 namespace ov {
@@ -49,11 +54,20 @@ public:
                                   const MemoryManager& memoryManager,
                                   const Workbuffers::mutable_buffer& buffer,
                                   const InferenceRequestContext& context) override {
+        static const bool trace = std::getenv("ROCM_OP_TRACE") != nullptr;
         for (auto& op : subGraphPtr->getExecSequence()) {
             const auto& inputTensors = memoryManager.inputTensorPointers(*op, buffer);
             const auto& outputTensors = memoryManager.outputTensorPointers(*op, buffer);
             const auto& workBuffers = memoryManager.workBuffers(*op, buffer, context.getPinnedPool());
+            if (trace) {
+                fprintf(stderr, "[op-trace] -> %s (%s)\n",
+                        op->GetName().c_str(), op->GetTypeName().c_str()); fflush(stderr);
+            }
             op->Execute(context, inputTensors, outputTensors, workBuffers);
+            if (trace) {
+                context.getThreadContext().stream().synchronize();
+                fprintf(stderr, "[op-trace] <- %s done\n", op->GetName().c_str()); fflush(stderr);
+            }
         }
     };
 

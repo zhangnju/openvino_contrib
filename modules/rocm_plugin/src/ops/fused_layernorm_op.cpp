@@ -231,11 +231,18 @@ FusedLayerNormOp::FusedLayerNormOp(
     has_scale_    = true;
     has_bias_     = true;
 
-    // Try JIT kernel (register-cached, faster for eligible shapes)
-    jit_kernel_ = compile_ln_kernel(rows_, cols_);
-    if (!jit_kernel_) {
-        fprintf(stderr, "[FusedLN] JIT not available for rows=%d cols=%d, using fallback kernel\n",
-                rows_, cols_);
+    // The fp16 JIT and fused_reduce fallback kernels both assume __half I/O. In INT8
+    // models the dequant path feeds f32 into LayerNorm — reading f32 as __half2 yields
+    // garbage/nan. Detect f32 input and route to the native f32 layer_norm kernel.
+    is_f32_ = (node->get_input_element_type(0) == ov::element::f32);
+
+    if (!is_f32_) {
+        // Try JIT kernel (register-cached, faster for eligible shapes)
+        jit_kernel_ = compile_ln_kernel(rows_, cols_);
+        if (!jit_kernel_) {
+            fprintf(stderr, "[FusedLN] JIT not available for rows=%d cols=%d, using fallback kernel\n",
+                    rows_, cols_);
+        }
     }
 }
 
@@ -259,6 +266,14 @@ void FusedLayerNormOp::Execute(
     const void* gamma_ptr = inputs[bias_off + skip_off + 1].get();
     const void* beta_ptr  = inputs[bias_off + skip_off + 2].get();
     void*       out_ptr   = outputs[0].get();
+
+    if (is_f32_) {
+        // f32 path (INT8 dequant): native f32 kernel with optional add_bias + residual.
+        kernel::launchLayerNorm(stream, x_ptr, out_ptr, gamma_ptr, beta_ptr,
+                                abias_ptr, skip_ptr,
+                                (size_t)rows_, (size_t)cols_, epsilon_, /*is_fp16=*/false);
+        return;
+    }
 
     if (jit_kernel_) {
         // hipRTC register-cached kernel with optional add_bias parameter

@@ -49,9 +49,11 @@ public:
 private:
     std::vector<uint8_t>          host_ops_;
     std::vector<float>            host_params_;
+    std::vector<uint8_t>          host_aux_scalar_;  // per-step: 1 if aux is a 1-elem scalar (broadcast)
     std::vector<bool>             step_has_aux_;  // whether each step needs aux input
     int                           chain_len_{0};
     bool                          is_fp16_{false};
+    bool                          prim_is_i32_{false};  // primary input is i32 (Convert chain head)
     int64_t                       num_elements_{0};
     int                           num_aux_{0};     // number of auxiliary inputs
 

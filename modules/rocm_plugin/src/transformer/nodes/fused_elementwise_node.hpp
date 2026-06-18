@@ -63,7 +63,18 @@ public:
                 break;
             }
         }
-        set_output_type(0, get_input_element_type(0), out_shape);
+        // Output element type = primary input type, EXCEPT when the primary is i32
+        // (the chain head is a Convert(i32->f32)): the kernel converts on load and
+        // computes/outputs in float, so the output is the first f32/f16 input's type.
+        ov::element::Type out_et = get_input_element_type(0);
+        if (out_et == ov::element::i32) {
+            out_et = ov::element::f32;
+            for (size_t i = 1; i < get_input_size(); ++i) {
+                const auto& t = get_input_element_type(i);
+                if (t == ov::element::f16 || t == ov::element::f32) { out_et = t; break; }
+            }
+        }
+        set_output_type(0, out_et, out_shape);
     }
 
     std::shared_ptr<ov::Node> clone_with_new_inputs(const ov::OutputVector& new_inputs) const override {

@@ -38,20 +38,15 @@ struct ModOpImpl {
 };
 */
 
-static __global__ void ModOpImpl_fp32(const float* in0, const float* in1,float* out)
+static __global__ void ModOpImpl_fp32(const float* in0, NumpyBroadcastMapper m0,
+                                      const float* in1, NumpyBroadcastMapper m1,
+                                      float* out, unsigned n)
 {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
-
-    float x = in0[i];
-    float y = in1[i];
-
-    if (y == 0) {
-        out[i] = 0;
-    }
-    else {
-        out[i] = fmodf(x,y);
-    } 
-        
+    if (i >= n) return;
+    float x = in0[m0.srcIndex(i)];
+    float y = in1[m1.srcIndex(i)];
+    out[i] = (y == 0) ? 0.f : fmodf(x, y);
 }
 Mod::Mod(Type_t element_type, size_t out_num_elements, size_t max_threads_per_block)
 {
@@ -77,7 +72,8 @@ void Mod::operator()(hipStream_t stream,
             in0_fp32 = (const float*) in0;
             in1_fp32 = (const float*) in1;
             out_fp32 = (float*) out;
-            ModOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(in0_fp32, in1_fp32,out_fp32);
+            ModOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(
+                in0_fp32, in0_mapper, in1_fp32, in1_mapper, out_fp32, (unsigned)num_elements_);
             break;
         default:
             throw_ov_exception(fmt::format("Input element type = {} is not supported by Mod operation !!",

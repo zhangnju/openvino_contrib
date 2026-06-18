@@ -39,15 +39,22 @@ __device__ inline float fused_ew_apply(float acc, float aux, uint8_t op, float p
         case FusedEwOp::Mul:        return acc * aux;
         case FusedEwOp::Div:        return acc / aux;
         case FusedEwOp::LeakyRelu:  return acc >= 0.f ? acc : acc * param;
+        case FusedEwOp::Round:      return rintf(acc);                 // round-half-to-even
+        case FusedEwOp::Clamp:      return fminf(255.f, fmaxf(0.f, acc)); // u8 quant range (0,255)
+        case FusedEwOp::Cast:       return acc;                        // dtype cast: primary already loaded as float
         default:                    return acc;
     }
 }
 
 // ─── Main fused kernel (scalar fallback, works for all sizes) ────────────────
 
-template<typename T>
+// Bit 7 of an ops byte = "aux is a 1-element scalar → broadcast (read aux[0])".
+// Low 7 bits = the FusedEwOp kind.
+// PrimT = primary input element type (may differ from T when the chain head is a
+// Convert, e.g. i32 primary → f32 aux/out). aux tensors and the output are type T.
+template<typename PrimT, typename T>
 __global__ void fused_elementwise_kernel(
-        const T* __restrict__ primary_in,
+        const PrimT* __restrict__ primary_in,
         const void* const* __restrict__ aux_ptrs,  // per-step auxiliary inputs (nullptr if unary)
         T* __restrict__ out,
         int64_t n,
@@ -60,20 +67,25 @@ __global__ void fused_elementwise_kernel(
 
     float acc = float(primary_in[i]);
     for (int s = 0; s < chain_len; ++s) {
+        const uint8_t opc = ops[s];
         float aux = 0.f;
         if (aux_ptrs && aux_ptrs[s]) {
-            aux = float(reinterpret_cast<const T*>(aux_ptrs[s])[i]);
+            // bit7 = scalar (aux[0]); bit6 = per-channel (aux[i % C], C=params[s]); else aux[i]
+            int64_t idx = i;
+            if (opc & 0x80)      idx = 0;
+            else if (opc & 0x40) idx = i % (int64_t)params[s];
+            aux = float(reinterpret_cast<const T*>(aux_ptrs[s])[idx]);
         }
-        acc = fused_ew_apply(acc, aux, ops[s], params[s]);
+        acc = fused_ew_apply(acc, aux, opc & 0x3F, params[s]);
     }
     out[i] = T(acc);
 }
 
 // ─── Vectorized FP16 variant: 4 elements per thread ──────────────────────────
 
-template<typename T>
+template<typename PrimT, typename T>
 __global__ void fused_elementwise_kernel_vec4(
-        const T* __restrict__ primary_in,
+        const PrimT* __restrict__ primary_in,
         const void* const* __restrict__ aux_ptrs,
         T* __restrict__ out,
         int64_t n,
@@ -94,11 +106,16 @@ __global__ void fused_elementwise_kernel_vec4(
     for (int k = 0; k < count; ++k) {
         float acc = v[k];
         for (int s = 0; s < chain_len; ++s) {
+            const uint8_t opc = ops[s];
             float aux = 0.f;
             if (aux_ptrs && aux_ptrs[s]) {
-                aux = float(reinterpret_cast<const T*>(aux_ptrs[s])[base + k]);
+                const int64_t gi = base + k;
+                int64_t idx = gi;
+                if (opc & 0x80)      idx = 0;
+                else if (opc & 0x40) idx = gi % (int64_t)params[s];
+                aux = float(reinterpret_cast<const T*>(aux_ptrs[s])[idx]);
             }
-            acc = fused_ew_apply(acc, aux, ops[s], params[s]);
+            acc = fused_ew_apply(acc, aux, opc & 0x3F, params[s]);
         }
         v[k] = acc;
     }
@@ -119,23 +136,37 @@ void launch_fused_elementwise(
         const float* params_device,
         int chain_len,
         bool is_fp16,
+        bool prim_is_i32,
         hipStream_t stream)
 {
     constexpr int BLOCK = 256;
+
+    // i32 primary (Convert chain head): primary read as int32, aux/out are f32.
+    // Use the scalar kernel (no float4 vectorization for the mixed-type case).
+    if (prim_is_i32) {
+        int grid = (int)((n + BLOCK - 1) / BLOCK);
+        hipLaunchKernelGGL((fused_elementwise_kernel<int32_t, float>),
+            grid, BLOCK, 0, stream,
+            reinterpret_cast<const int32_t*>(primary_in),
+            aux_ptrs_device,
+            reinterpret_cast<float*>(out),
+            n, ops_device, params_device, chain_len);
+        return;
+    }
 
     // Use vectorized kernel (4 elems/thread) for large tensors
     if (n >= 4096) {
         int64_t vec_n = (n + 3) / 4;
         int grid = (int)((vec_n + BLOCK - 1) / BLOCK);
         if (is_fp16) {
-            hipLaunchKernelGGL(fused_elementwise_kernel_vec4<__half>,
+            hipLaunchKernelGGL((fused_elementwise_kernel_vec4<__half, __half>),
                 grid, BLOCK, 0, stream,
                 reinterpret_cast<const __half*>(primary_in),
                 aux_ptrs_device,
                 reinterpret_cast<__half*>(out),
                 n, ops_device, params_device, chain_len);
         } else {
-            hipLaunchKernelGGL(fused_elementwise_kernel_vec4<float>,
+            hipLaunchKernelGGL((fused_elementwise_kernel_vec4<float, float>),
                 grid, BLOCK, 0, stream,
                 reinterpret_cast<const float*>(primary_in),
                 aux_ptrs_device,
@@ -145,14 +176,14 @@ void launch_fused_elementwise(
     } else {
         int grid = (int)((n + BLOCK - 1) / BLOCK);
         if (is_fp16) {
-            hipLaunchKernelGGL(fused_elementwise_kernel<__half>,
+            hipLaunchKernelGGL((fused_elementwise_kernel<__half, __half>),
                 grid, BLOCK, 0, stream,
                 reinterpret_cast<const __half*>(primary_in),
                 aux_ptrs_device,
                 reinterpret_cast<__half*>(out),
                 n, ops_device, params_device, chain_len);
         } else {
-            hipLaunchKernelGGL(fused_elementwise_kernel<float>,
+            hipLaunchKernelGGL((fused_elementwise_kernel<float, float>),
                 grid, BLOCK, 0, stream,
                 reinterpret_cast<const float*>(primary_in),
                 aux_ptrs_device,

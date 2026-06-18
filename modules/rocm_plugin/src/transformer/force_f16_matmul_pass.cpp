@@ -94,6 +94,14 @@ bool ForceF16MatMulOutput::run_on_model(const std::shared_ptr<ov::Model>& model)
 // 3. MIGraphX does the same: --fp16 mode eliminates all f16↔f32 converts
 
 bool EliminateF16ToF32Convert::run_on_model(const std::shared_ptr<ov::Model>& model) {
+    // Skip this pass for quantized (INT8/INT32) models: the f16 constant rewrite
+    // corrupts nodes whose kernels don't support f16 inputs (e.g. Maximum, Gather).
+    for (const auto& node : model->get_ordered_ops()) {
+        if (node->get_type_name() == std::string("MatMul") &&
+            node->get_input_element_type(0) == ov::element::i32)
+            return false;
+    }
+
     bool changed = false;
     size_t converts_removed = 0;
     size_t constants_converted = 0;
