@@ -22,7 +22,11 @@
 #include <vector>
 #include <cstdlib>
 #include <chrono>
+#include <cstring>
+#include <cmath>
+#include <algorithm>
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
 #include "converters.hpp"
 #include "rocm/constant_factory.hpp"
@@ -402,10 +406,30 @@ MatMulOp::MatMulOp(const CreationContext& context,
     OPENVINO_ASSERT(ld_c_ != 0, "Node name: ", GetName());
     OPENVINO_ASSERT(batch_count_ != 0, "Node name: ", GetName());
 
-    // For the i32 GEMM (cast to f16), route through hipBLASLt to avoid a rocBLAS
-    // gemm_strided_batched_ex GPU hang on gfx1201 for certain shapes.
+    // INT8 path: for the i32 GEMM (cast to f16), route through hipBLASLt to avoid a
+    // rocBLAS gemm_strided_batched_ex GPU hang on gfx1201 for certain shapes.
     if (needs_i32_cast_ && i32_use_f16_)
         setup_hipblaslt_i32();
+
+    // fp16 path: optional tuned rocMLIR GEMM for plain 2D fp16, single batch, no
+    // A-transpose, beta==0. Decided by tuning-cache presence; one-time numeric check
+    // vs rocBLAS in Execute. Mutually exclusive with the INT8 i32 path (gated on dtype).
+    const auto& props = context.device().props();
+    arch_ = props.gcnArchName;
+    if (auto p = arch_.find(':'); p != std::string::npos) arch_ = arch_.substr(0, p);
+    num_cu_ = props.multiProcessorCount;
+    const bool beta_zero = (beta_ == &rocm::NumericConst<rocm::constants::zero>(compute_type_));
+    if (data_type_ == HIP_R_16F && batch_count_ == 1 &&
+        rocblas_transpose_a_ == rocblas_operation_none && beta_zero) {
+        const bool transB = (rocblas_transpose_b_ == rocblas_operation_transpose);
+        const std::string cfg = rocmlir_gemm::get_tuned_gemm_config(
+            m_, n_, k_, transB, arch_, num_cu_, rocmlir_gemm::Epilogue::None);
+        if (!cfg.empty()) {
+            auto maybe = rocmlir_gemm::compile_rocmlir_gemm(
+                m_, n_, k_, transB, arch_, num_cu_, rocmlir_gemm::Epilogue::None, cfg);
+            if (maybe) rocmlir_kernel_ = std::make_shared<rocmlir_gemm::GemmKernel>(std::move(*maybe));
+        }
+    }
 }
 template MatMulOp::MatMulOp(const CreationContext& context,
                             const ov::op::v0::MatMul&,
@@ -601,6 +625,46 @@ void MatMulOp::Execute(const InferenceRequestContext& context,
     auto matrixB = inputs[1];
     auto matrixC = outputs[0];
     const auto& stream = context.getThreadContext().stream();
+
+    // ── Tuned rocMLIR GEMM (plain 2D fp16; mutually exclusive with INT8 i32) ──
+    // One-time correctness check vs rocBLAS (timing-only selection could silently
+    // accept a wrong kernel), then pure dispatch — no per-inference benchmark.
+    if (rocmlir_kernel_ && !rocmlir_checked_) {
+        auto* self = const_cast<MatMulOp*>(this);
+        self->rocmlir_checked_ = true;
+        const size_t cElems = (size_t)m_ * n_;
+        const rocblas_datatype dtc = rocblas_datatype_f16_r, ctc = rocblas_datatype_f16_r;
+        const void* one = &rocm::NumericConst<rocm::constants::one>(compute_type_);
+        auto run_rb = [&]{
+            rocblas_gemm_strided_batched_ex(RocBlasHandle.get(),
+                rocblas_transpose_b_, rocblas_transpose_a_, n_, m_, k_, one,
+                matrixB.get(), dtc, ld_b_, stride_b_, matrixA.get(), dtc, ld_a_, stride_a_,
+                beta_, matrixC.get(), dtc, ld_c_, stride_c_, matrixC.get(), dtc, ld_c_, stride_c_,
+                1, ctc, rocblas_gemm_algo_standard, 0, 0);
+        };
+        auto run_ml = [&]{
+            rocmlir_gemm::launch_rocmlir_gemm(*rocmlir_kernel_, stream.get(),
+                const_cast<void*>(matrixA.get()), const_cast<void*>(matrixB.get()), matrixC.get());
+        };
+        std::vector<uint16_t> ref(cElems), got(cElems);
+        run_rb(); hipStreamSynchronize(stream.get());
+        hipMemcpy(ref.data(), matrixC.get(), cElems*2, hipMemcpyDeviceToHost);
+        run_ml(); hipStreamSynchronize(stream.get());
+        hipMemcpy(got.data(), matrixC.get(), cElems*2, hipMemcpyDeviceToHost);
+        auto h2f=[](uint16_t h)->float{ __half x; std::memcpy(&x,&h,2); return __half2float(x); };
+        size_t nbad=0;
+        for (size_t i=0;i<cElems;++i){ float a=h2f(ref[i]),b=h2f(got[i]);
+            if (std::abs(a-b)/std::max(std::abs(a),1e-3f) > 0.02) ++nbad; }
+        self->use_rocmlir_ = (nbad <= cElems/1000);
+        if (!use_rocmlir_) { self->rocmlir_kernel_.reset();
+            fprintf(stderr, "[MatMul] rocMLIR numeric mismatch %dx%dx%d -> rocBLAS\n", m_,n_,k_); }
+        else fprintf(stderr, "[MatMul] using tuned rocMLIR GEMM %dx%dx%d\n", m_,n_,k_);
+    }
+    if (use_rocmlir_ && rocmlir_kernel_) {
+        rocmlir_gemm::launch_rocmlir_gemm(*rocmlir_kernel_, stream.get(),
+            const_cast<void*>(matrixA.get()), const_cast<void*>(matrixB.get()), matrixC.get());
+        return;
+    }
 
     if (needs_i32_cast_ && std::getenv("ROCM_I32_DEBUG")) {
         static int idx = 0;

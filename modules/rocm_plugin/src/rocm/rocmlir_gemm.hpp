@@ -61,7 +61,16 @@ struct SelectResult {
 std::optional<GemmKernel> compile_rocmlir_gemm(
     int M, int N, int K, bool transB,
     const std::string& arch, int num_cu,
-    Epilogue epilogue = Epilogue::None);
+    Epilogue epilogue = Epilogue::None,
+    const std::string& perf_config = "");
+
+// Best perf_config for a GEMM shape on this arch (empty = pipeline default / untuned).
+// Honors ROCMLIR_PERF_CONFIG; persistent JSON cache keyed by (M,N,K,transB,ep,arch).
+// Only enumerates+times+saves when ROCMLIR_ENABLE_TUNING=1; else returns cached or "".
+// Never hardcodes arch (file name embeds runtime gcnArchName).
+std::string get_tuned_gemm_config(
+    int M, int N, int K, bool transB,
+    const std::string& arch, int num_cu, Epilogue epilogue);
 
 // Benchmark rocBLAS vs rocMLIR (no-epilogue) and return the faster backend.
 // Results are cached globally per shape.

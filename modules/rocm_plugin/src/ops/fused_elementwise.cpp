@@ -165,10 +165,12 @@ void FusedElementwiseOp::Execute(const InferenceRequestContext& ctx,
     void* aux_ptrs_device = wbs.mutable_buffers[0].get();
 
     const size_t aux_bytes = chain_len_ * sizeof(void*);
-    // Always upload the aux-pointer table. (A previous "skip H2D if unchanged"
-    // optimization compared against an uninitialized shadow buffer and left stale
-    // device pointers in steady state → GPU memory-access faults on the INT8
-    // dequant chains. The saved ~50µs is not worth the correctness hazard.)
+    // Always upload the aux-pointer table. aux_ptrs_device is a MUTABLE workbuffer
+    // that OV's memory model may recycle for other ops between inferences, so the
+    // previous "skip H2D if unchanged" optimization left stale/garbage device
+    // pointers in steady state → GPU memory-access faults (seen both on INT8 dequant
+    // chains and fp16 BERT on gfx1100, 2nd+ inference). The saved ~50µs is not worth
+    // the correctness hazard.
     hipMemcpyAsync(aux_ptrs_device, pinned, aux_bytes, hipMemcpyHostToDevice,
                    ctx.getThreadContext().stream().get());
 

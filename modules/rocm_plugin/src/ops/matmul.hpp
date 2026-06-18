@@ -11,7 +11,10 @@
 #include <transformer/nodes/fully_connected.hpp>
 
 #include "rocm/constant_factory.hpp"
+#include "rocm/rocmlir_gemm.hpp"
 #include "openvino/op/matmul.hpp"
+#include <memory>
+#include <string>
 
 namespace ov {
 namespace rocm_gpu {
@@ -103,7 +106,7 @@ private:
     rocblas_operation rocblas_transpose_a_ = rocblas_operation_none;
     rocblas_operation rocblas_transpose_b_ = rocblas_operation_none;
 
-    // ── hipBLASLt path for the i32 GEMM ──────────────────────────────────────
+    // ── hipBLASLt path for the i32 GEMM (INT8 models) ────────────────────────
     // rocBLAS's gemm_strided_batched_ex hangs on gfx1201 for some shapes (e.g.
     // m=256,n=768,k=3072). hipBLASLt does not, so the i32 (cast-to-f16) GEMM runs
     // through hipBLASLt. Set up at construction; falls back to rocBLAS if unavailable.
@@ -117,6 +120,15 @@ private:
     mutable hipblasLtMatmulAlgo_t   lt_algo_{};
     mutable void*  lt_workspace_{nullptr};
     size_t lt_workspace_bytes_{0};
+
+    // ── Optional tuned rocMLIR GEMM for plain 2D fp16 (BERT FFN-down/attn-out) ─
+    // Decided at construction by tuning-cache presence; Execute is pure dispatch.
+    // A one-time numeric check vs rocBLAS guards correctness (generic op).
+    mutable std::shared_ptr<rocmlir_gemm::GemmKernel> rocmlir_kernel_;
+    mutable bool use_rocmlir_ = false;
+    mutable bool rocmlir_checked_ = false;
+    std::string arch_;
+    int num_cu_ = 0;
 };
 
 }  // namespace rocm_gpu
