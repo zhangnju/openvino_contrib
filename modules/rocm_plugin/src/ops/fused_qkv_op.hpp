@@ -9,6 +9,7 @@
 #include <rocm_operation_base.hpp>
 #include <transformer/nodes/fused_qkv_node.hpp>
 #include <hipblaslt/hipblaslt.h>
+#include "rocm/rocmlir_gemm.hpp"
 #include <memory>
 
 namespace ov {
@@ -49,6 +50,13 @@ private:
     // Lazy algo tuning
     mutable bool        lt_tuned_{false};
     std::string         arch_;
+    int                 num_cu_{0};
+
+    // Tuned fused rocMLIR GEMM+bias. Decided at construction by cache presence
+    // (a tuned perf_config exists ⇒ use rocMLIR); Execute is pure dispatch, never
+    // benchmarks. No tuned config ⇒ hipBLASLt (no regression).
+    std::shared_ptr<rocmlir_gemm::GemmKernel> rocmlir_kernel_;
+    bool                use_rocmlir_{false};
 };
 
 }  // namespace rocm_gpu

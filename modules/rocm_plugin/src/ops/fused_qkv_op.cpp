@@ -10,6 +10,7 @@
 #include <fstream>
 #include <sys/stat.h>
 #include <fmt/format.h>
+#include <string>
 
 namespace ov {
 namespace rocm_gpu {
@@ -90,6 +91,7 @@ FusedQKVProjectionOp::FusedQKVProjectionOp(
     const auto& props = context.device().props();
     arch_ = props.gcnArchName;
     if (auto p = arch_.find(':'); p != std::string::npos) arch_ = arch_.substr(0, p);
+    num_cu_ = props.multiProcessorCount;
 
     // hipBLASLt setup: D[3H,M] = W[3H,H] × X[H,M] + bias[3H]
     // col-major convention: M=seq, N=3*hidden, K=hidden
@@ -135,6 +137,21 @@ FusedQKVProjectionOp::FusedQKVProjectionOp(
     OPENVINO_ASSERT(ok, "FusedQKVProjectionOp: hipBLASLt setup failed");
     fprintf(stderr, "[FusedQKV] Initialized: M=%d N=%d K=%d (1 GEMM replaces 3×%dx%dx%d)\n",
             M, N, K, seq_len_, hidden_, hidden_);
+
+    // Decide backend by tuning-cache presence (no runtime benchmark). A tuned
+    // perf_config exists ⇒ rocMLIR (offline-verified faster on RDNA3); else hipBLASLt.
+    // Under ROCMLIR_ENABLE_TUNING=1, get_tuned_gemm_config does the sweep+save.
+    const std::string cfg = rocmlir_gemm::get_tuned_gemm_config(
+        M, N, K, true, arch_, num_cu_, rocmlir_gemm::Epilogue::Bias);
+    if (!cfg.empty()) {
+        auto maybe = rocmlir_gemm::compile_rocmlir_gemm(
+            M, N, K, /*transB=*/true, arch_, num_cu_, rocmlir_gemm::Epilogue::Bias, cfg);
+        if (maybe) {
+            rocmlir_kernel_ = std::make_shared<rocmlir_gemm::GemmKernel>(std::move(*maybe));
+            use_rocmlir_ = true;
+            fprintf(stderr, "[FusedQKV] using tuned rocMLIR GEMM+bias (cfg=%s)\n", cfg.c_str());
+        }
+    }
 }
 
 FusedQKVProjectionOp::~FusedQKVProjectionOp() {
@@ -153,34 +170,36 @@ void FusedQKVProjectionOp::Execute(
     OPENVINO_ASSERT(inputs.size() == 3 && outputs.size() == 1);
 
     hipStream_t stream = context.getThreadContext().stream().get();
+    void* bias = const_cast<void*>(inputs[2].get());
 
-    // Lazy algo tuning on first Execute with real buffers
+    // rocMLIR path: decided at construction, pure dispatch (no benchmark).
+    if (use_rocmlir_ && rocmlir_kernel_) {
+        rocmlir_gemm::launch_rocmlir_gemm_bias(*rocmlir_kernel_, stream,
+            const_cast<void*>(inputs[0].get()), const_cast<void*>(inputs[1].get()),
+            bias, outputs[0].get());
+        return;
+    }
+
+    // hipBLASLt path: lazy algo tuning on first Execute, then dispatch.
     if (!lt_tuned_) {
         const int M = seq_len_, N = 3 * hidden_, K = hidden_;
-        void* bias = const_cast<void*>(inputs[2].get());
         hipblasLtMatmulDescSetAttribute(lt_desc_, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(void*));
-
         auto best = tune_algo(lt_handle_, lt_desc_,
             lt_layout_W_, lt_layout_X_, lt_layout_D_,
             inputs[1].get(), inputs[0].get(), bias, outputs[0].get(),
             lt_workspace_, lt_workspace_bytes_, stream);
-
         const_cast<FusedQKVProjectionOp*>(this)->lt_algo_ = best;
         const_cast<FusedQKVProjectionOp*>(this)->lt_tuned_ = true;
         save_algo(arch_, M, N, K, best);
     }
-
-    // Set bias pointer and launch GEMM+bias
-    void* bias = const_cast<void*>(inputs[2].get());
     hipblasLtMatmulDescSetAttribute(lt_desc_, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(void*));
-
     const float alpha = 1.f, beta = 0.f;
     hipblasLtMatmul(
         lt_handle_, lt_desc_, &alpha,
-        inputs[1].get(),  lt_layout_W_,   // W_qkv [3H, H]
-        inputs[0].get(),  lt_layout_X_,   // x     [H, M]
+        inputs[1].get(),  lt_layout_W_,
+        inputs[0].get(),  lt_layout_X_,
         &beta,
-        outputs[0].get(), lt_layout_D_,   // QKV   [3H, M] — Q at offset 0, K at H*M, V at 2H*M
+        outputs[0].get(), lt_layout_D_,
         outputs[0].get(), lt_layout_D_,
         &lt_algo_, lt_workspace_, lt_workspace_bytes_, stream);
 }

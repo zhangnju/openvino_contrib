@@ -9,7 +9,10 @@
 #include <transformer/nodes/fully_connected.hpp>
 
 #include "rocm/constant_factory.hpp"
+#include "rocm/rocmlir_gemm.hpp"
 #include "openvino/op/matmul.hpp"
+#include <memory>
+#include <string>
 
 namespace ov {
 namespace rocm_gpu {
@@ -88,6 +91,15 @@ private:
     const rocm::constants::AnyNumeric* beta_ = nullptr;
     rocblas_operation rocblas_transpose_a_ = rocblas_operation_none;
     rocblas_operation rocblas_transpose_b_ = rocblas_operation_none;
+
+    // Optional tuned rocMLIR GEMM for plain 2D fp16 (e.g. BERT FFN-down/attn-out).
+    // Decided at construction by tuning-cache presence; Execute is pure dispatch.
+    // A one-time numeric check vs rocBLAS guards correctness (generic op).
+    mutable std::shared_ptr<rocmlir_gemm::GemmKernel> rocmlir_kernel_;
+    mutable bool use_rocmlir_ = false;
+    mutable bool rocmlir_checked_ = false;
+    std::string arch_;
+    int num_cu_ = 0;
 };
 
 }  // namespace rocm_gpu
