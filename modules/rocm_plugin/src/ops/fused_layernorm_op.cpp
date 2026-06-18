@@ -123,9 +123,9 @@ namespace {
 static std::mutex                                                  g_ln_mu;
 static std::unordered_map<std::string, std::shared_ptr<LNKernel>> g_ln_cache;
 
-static std::shared_ptr<LNKernel> compile_ln_kernel(int rows, int cols) {
-    // Key includes shape + arch so cache is unique
-    std::string key = fmt::format("{}_{}_{}", rows, cols, "gfx1201");
+static std::shared_ptr<LNKernel> compile_ln_kernel(int rows, int cols, const std::string& arch) {
+    // Key includes shape + arch so cache is unique across GPU architectures.
+    std::string key = fmt::format("{}_{}_{}", rows, cols, arch);
     {
         std::lock_guard<std::mutex> lk(g_ln_mu);
         auto it = g_ln_cache.find(key);
@@ -159,8 +159,11 @@ static std::shared_ptr<LNKernel> compile_ln_kernel(int rows, int cols) {
         return nullptr;
     }
 
+    // Compile for the actual runtime GPU architecture (not a hardcoded one),
+    // so the JIT kernel loads on every supported platform (gfx1100/gfx1201/gfx950/...).
+    std::string offload_arch = "--offload-arch=" + arch;
     const char* opts[] = {
-        "--offload-arch=gfx1201",
+        offload_arch.c_str(),
         "-O3",
         "-ffast-math",
         "-I/opt/rocm/include"
@@ -231,8 +234,13 @@ FusedLayerNormOp::FusedLayerNormOp(
     has_scale_    = true;
     has_bias_     = true;
 
+    // Resolve the runtime GPU architecture (e.g. "gfx1100"); strip the
+    // ":sramecc+:xnack-" feature suffix that gcnArchName carries.
+    std::string arch(context.device().props().gcnArchName);
+    if (auto p = arch.find(':'); p != std::string::npos) arch = arch.substr(0, p);
+
     // Try JIT kernel (register-cached, faster for eligible shapes)
-    jit_kernel_ = compile_ln_kernel(rows_, cols_);
+    jit_kernel_ = compile_ln_kernel(rows_, cols_, arch);
     if (!jit_kernel_) {
         fprintf(stderr, "[FusedLN] JIT not available for rows=%d cols=%d, using fallback kernel\n",
                 rows_, cols_);
