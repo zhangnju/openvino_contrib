@@ -188,6 +188,9 @@ void Gather::CallByDataType(const hipStream_t stream,
         case Type_t::i32:
             return CallGeneric(stream, src_dict, (const int32_t*)src_index, dst_data, sizeof(int32_t));
         case Type_t::u8:
+        case Type_t::i8:
+            // 1-byte data (INT8 quantized models gather i8 weights/activations);
+            // CallGeneric copies raw bytes, so i8/u8 share the same path.
             return CallGeneric(stream, src_dict, (const int32_t*)src_index, dst_data, sizeof(uint8_t));
         default:
             throw_ov_exception(

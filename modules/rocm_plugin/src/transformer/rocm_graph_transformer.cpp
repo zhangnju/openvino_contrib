@@ -46,6 +46,7 @@
 #include "transformer/rocmlir_conv_decompose_transformation.hpp"
 #include "transformer/elementwise_fusion_transformation.hpp"
 #include "transformer/quantize_convert_elision_pass.hpp"
+#include "transformer/matmul_dequant_convert_pass.hpp"
 #include "transformer/variadic_split_zero_copy.hpp"
 #include "transformer/rocm_attention_fusion.hpp"
 #include "transformer/layer_norm_fusion.hpp"
@@ -273,6 +274,12 @@ void GraphTransformer::transform(const rocm::Device& device,
         // that may appear after type changes.
         pass_manager.register_pass<ov::rocm_gpu::pass::RemoveRedundantConvertTransformation>();
     }
+
+    // INT8: retype each i32 MatMulInteger output to f32 and elide the dequant
+    // epilogue's Convert(i32->f32). The executor's i32 GEMM already computes in
+    // f32; this removes the f32->i32->f32 round-trip (cast_f32_to_i32 + Convert).
+    // Run BEFORE ElementwiseFusionPass so the dequant chain fuses on the f32 head.
+    pass_manager.register_pass<ov::rocm_gpu::pass::MatMulDequantConvertPass>();
 
     // Fuse chains of elementwise ops (Swish, Mul, Add, Sigmoid, etc.) into a single
     // FusedElementwise kernel launch. Run AFTER conv fusion (which handles Conv+SiLU)

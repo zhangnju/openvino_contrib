@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 #include "hip/hip_runtime.h"
+#include <hip/hip_fp16.h>
 #include "rocm/math.hpp"
 
 #include "clamp.hpp"
@@ -43,6 +44,13 @@ static __global__ void ClampOpImpl_fp32(const float* in,float min_value, float m
 
      out[i] = fminf(fmaxf(in[i], min_value), max_value);
 }
+
+static __global__ void ClampOpImpl_fp16(const __half* in, float min_value, float max_value, __half* out)
+{
+     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+     out[i] = __float2half(fminf(fmaxf(__half2float(in[i]), min_value), max_value));
+}
+
 Clamp::Clamp(Type_t element_type, size_t max_threads_per_block, size_t num_elements, double min, double max)
     : element_type_{element_type},
       min_{min},
@@ -65,6 +73,10 @@ void Clamp::operator()(hipStream_t stream, const void* in, void* out) const {
             in0_fp32 = (const float*) in;
             out_fp32 = (float*) out;
             ClampOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(in0_fp32, static_cast<float>(min_), static_cast<float>(max_), out_fp32);
+            break;
+        case Type_t::f16:
+            ClampOpImpl_fp16<<<num_blocks_, threads_per_block_, 0, stream>>>(
+                (const __half*)in, static_cast<float>(min_), static_cast<float>(max_), (__half*)out);
             break;
         default:
             throw_ov_exception(fmt::format("Input element type = {} is not supported by Clamp operation !!",
