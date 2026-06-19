@@ -5,6 +5,7 @@
 
 
 #include <fmt/format.h>
+#include <hip/hip_fp16.h>
 
 //#include "details/type_validator.hpp"
 #include "select.hpp"
@@ -14,15 +15,16 @@ namespace ov {
 namespace rocm_gpu {
 
 namespace kernel {
+template <typename T>
 static __global__ void select(const bool* condition,
-                              const float* then_node,
-                              const float* else_node,
+                              const T* then_node,
+                              const T* else_node,
                               const SelectKernelOp::BrcstOffsetType* cond_brcst_offsets,
                               const SelectKernelOp::BrcstOffsetType* then_brcst_offsets,
                               const SelectKernelOp::BrcstOffsetType* else_brcst_offsets,
                               const SelectKernelOp::BrcstOffsetType* output_sizes,
                               const size_t max_size,
-                              float* buffer) {
+                              T* buffer) {
     const unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= max_size) return;
     // calc N, C, D, H, W indexes
@@ -83,6 +85,18 @@ void SelectKernelOp::operator()(const hipStream_t stream,
                                      else_brcst_offsets,
                                      output_sizes,
                                      buffer_fp32);
+        case Type_t::f16:
+            kernel::select<__half><<<blocks_number_, threads_per_block_, 0, stream>>>(
+                condition,
+                static_cast<const __half*>(then_node),
+                static_cast<const __half*>(else_node),
+                cond_brcst_offsets,
+                then_brcst_offsets,
+                else_brcst_offsets,
+                output_sizes,
+                max_size_,
+                static_cast<__half*>(buffer));
+            return;
         default:
             throw_ov_exception(
                 fmt::format("Index element type = {} is not supported by Gather operation !!", operation_type_));
@@ -99,7 +113,7 @@ void SelectKernelOp::callKernel(const hipStream_t stream,
                                 const BrcstOffsetType* else_brcst_offsets,
                                 const BrcstOffsetType* output_sizes,
                                 float* buffer) const {
-    kernel::select<<<blocks_number_, threads_per_block_, 0, stream>>>(condition,
+    kernel::select<float><<<blocks_number_, threads_per_block_, 0, stream>>>(condition,
                                                                          static_cast<const float*>(then_node),
                                                                          static_cast<const float*>(else_node),
                                                                          cond_brcst_offsets,

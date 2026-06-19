@@ -3,6 +3,7 @@
 //
 
 #include <rocm/float16.hpp>
+#include <hip/hip_fp16.h>
 #include <type_traits>
 
 #include "squared_difference.hpp"
@@ -28,6 +29,16 @@ static __global__ void SquaredDifferenceOpImpl_fp32(const float* in0, NumpyBroad
     if (i >= n) return;
     const float diff = in0[m0.srcIndex(i)] - in1[m1.srcIndex(i)];
     out[i] = diff * diff;
+}
+
+static __global__ void SquaredDifferenceOpImpl_fp16(const __half* in0, NumpyBroadcastMapper m0,
+                                     const __half* in1, NumpyBroadcastMapper m1,
+                                     __half* out, unsigned n)
+{
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float diff = __half2float(in0[m0.srcIndex(i)]) - __half2float(in1[m1.srcIndex(i)]);
+    out[i] = __float2half(diff*diff);
 }
 
 SquaredDifference::SquaredDifference(Type_t element_type, size_t out_num_elements, size_t max_threads_per_block)
@@ -56,6 +67,10 @@ void SquaredDifference::operator()(hipStream_t stream,
             out_fp32 = (float*) out;
             SquaredDifferenceOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(
                 in0_fp32, in0_mapper, in1_fp32, in1_mapper, out_fp32, (unsigned)num_elements_);
+            break;
+        case Type_t::f16:
+            SquaredDifferenceOpImpl_fp16<<<num_blocks_, threads_per_block_, 0, stream>>>(
+                (const __half*)in0, in0_mapper, (const __half*)in1, in1_mapper, (__half*)out, (unsigned)num_elements_);
             break;
         default:
             throw_ov_exception(fmt::format("Input element type = {} is not supported by SquaredDifference operation !!",

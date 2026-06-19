@@ -3,6 +3,7 @@
 //
 
 #include <rocm/float16.hpp>
+#include <hip/hip_fp16.h>
 
 #include "details/tensor_helpers.hpp"
 #include "elu.hpp"
@@ -26,6 +27,13 @@ static __global__ void EluOpImpl_fp32(const float* in,float alpha, float* out)
     float x = in[i] ;
     out[i] = ( x >= static_cast<float>(0.0) ) ? in[i] : (static_cast<float>(alpha) * (expf(x) - static_cast<float>(1.0)));
 }
+
+static __global__ void EluOpImpl_fp16(const __half* in, float alpha, __half* out)
+{
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    float x = __half2float(in[i]);
+    out[i] = __float2half( (x >= 0.0f) ? x : (alpha * (expf(x) - 1.0f)) );
+}
 Elu::Elu(Type_t element_type, size_t max_threads_per_block, size_t num_elements, float alpha)
     : alpha_{alpha} 
 {
@@ -46,6 +54,9 @@ void Elu::operator()(hipStream_t stream, const void* in, void* out) const
             in0_fp32 = (const float*) in;
             out_fp32 = (float*) out;
             EluOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(in0_fp32, alpha_,out_fp32);
+            break;
+        case Type_t::f16:
+            EluOpImpl_fp16<<<num_blocks_, threads_per_block_, 0, stream>>>((const __half*)in, alpha_, (__half*)out);
             break;
         default:
             throw_ov_exception(fmt::format("Input element type = {} is not supported by Elu operation !!",

@@ -3,6 +3,7 @@
 //
 
 #include "rocm/float16.hpp"
+#include <hip/hip_fp16.h>
 #include "rocm/math.hpp"
 #include <type_traits>
 
@@ -38,6 +39,15 @@ static __global__ void DivOpImpl_fp32(const float* in0, NumpyBroadcastMapper m0,
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     out[i] = fdividef(in0[m0.srcIndex(i)], in1[m1.srcIndex(i)]);
+}
+
+static __global__ void DivOpImpl_fp16(const __half* in0, NumpyBroadcastMapper m0,
+                                     const __half* in1, NumpyBroadcastMapper m1,
+                                     __half* out, unsigned n)
+{
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = __float2half(fdividef(__half2float(in0[m0.srcIndex(i)]), __half2float(in1[m1.srcIndex(i)])));
 }
 
 static __global__ void DivOpImpl_i32(const int32_t* in0, NumpyBroadcastMapper m0,
@@ -142,6 +152,10 @@ void Divide::operator()(hipStream_t stream,
             DivOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(
                 (const float*)in0, in0_mapper, (const float*)in1, in1_mapper, (float*)out, num_elements_);
             break;
+        case Type_t::f16:
+            DivOpImpl_fp16<<<num_blocks_, threads_per_block_, 0, stream>>>(
+                (const __half*)in0, in0_mapper, (const __half*)in1, in1_mapper, (__half*)out, (unsigned)num_elements_);
+            break;
         case Type_t::i32:
             DivOpImpl_i32<<<num_blocks_, threads_per_block_, 0, stream>>>(
                 (const int32_t*)in0, in0_mapper, (const int32_t*)in1, in1_mapper, (int32_t*)out, num_elements_);
@@ -176,6 +190,10 @@ void PythonDivide::operator()(hipStream_t stream,
         case Type_t::f32:
             DivOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(
                 (const float*)in0, in0_mapper, (const float*)in1, in1_mapper, (float*)out, num_elements_);
+            break;
+        case Type_t::f16:
+            DivOpImpl_fp16<<<num_blocks_, threads_per_block_, 0, stream>>>(
+                (const __half*)in0, in0_mapper, (const __half*)in1, in1_mapper, (__half*)out, (unsigned)num_elements_);
             break;
         case Type_t::i32:
             PythonDivOpImpl_i32<<<num_blocks_, threads_per_block_, 0, stream>>>(

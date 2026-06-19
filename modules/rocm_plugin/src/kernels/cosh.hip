@@ -3,6 +3,7 @@
 //
 
 #include "cosh.hpp"
+#include <hip/hip_fp16.h>
 
 namespace ov {
 namespace rocm_gpu {
@@ -25,6 +26,12 @@ static __global__ void CoshOpImpl_fp32(const float* in,float* out)
     out[i]=cosh(in[i]);
 }
 
+static __global__ void CoshOpImpl_fp16(const __half* in, __half* out)
+{
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    out[i] = __float2half(coshf(__half2float(in[i])));
+}
+
 Cosh::Cosh(Type_t element_type, size_t max_threads_per_block, size_t num_elements)
 {
     element_type_ = element_type;
@@ -43,6 +50,9 @@ void Cosh::operator()(hipStream_t stream, const void* in0, void* out) const {
             in0_fp32 = (const float*) in0;
             out_fp32 = (float*) out;
             CoshOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(in0_fp32, out_fp32);
+            break;
+        case Type_t::f16:
+            CoshOpImpl_fp16<<<num_blocks_, threads_per_block_, 0, stream>>>((const __half*)in0, (__half*)out);
             break;
         default:
             throw_ov_exception(fmt::format("Input element type = {} is not supported by Cosh operation !!",

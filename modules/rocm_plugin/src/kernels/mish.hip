@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#include <hip/hip_fp16.h>
+
 #include "mish.hpp"
 
 namespace ov {
@@ -31,6 +33,14 @@ static __global__ void MishOpImpl_fp32(const float* in, float* out)
 
     out[i] = x * tanhf(soft_plus_value);
 }
+
+static __global__ void MishOpImpl_fp16(const __half* in, __half* out)
+{
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    float x = __half2float(in[i]);
+    float soft_plus_value = logf(static_cast<float>(1.0) + expf(x));
+    out[i] = __float2half(x * tanhf(soft_plus_value));
+}
 Mish::Mish(Type_t element_type, size_t max_threads_per_block, size_t num_elements)
 {
     element_type_ = element_type;
@@ -49,6 +59,9 @@ void Mish::operator()(hipStream_t stream, const void* in0, void* out) const {
             in0_fp32 = (const float*) in0;
             out_fp32 = (float*) out;
             MishOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(in0_fp32,out_fp32);
+            break;
+        case Type_t::f16:
+            MishOpImpl_fp16<<<num_blocks_, threads_per_block_, 0, stream>>>((const __half*)in0, (__half*)out);
             break;
         default:
             throw_ov_exception(fmt::format("Input element type = {} is not supported by Mish operation !!",

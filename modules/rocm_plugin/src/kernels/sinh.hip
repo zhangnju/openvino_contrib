@@ -3,6 +3,7 @@
 //
 
 #include "sinh.hpp"
+#include <hip/hip_fp16.h>
 
 namespace ov {
 namespace rocm_gpu {
@@ -24,6 +25,12 @@ static __global__ void SinhOpImpl_fp32(const float* in, float* out)
     out[i] = sinhf(in[i]);
 }
 
+static __global__ void SinhOpImpl_fp16(const __half* in, __half* out)
+{
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    out[i] = __float2half(sinhf(__half2float(in[i])));
+}
+
 Sinh::Sinh(Type_t element_type, size_t max_threads_per_block, size_t num_elements)
 {
     element_type_ = element_type;
@@ -42,6 +49,9 @@ void Sinh::operator()(hipStream_t stream, const void* in0, void* out) const {
             in0_fp32 = (const float*) in0;
             out_fp32 = (float*) out;
             SinhOpImpl_fp32<<<num_blocks_, threads_per_block_, 0, stream>>>(in0_fp32,out_fp32);
+            break;
+        case Type_t::f16:
+            SinhOpImpl_fp16<<<num_blocks_, threads_per_block_, 0, stream>>>((const __half*)in0, (__half*)out);
             break;
         default:
             throw_ov_exception(fmt::format("Input element type = {} is not supported by Sinh operation !!",
