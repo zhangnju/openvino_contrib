@@ -75,8 +75,10 @@ private:
     Type_t element_type_integer_;
 };
 
-template class StridedSliceKernelOp<int32_t>;
-template class StridedSliceKernelOp<int64_t>;
+// Explicit instantiations are emitted at the end of strided_slice.hip (where the
+// member-function definitions are visible). Declared here as extern to other TUs.
+extern template class StridedSliceKernelOp<int32_t>;
+extern template class StridedSliceKernelOp<int64_t>;
 
 }  // namespace kernel
 }  // namespace rocm_gpu

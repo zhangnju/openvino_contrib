@@ -146,8 +146,8 @@ StridedSliceKernelOp<T_INT>::StridedSliceKernelOp(const std::vector<T_INT> src_m
       element_type_{element_type},
       element_type_integer_{element_type_integer} {
     
-    using StridedSliceElementTypesSwitch = ElementTypesSwitch<Type_t::f32>;
-    //ElementTypesSwitch<Type_t::f32, Type_t::i32, Type_t::f16, Type_t::i16, Type_t::i8, Type_t::u8>;
+    using StridedSliceElementTypesSwitch =
+        ElementTypesSwitch<Type_t::f32, Type_t::i32, Type_t::f16, Type_t::i16, Type_t::i8, Type_t::u8>;
     TypeValidator<StridedSliceElementTypesSwitch>::check(element_type_);
     using StridedSliceIntegerElementTypesSwitch = ElementTypesSwitch<Type_t::i32, Type_t::i64>;
     TypeValidator<StridedSliceIntegerElementTypesSwitch>::check(element_type_integer_);
@@ -166,7 +166,6 @@ void StridedSliceKernelOp<T_INT>::operator()(const hipStream_t stream,
     switch (element_type_) {
         case Type_t::f32:
             return callKernels<float>(stream, src_matrix_sizes, src, begin, end, stride, dst_matrix_sizes, dst);
-        /*
         case Type_t::i32:
             return callKernels<int32_t>(stream, src_matrix_sizes, src, begin, end, stride, dst_matrix_sizes, dst);
         case Type_t::f16:
@@ -177,7 +176,6 @@ void StridedSliceKernelOp<T_INT>::operator()(const hipStream_t stream,
             return callKernels<int8_t>(stream, src_matrix_sizes, src, begin, end, stride, dst_matrix_sizes, dst);
         case Type_t::u8:
             return callKernels<uint8_t>(stream, src_matrix_sizes, src, begin, end, stride, dst_matrix_sizes, dst);
-        */
         default:
             throw_ov_exception(fmt::format("Input element type = {} is not supported by StridedSlice operation !!",
                                          element_type_));
@@ -238,6 +236,10 @@ void StridedSliceKernelOp<T_INT>::callReverseAxesKernel(const hipStream_t stream
                                                               static_cast<T*>(dst));
     }
 }
+
+// Explicit instantiations (method definitions are visible here, unlike in the header).
+template class StridedSliceKernelOp<int32_t>;
+template class StridedSliceKernelOp<int64_t>;
 
 }  // namespace kernel
 
