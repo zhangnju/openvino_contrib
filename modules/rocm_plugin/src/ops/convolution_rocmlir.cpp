@@ -69,6 +69,12 @@ ConvolutionRocMLIR::ConvolutionRocMLIR(
         const Convolution::Details::ConvolutionParams& params)
     : OperationBase(ctx, node, std::move(inputIds), std::move(outputIds))
 {
+    // rocMLIR conv path only supports f16/f32. For quantized (int8) convolutions
+    // the IR generator would emit f32-typed IR for i8 buffers (malformed), so bail
+    // out here and let the convolution factory fall through to the MIOpen backend.
+    OPENVINO_ASSERT(params.element_type_ == ov::element::Type_t::f16 ||
+                        params.element_type_ == ov::element::Type_t::f32,
+                    "ConvolutionRocMLIR: only f16/f32 supported");
     conv_params_ = to_rocmlir_params(params, ctx.device());
     // compile_conv or fetch from cache
     kernel_ = &rocmlir::RocMLIRKernelCache::global().get_or_compile(conv_params_);

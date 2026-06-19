@@ -1804,36 +1804,52 @@ static std::string patch_ir_bias_silu(const std::string& base_ir, const ConvPara
 
         std::ostringstream epi;
 
-        // 3D linalg.generic epilogue via memref.expand_shape — NO integer division.
-        // Reshapes flat [N*K*OH*OW] alloc to 3D [K, OH, OW] using expand_shape.
-        // Bias is a 1D [K] memref; affine_map<(d0,d1,d2)->(d0)> handles broadcast.
-        // This matches what MIGraphX generates, but using expand_shape instead of rock.transform.
-        const size_t ohw = (size_t)OH * OW;
-        epi << "    // ── bias + " << (with_silu ? "SiLU" : "add") << " epilogue (3D, no int div) ────\n";
+        // bias epilogue via memref.expand_shape — NO integer division.
+        // For N==1 we keep the original 3D [K, OH, OW] reshape (bias broadcast over d0).
+        // For N>1 we use 4D [N, K, OH, OW] (bias broadcast over d1) so the flat
+        // [N*K*OH*OW] alloc reshapes correctly.
+        const bool nd4 = (p.N > 1);
+        epi << "    // ── bias + " << (with_silu ? "SiLU" : "add") << (nd4 ? " epilogue (4D)" : " epilogue (3D)") << " ────\n";
         if (with_silu) {
             epi << "    %cst = arith.constant 1.0e+00 : f32\n";
         }
-        // Reshape flat conv output [K*OH*OW] → 3D [K, OH, OW]
-        epi << "    %conv_3d = memref.expand_shape %conv_out_alloc [[0, 1, 2]]"
-            << " output_shape [" << p.K << ", " << OH << ", " << OW << "]"
-            << " : memref<" << out_flat << "x" << dt << "> into"
-            << " memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">\n";
-        // Reshape flat output arg3 [K*OH*OW] → 3D [K, OH, OW]
-        epi << "    %out_3d = memref.expand_shape %arg3 [[0, 1, 2]]"
-            << " output_shape [" << p.K << ", " << OH << ", " << OW << "]"
-            << " : memref<" << out_flat << "x" << dt << "> into"
-            << " memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">\n";
-
-        // 3D parallel linalg.generic: bias broadcast via affine_map<(d0,d1,d2)->(d0)>
-        epi << "    linalg.generic {\n"
-            << "      indexing_maps = [\n"
-            << "        affine_map<(d0, d1, d2) -> (d0, d1, d2)>,\n"  // conv_3d
-            << "        affine_map<(d0, d1, d2) -> (d0)>,\n"            // bias (broadcast H,W)
-            << "        affine_map<(d0, d1, d2) -> (d0, d1, d2)>],\n"  // out_3d
-            << "      iterator_types = [\"parallel\", \"parallel\", \"parallel\"]}\n"
-            << "      ins(%conv_3d, %arg2 : memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">,"
-            << " memref<" << p.K << "x" << dt << ">)\n"
-            << "      outs(%out_3d : memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">) {\n";
+        if (nd4) {
+            epi << "    %conv_3d = memref.expand_shape %conv_out_alloc [[0, 1, 2, 3]]"
+                << " output_shape [" << p.N << ", " << p.K << ", " << OH << ", " << OW << "]"
+                << " : memref<" << out_flat << "x" << dt << "> into"
+                << " memref<" << p.N << "x" << p.K << "x" << OH << "x" << OW << "x" << dt << ">\n";
+            epi << "    %out_3d = memref.expand_shape %arg3 [[0, 1, 2, 3]]"
+                << " output_shape [" << p.N << ", " << p.K << ", " << OH << ", " << OW << "]"
+                << " : memref<" << out_flat << "x" << dt << "> into"
+                << " memref<" << p.N << "x" << p.K << "x" << OH << "x" << OW << "x" << dt << ">\n";
+            epi << "    linalg.generic {\n"
+                << "      indexing_maps = [\n"
+                << "        affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,\n"
+                << "        affine_map<(d0, d1, d2, d3) -> (d1)>,\n"
+                << "        affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],\n"
+                << "      iterator_types = [\"parallel\", \"parallel\", \"parallel\", \"parallel\"]}\n"
+                << "      ins(%conv_3d, %arg2 : memref<" << p.N << "x" << p.K << "x" << OH << "x" << OW << "x" << dt << ">,"
+                << " memref<" << p.K << "x" << dt << ">)\n"
+                << "      outs(%out_3d : memref<" << p.N << "x" << p.K << "x" << OH << "x" << OW << "x" << dt << ">) {\n";
+        } else {
+            epi << "    %conv_3d = memref.expand_shape %conv_out_alloc [[0, 1, 2]]"
+                << " output_shape [" << p.K << ", " << OH << ", " << OW << "]"
+                << " : memref<" << out_flat << "x" << dt << "> into"
+                << " memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">\n";
+            epi << "    %out_3d = memref.expand_shape %arg3 [[0, 1, 2]]"
+                << " output_shape [" << p.K << ", " << OH << ", " << OW << "]"
+                << " : memref<" << out_flat << "x" << dt << "> into"
+                << " memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">\n";
+            epi << "    linalg.generic {\n"
+                << "      indexing_maps = [\n"
+                << "        affine_map<(d0, d1, d2) -> (d0, d1, d2)>,\n"
+                << "        affine_map<(d0, d1, d2) -> (d0)>,\n"
+                << "        affine_map<(d0, d1, d2) -> (d0, d1, d2)>],\n"
+                << "      iterator_types = [\"parallel\", \"parallel\", \"parallel\"]}\n"
+                << "      ins(%conv_3d, %arg2 : memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">,"
+                << " memref<" << p.K << "x" << dt << ">)\n"
+                << "      outs(%out_3d : memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">) {\n";
+        }
         epi << "    ^bb0(%in: " << dt << ", %bias_v: " << dt << ", %out: " << dt << "):\n";
         if (p.fp16) {
             epi << "      %e0 = arith.extf %in : f16 to f32\n";
@@ -1934,35 +1950,59 @@ static std::string patch_ir_bias_silu_add(const std::string& base_ir, const Conv
         std::ostringstream epi;
         epi << "    %cst = arith.constant 1.0e+00 : f32\n";
 
-        // Reshape flat tensors to 3D [K, OH, OW]
-        epi << "    %conv_3d = memref.expand_shape %conv_out_alloc [[0, 1, 2]]"
-            << " output_shape [" << p.K << ", " << OH << ", " << OW << "]"
-            << " : memref<" << out_flat << "x" << dt << "> into"
-            << " memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">\n";
-        // skip_input is arg3
-        epi << "    %skip_3d = memref.expand_shape %arg3 [[0, 1, 2]]"
-            << " output_shape [" << p.K << ", " << OH << ", " << OW << "]"
-            << " : memref<" << out_flat << "x" << dt << "> into"
-            << " memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">\n";
-        // output is arg4
-        epi << "    %out_3d = memref.expand_shape %arg4 [[0, 1, 2]]"
-            << " output_shape [" << p.K << ", " << OH << ", " << OW << "]"
-            << " : memref<" << out_flat << "x" << dt << "> into"
-            << " memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">\n";
-
-        // linalg.generic: 4 inputs (conv, bias, skip), 1 output
-        epi << "    linalg.generic {\n"
-            << "      indexing_maps = [\n"
-            << "        affine_map<(d0, d1, d2) -> (d0, d1, d2)>,\n"   // conv_3d
-            << "        affine_map<(d0, d1, d2) -> (d0)>,\n"             // bias (broadcast)
-            << "        affine_map<(d0, d1, d2) -> (d0, d1, d2)>,\n"   // skip_3d
-            << "        affine_map<(d0, d1, d2) -> (d0, d1, d2)>],\n"  // out_3d
-            << "      iterator_types = [\"parallel\", \"parallel\", \"parallel\"]}\n"
-            << "      ins(%conv_3d, %arg2, %skip_3d : "
-            << "memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">, "
-            << "memref<" << p.K << "x" << dt << ">, "
-            << "memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">)\n"
-            << "      outs(%out_3d : memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">) {\n";
+        // Reshape flat tensors: N==1 → 3D [K,OH,OW] (original); N>1 → 4D [N,K,OH,OW].
+        const bool nd4 = (p.N > 1);
+        if (nd4) {
+            epi << "    %conv_3d = memref.expand_shape %conv_out_alloc [[0, 1, 2, 3]]"
+                << " output_shape [" << p.N << ", " << p.K << ", " << OH << ", " << OW << "]"
+                << " : memref<" << out_flat << "x" << dt << "> into"
+                << " memref<" << p.N << "x" << p.K << "x" << OH << "x" << OW << "x" << dt << ">\n";
+            epi << "    %skip_3d = memref.expand_shape %arg3 [[0, 1, 2, 3]]"
+                << " output_shape [" << p.N << ", " << p.K << ", " << OH << ", " << OW << "]"
+                << " : memref<" << out_flat << "x" << dt << "> into"
+                << " memref<" << p.N << "x" << p.K << "x" << OH << "x" << OW << "x" << dt << ">\n";
+            epi << "    %out_3d = memref.expand_shape %arg4 [[0, 1, 2, 3]]"
+                << " output_shape [" << p.N << ", " << p.K << ", " << OH << ", " << OW << "]"
+                << " : memref<" << out_flat << "x" << dt << "> into"
+                << " memref<" << p.N << "x" << p.K << "x" << OH << "x" << OW << "x" << dt << ">\n";
+            epi << "    linalg.generic {\n"
+                << "      indexing_maps = [\n"
+                << "        affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,\n"
+                << "        affine_map<(d0, d1, d2, d3) -> (d1)>,\n"
+                << "        affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,\n"
+                << "        affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],\n"
+                << "      iterator_types = [\"parallel\", \"parallel\", \"parallel\", \"parallel\"]}\n"
+                << "      ins(%conv_3d, %arg2, %skip_3d : "
+                << "memref<" << p.N << "x" << p.K << "x" << OH << "x" << OW << "x" << dt << ">, "
+                << "memref<" << p.K << "x" << dt << ">, "
+                << "memref<" << p.N << "x" << p.K << "x" << OH << "x" << OW << "x" << dt << ">)\n"
+                << "      outs(%out_3d : memref<" << p.N << "x" << p.K << "x" << OH << "x" << OW << "x" << dt << ">) {\n";
+        } else {
+            epi << "    %conv_3d = memref.expand_shape %conv_out_alloc [[0, 1, 2]]"
+                << " output_shape [" << p.K << ", " << OH << ", " << OW << "]"
+                << " : memref<" << out_flat << "x" << dt << "> into"
+                << " memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">\n";
+            epi << "    %skip_3d = memref.expand_shape %arg3 [[0, 1, 2]]"
+                << " output_shape [" << p.K << ", " << OH << ", " << OW << "]"
+                << " : memref<" << out_flat << "x" << dt << "> into"
+                << " memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">\n";
+            epi << "    %out_3d = memref.expand_shape %arg4 [[0, 1, 2]]"
+                << " output_shape [" << p.K << ", " << OH << ", " << OW << "]"
+                << " : memref<" << out_flat << "x" << dt << "> into"
+                << " memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">\n";
+            epi << "    linalg.generic {\n"
+                << "      indexing_maps = [\n"
+                << "        affine_map<(d0, d1, d2) -> (d0, d1, d2)>,\n"
+                << "        affine_map<(d0, d1, d2) -> (d0)>,\n"
+                << "        affine_map<(d0, d1, d2) -> (d0, d1, d2)>,\n"
+                << "        affine_map<(d0, d1, d2) -> (d0, d1, d2)>],\n"
+                << "      iterator_types = [\"parallel\", \"parallel\", \"parallel\"]}\n"
+                << "      ins(%conv_3d, %arg2, %skip_3d : "
+                << "memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">, "
+                << "memref<" << p.K << "x" << dt << ">, "
+                << "memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">)\n"
+                << "      outs(%out_3d : memref<" << p.K << "x" << OH << "x" << OW << "x" << dt << ">) {\n";
+        }
         epi << "    ^bb0(%in: " << dt << ", %bias_v: " << dt
             << ", %skip_v: " << dt << ", %out: " << dt << "):\n";
         if (p.fp16) {
