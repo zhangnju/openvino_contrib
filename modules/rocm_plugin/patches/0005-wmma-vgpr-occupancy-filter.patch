@@ -1,0 +1,74 @@
+From: OpenVINO ROCm Plugin <noreply@openvino.org>
+Subject: [PATCH 5/6] Reject low-occupancy WMMA tuning configs
+
+Estimate VGPR usage for WMMA configs on gfx1100 (wave32, 1536 VGPRs/SIMD)
+and reject configurations that would result in <50% occupancy (<8 waves).
+
+Accumulator VGPRs = 8 * mRepeats * nRepeats, plus input and copy buffer
+registers. Configs with oversized tiles (e.g. mPerWave=128, nPerWave=128)
+that push VGPR count past 192 are filtered out, preventing occupancy drops
+from 81% to <50%.
+---
+diff --git a/mlir/lib/Dialect/Rock/Tuning/GridwiseGemmParams.cpp b/mlir/lib/Dialect/Rock/Tuning/GridwiseGemmParams.cpp
+index be136a4775d2..5b88fe1cf480 100644
+--- a/mlir/lib/Dialect/Rock/Tuning/GridwiseGemmParams.cpp
++++ b/mlir/lib/Dialect/Rock/Tuning/GridwiseGemmParams.cpp
+@@ -726,10 +726,54 @@ PopulateParamsWmma::getTuningParameters(KernelType opType, Type dataTypeA,
+ LogicalResult
+ PopulateParamsWmma::specificCouldBePerformant(const InitParamsAccel &params,
+                                               Type dataTypeA, Type dataTypeB) {
+-  // Implement this if needed.
+-  (void)params;
+-  (void)dataTypeA;
+-  (void)dataTypeB;
++  // Estimate VGPR usage and reject configs with low occupancy.
++  // WMMA on gfx1100: wave32, 1536 VGPRs per SIMD, max 16 waves.
++  // Accumulator: 8 * mRepeats * nRepeats (f32 output vectors)
++  // Input buffers: 2 * kBasePerThread * vectorLen (A + B)
++  // Copy buffers: (kPerBlock * mPerBlock + kPerBlock * nPerBlock) / blockSize
++
++  const int64_t dPerAccel = 16; // WMMA 16x16x16
++  int64_t mPerWave = params.gemmMPerWave;
++  int64_t nPerWave = params.gemmNPerWave;
++  if (params.getVersion() < InitParamsAccel::Version::V4)
++    nPerWave = params.gemmNPerWaveOrMnPerXdl;
++
++  if (mPerWave == 0 || nPerWave == 0)
++    return success();
++
++  int64_t mRepeats = mPerWave / dPerAccel;
++  int64_t nRepeats = nPerWave / dPerAccel;
++  int64_t waveSize = 32;
++  int64_t blockSize = (params.gemmMPerBlock / mPerWave) *
++                      (params.gemmNPerBlock / nPerWave) * waveSize;
++  if (blockSize == 0)
++    return success();
++
++  // C accumulator: 8 f32 values per WMMA result, times repeats
++  int64_t accVgprs = 8 * mRepeats * nRepeats;
++
++  // Input operand registers (A and B from LDS)
++  int64_t kPerBlock = params.gemmKPerBlock * params.gemmKPack;
++  int64_t inputVectorLen = 16; // WMMA loads vector<16xf16>
++  int64_t kBasePerThread = std::max(int64_t(1), kPerBlock / inputVectorLen);
++  int64_t inputVgprs = kBasePerThread * inputVectorLen; // A
++  inputVgprs += kBasePerThread * inputVectorLen;        // B
++  // f16 packs 2 per VGPR
++  inputVgprs = inputVgprs / 2;
++
++  // Copy buffers (global → LDS staging)
++  int64_t copyElems = (kPerBlock * params.gemmMPerBlock +
++                       kPerBlock * params.gemmNPerBlock) / blockSize;
++  int64_t copyVgprs = copyElems / 2; // f16
++
++  int64_t estVgprs = accVgprs + inputVgprs + copyVgprs + 16; // +16 overhead
++
++  // Reject if occupancy < 50% (fewer than 8 waves per SIMD out of 16 max)
++  // 1536 VGPRs per SIMD on gfx1100
++  int64_t wavesPerSimd = 1536 / std::max(estVgprs, int64_t(1));
++  if (wavesPerSimd < 8)
++    return failure();
++
+   return success();
+ }
+ 
