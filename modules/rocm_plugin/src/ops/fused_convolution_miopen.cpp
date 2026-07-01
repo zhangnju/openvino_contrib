@@ -3,6 +3,7 @@
 //
 
 #include "fused_convolution_miopen.hpp"
+#include "convolution_miopen.hpp"
 
 #include <miopen/miopen.h>
 
@@ -52,6 +53,8 @@ void FusedConvolutionmiopen::Execute(const InferenceRequestContext& context,
                                     Inputs inputs,
                                     Outputs outputs,
                                     const Workbuffers& workbuffers) const {
+    MiopenLockGuard miopen_lock;
+
     using ArgIndices = Convolution::Details::FusedConvolutionIndices;
 
     const bool includesOnlyBiasAdd = inputs.size() == 3;
@@ -81,7 +84,7 @@ void FusedConvolutionmiopen::Execute(const InferenceRequestContext& context,
     // Step 1: LazyFind on first Execute, then use stable old-style Forward API.
     // miopenFindConvolutionForwardAlgorithm tests solvers with actual data —
     // GemmFwd1x1_0_1 (GPU fault on gfx950) will be rejected during testing.
-    constexpr size_t findWsSize = 256ULL * 1024 * 1024;
+    constexpr size_t findWsSize = 64ULL * 1024 * 1024;
     conv_descs_->LazyFindAlgo(dnnHandle,
                                inputs[ArgIndices::input].get(),
                                inputs[ArgIndices::filter].get(),
@@ -147,7 +150,7 @@ rocmGraphCompatibility FusedConvolutionmiopen::GetrocmGraphCompatibility() const
 
 WorkbufferRequest FusedConvolutionmiopen::GetWorkBufferRequest() const {
     // Allocate large workspace so LazyFindAlgo can test all candidate solvers
-    const size_t ws = std::max(conv_descs_->WorkspaceSize(), (size_t)(256 * 1024 * 1024));
+    const size_t ws = std::max(conv_descs_->WorkspaceSize(), (size_t)(64 * 1024 * 1024));
     return {{}, {ws}};
 }
 

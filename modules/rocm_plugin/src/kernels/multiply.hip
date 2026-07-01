@@ -27,6 +27,32 @@ static __global__ void MultiplyOpImpl_fp32(const float* in0, const float* in1,fl
 }
 */
 
+// Fast periodic broadcast multiply: out[i] = in0[i] * in1[i % period]
+// Covers swin per-channel *[1,1,1,C] (period=C, repeat=1) and per-head *[1,H,1,1]
+static __global__ void multiply_bcast_periodic_h2(
+    const __half2* __restrict__ in0,
+    const __half* __restrict__ in1,
+    __half2* __restrict__ out,
+    unsigned n2, unsigned period, unsigned repeat)
+{
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n2) return;
+    __half2 a = in0[i];
+    if (repeat == 1) {
+        // Last-dim broadcast: in1 repeats every period elements
+        unsigned j = (i * 2) % period;
+        __half2 b = __halves2half2(in1[j], in1[j + 1]);
+        out[i] = __hmul2(a, b);
+    } else {
+        // Per-head broadcast: in1[head_idx] scalar broadcast
+        unsigned elem_idx = i * 2;
+        unsigned head_idx = (elem_idx / repeat) % period;
+        __half b = in1[head_idx];
+        __half2 b2 = __half2half2(b);
+        out[i] = __hmul2(a, b2);
+    }
+}
+
 Multiply::Multiply(Type_t element_type, size_t out_num_elements, size_t max_threads_per_block)
     : impl_{element_type, out_num_elements, max_threads_per_block} {}
 /*
@@ -38,6 +64,20 @@ Multiply::Multiply(Type_t element_type, size_t out_num_elements, size_t max_thre
     std::tie(num_blocks_, threads_per_block_) = calculateElementwiseGrid(out_num_elements, max_threads_per_block);
 }
 */
+void Multiply::launch_bcast_periodic_f16(hipStream_t stream,
+                                        const void* in0, const void* in1, void* out,
+                                        size_t total, size_t period, size_t repeat) const {
+    unsigned n2 = total / 2;
+    unsigned blk = 256;
+    unsigned grd = (n2 + blk - 1) / blk;
+    hipLaunchKernelGGL(multiply_bcast_periodic_h2,
+        dim3(grd), dim3(blk), 0, stream,
+        reinterpret_cast<const __half2*>(in0),
+        reinterpret_cast<const __half*>(in1),
+        reinterpret_cast<__half2*>(out),
+        n2, (unsigned)period, (unsigned)repeat);
+}
+
 void Multiply::operator()(hipStream_t stream,
                           const void* in0,
                           const NumpyBroadcastMapper& in0_mapper,

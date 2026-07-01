@@ -59,6 +59,23 @@ MvnOp::MvnOp(const CreationContext& context,
     if (!isTypeSupported(op_desc_type_)) {
         throw_ov_exception(fmt::format("MvnOp: unsupported argument type: {}", toString(op_desc_type_)));
     }
+    // Fast MVN path: warp-per-row kernel for last-axis-only reduce, f16, normalize_variance.
+    // Replaces MIOpen's gridwise_generic_reduce (~28% faster on swin).
+    if (!std::getenv("ROCM_DISABLE_MVN_FAST") &&
+        normalize_variance_ && !reduced_shape_.empty() &&
+        comp_type_ == miopenHalf && shape_.size() >= 2) {
+        // Check: reduce axes = last axis only
+        bool last_axis_only = true;
+        for (size_t i = 0; i < shape_.size() - 1; i++) {
+            if (reduced_shape_[i] != shape_[i]) { last_axis_only = false; break; }
+        }
+        if (last_axis_only && reduced_shape_.back() == 1) {
+            fast_cols_ = shape_.back();
+            fast_rows_ = 1;
+            for (size_t i = 0; i < shape_.size() - 1; i++) fast_rows_ *= shape_[i];
+            fast_ok_ = true;
+        }
+    }
     if (!reduced_shape_.empty()) {
         size_t size = shape_size(reduced_shape_);
         unsigned max_threads_per_block = context.device().props().maxThreadsPerBlock;
@@ -78,6 +95,14 @@ void MvnOp::Execute(const InferenceRequestContext& context,
                     Inputs inputTensors,
                     Outputs outputTensors,
                     const Workbuffers& workbuffers) const {
+    // Fast path: native warp-per-row MVN kernel (replaces MIOpen gridwise_generic_reduce)
+    if (fast_ok_) {
+        kernel::launchMvnFast(context.getThreadContext().stream().get(),
+                              inputTensors[0].get(), outputTensors[0].get(),
+                              fast_rows_, fast_cols_, (float)epsilon_);
+        return;
+    }
+
     if (reduced_shape_.empty()) {
         // Edge case: no axes to reduce → output = x - x = 0. Keep legacy path.
         Context opContext{context, workbuffers, *this};

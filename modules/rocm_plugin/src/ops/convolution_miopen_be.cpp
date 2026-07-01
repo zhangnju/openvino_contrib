@@ -3,6 +3,7 @@
 //
 
 #include "convolution_miopen_be.hpp"
+#include "convolution_miopen.hpp"
 
 #include <fmt/format.h>
 
@@ -125,6 +126,7 @@ void ConvolutionmiopenBE::Execute(const InferenceRequestContext& context,
                                  Inputs inputs,
                                  Outputs outputs,
                                  const Workbuffers& workbuffers) const {
+    MiopenLockGuard miopen_lock;
     OPENVINO_ASSERT(inputs.size() == 2, "Node name: ", GetName());
     OPENVINO_ASSERT(outputs.size() == 1, "Node name: ", GetName());
 

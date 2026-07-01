@@ -24,10 +24,12 @@ void Convolutionmiopen::Execute(const InferenceRequestContext& context,
                                Inputs inputs,
                                Outputs outputs,
                                const Workbuffers& workbuffer) const {
+    MiopenLockGuard miopen_lock;
     OPENVINO_ASSERT(inputs.size() == 2, "Node name: ", GetName());
     OPENVINO_ASSERT(outputs.size() == 1, "Node name: ", GetName());
-    std::size_t workspace_size = 0;
-    workspace_size = descs_.WorkspaceSize();
+    std::size_t workspace_size = descs_.WorkspaceSize();
+    constexpr std::size_t kMaxWorkspace = 64 * 1024 * 1024; // 64MB cap for multi-stream safety
+    if (workspace_size > kMaxWorkspace) workspace_size = 0;
     if( workspace_size ==0 )
     {
         uint64_t solution_id = descs_.SolutionId();

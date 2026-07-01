@@ -119,10 +119,25 @@ void ConvolutionDescriptorsmiopen::BenchmarkOptimalAlgo(const rocm::DnnHandle& d
     algo_perf_ = *optimalAlgo;
 }
 
+// Global mutex for MIOpen find — MIOpen's internal plan cache is not thread-safe.
+// Concurrent miopenFindConvolutionForwardAlgorithm calls from different threads
+// corrupt the solver cache and cause "No invoker was registered" in forward calls.
+static std::mutex& getMiopenFindMutex() {
+    static std::mutex mu;
+    return mu;
+}
+
 void ConvolutionDescriptorsmiopen::LazyFindAlgo(const rocm::DnnHandle& dnnHandle,
                                                  const void* in, const void* filter, void* out,
                                                  void* workspace, std::size_t workspaceSize) {
-    if (algo_found_) return;
+    // MIOpen registers invokers per-handle. In multi-stream mode each stream
+    // has a different dnnHandle, so find must run for each unique handle.
+    // Track which handles have completed find via a thread-safe set.
+    {
+        auto handle_ptr = reinterpret_cast<uintptr_t>(dnnHandle.get());
+        std::lock_guard<std::mutex> lock(getMiopenFindMutex());
+        if (found_handles_.count(handle_ptr)) return;
+    }
 
     // Request multiple candidates so we can skip broken ones.
     // GemmFwd1x1_0_1 causes GPU memory faults on gfx950 (MIOpen 7.2 bug).
@@ -144,6 +159,7 @@ void ConvolutionDescriptorsmiopen::LazyFindAlgo(const rocm::DnnHandle& dnnHandle
                                                           false);  // heuristic mode
     if (status != miopenStatusSuccess || returnedCount <= 0) return;
 
+    auto handle_ptr = reinterpret_cast<uintptr_t>(dnnHandle.get());
     // Select best candidate that is not GemmFwd1x1 (GEMM+workspace=0 pattern)
     for (int i = 0; i < returnedCount; ++i) {
         const auto& p = perf_results[i];
@@ -153,6 +169,7 @@ void ConvolutionDescriptorsmiopen::LazyFindAlgo(const rocm::DnnHandle& dnnHandle
             algo_perf_      = p;
             workspace_size_ = p.memory;
             algo_found_     = true;
+            { std::lock_guard<std::mutex> lk(getMiopenFindMutex()); found_handles_.insert(handle_ptr); }
             return;
         }
     }
@@ -160,6 +177,7 @@ void ConvolutionDescriptorsmiopen::LazyFindAlgo(const rocm::DnnHandle& dnnHandle
     algo_perf_      = perf_results[0];
     workspace_size_ = perf_results[0].memory;
     algo_found_     = true;
+    { std::lock_guard<std::mutex> lk(getMiopenFindMutex()); found_handles_.insert(handle_ptr); }
 }
 
 void ConvolutionDescriptorsmiopen::GetAlgo(const rocm::DnnHandle& dnnHandle) {
@@ -282,6 +300,10 @@ bool ConvolutionDescriptorsmiopen::FindAlgoForConvDataType(const rocm::DnnHandle
     ::miopenConvolutionForwardGetWorkSpaceSize(dnnHandle.get(),
                                                filter_.get(), input_.get(), conv_.get(), output_.get(),
                                                &findWorkspaceSize);
+
+    // Cap workspace to 64MB for multi-stream OOM safety (9 streams × N convs)
+    constexpr std::size_t kMaxFindWorkspace = 64 * 1024 * 1024;
+    if (findWorkspaceSize > kMaxFindWorkspace) findWorkspaceSize = kMaxFindWorkspace;
 
     // Allocate temporary workspace for Find
     void* findWorkspace = nullptr;

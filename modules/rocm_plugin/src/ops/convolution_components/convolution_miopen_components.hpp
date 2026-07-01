@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <mutex>
+#include <unordered_set>
 #include <rocm_creation_context.hpp>
 
 #include "convolution_components.hpp"
@@ -123,6 +125,8 @@ private:
     std::vector<miopenDataType_t> half_desc_types_;
     mutable std::size_t workspace_size_;
     mutable uint64_t solution_id_;
+    mutable std::mutex find_mutex_;
+    mutable std::unordered_set<uintptr_t> found_handles_;
     mutable bool algo_found_{false};
 };
 

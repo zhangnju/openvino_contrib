@@ -12,6 +12,7 @@
 #include <openvino/core/except.hpp>
 
 #include "converters.hpp"
+#include "kernels/fused_reduce.hpp"
 #include "rocm/constant_factory.hpp"
 
 namespace ov {
@@ -171,7 +172,26 @@ SoftmaxOp::SoftmaxOp(const CreationContext& context,
     }
     const int axis = node.get_axis();
     mapRankAxis(node.input(0).get_shape(), axis);
-    tensor_descriptor_.set(miopenTensorLayout_t::miopenTensorNCHW, type_, 4, shape_.data());
+    // Check if MIOpen will crash on this shape (N too large)
+    // MIOpen softmax has internal issues when N > ~8M on gfx1100.
+    // Fallback to custom warp kernel for fp16 with reasonable cols.
+    const size_t N_collapsed = static_cast<size_t>(shape_[0]);
+    const int softmax_dim = shape_[1];  // C dimension in NCHW mapping
+    use_custom_kernel_ = false;
+    if (type_ == miopenHalf && N_collapsed > 4000000 && softmax_dim <= 256) {
+        use_custom_kernel_ = true;
+        // For axis=last (most common), rows = product of all dims except last
+        const auto& orig_shape = node.input(0).get_shape();
+        custom_cols_ = static_cast<int>(orig_shape.back());
+        custom_rows_ = 1;
+        for (size_t i = 0; i < orig_shape.size() - 1; ++i)
+            custom_rows_ *= orig_shape[i];
+        fprintf(stderr, "[Softmax] Using custom kernel: rows=%zu cols=%d (MIOpen N=%zu too large)\n",
+                custom_rows_, custom_cols_, N_collapsed);
+    }
+
+    if (!use_custom_kernel_)
+        tensor_descriptor_.set(miopenTensorLayout_t::miopenTensorNCHW, type_, 4, shape_.data());
 }
 
 void SoftmaxOp::Execute(const InferenceRequestContext& context,
@@ -180,6 +200,17 @@ void SoftmaxOp::Execute(const InferenceRequestContext& context,
                         const Workbuffers&) const {
     OPENVINO_ASSERT(inputs.size() == 1);
     OPENVINO_ASSERT(outputs.size() == 1);
+
+    // MIOpen miopenSoftmaxForward crashes when N (collapsed batch dim) is very large
+    // (e.g. N=12582912 for swin_base_v2_bs8). Use custom warp kernel as fallback.
+    // The custom kernel handles fp16 softmax over the last axis with cols <= 256.
+    if (use_custom_kernel_) {
+        const auto& stream = context.getThreadContext().stream();
+        kernel::launch_plain_softmax(stream.get(), inputs[0].get(), outputs[0].get(),
+                             custom_rows_, custom_cols_);
+        return;
+    }
+
     throwIfError(miopenSoftmaxForward(context.getThreadContext().dnnHandle().get(),
                                      &rocm::constants::one<float>::value,
                                      tensor_descriptor_.get(),

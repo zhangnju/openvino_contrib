@@ -16,6 +16,7 @@
 #include "openvino/core/type/element_type.hpp"
 #include "openvino/op/variadic_split.hpp"
 #include "openvino/opsets/opset1.hpp"
+#include "openvino/op/reshape.hpp"
 #include "openvino/op/swish.hpp"
 #include "openvino/pass/pattern/matcher.hpp"
 #include "openvino/pass/pattern/op/or.hpp"
@@ -184,6 +185,11 @@ struct FusedConvCallbacks {
         auto activationNode = m.get_match_root();
         auto fused_conv = std::dynamic_pointer_cast<TFusedConvolution>(
             activationNode->input(0).get_source_output().get_node_shared_ptr());
+        if (!fused_conv) {
+            std::cerr << "[SinkAct] match root " << activationNode->get_type_name()
+                      << " input is not TFusedConvolution\n";
+            return false;
+        }
         if (fused_conv->get_activation() != ActivationMode::NO_ACTIVATION) {
             return false;
         }
@@ -197,9 +203,16 @@ struct FusedConvCallbacks {
             activation = ActivationMode::SWISH;
         } else if (ov::is_type<ov::op::v0::Tanh>(activationNode)) {
             activation = ActivationMode::TANH;
+        } else if (auto clamp = ov::as_type_ptr<ov::op::v0::Clamp>(activationNode)) {
+            if (clamp->get_min() == 0.0)
+                activation = ActivationMode::CLIPPED_RELU;
+            else
+                return false;
         } else {
             return false;
         }
+        std::cerr << "[SinkAct] fused " << activationNode->get_type_name()
+                  << " → activation=" << static_cast<int>(activation) << "\n";
         fused_conv->set_activation(activation);
 
         fused_conv->set_friendly_name(activationNode->get_friendly_name());
@@ -421,10 +434,28 @@ ov::rocm_gpu::pass::SinkActivationToFusedConvolution::SinkActivationToFusedConvo
     auto fused_convolution = wrap_type<FusedConvolution>(consumers_count(1));
     // Swish disabled: SinkActivationToFusedConvolution with Swish causes excessive D2D copies.
     // SiLU is handled separately by FusedElementwise or SwishOpImpl in the graph.
-    auto activation = wrap_type<ov::op::v0::Relu, ov::op::v0::Sigmoid>({fused_convolution});
+    auto activation = wrap_type<ov::op::v0::Relu, ov::op::v0::Sigmoid, ov::op::v0::Clamp>({fused_convolution});
 
     matcher_pass_callback callback = [](Matcher &m) {
         return FusedConvCallbacks<FusedConvolution>::sink_activation_to_fused_convolution(m);
+    };
+
+    auto m = std::make_shared<Matcher>(activation, matcher_name);
+    register_matcher(m, callback);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SinkActivationToFusedGroupConvolution
+// Same as SinkActivationToFusedConvolution but for FusedGroupConvolution
+// (depthwise/grouped conv). Needed for MobileNetV2 Conv+BN+ReLU6 pattern.
+// ─────────────────────────────────────────────────────────────────────────────
+ov::rocm_gpu::pass::SinkActivationToFusedGroupConvolution::SinkActivationToFusedGroupConvolution() {
+    MATCHER_SCOPE(SinkActivationToFusedGroupConvolution);
+    auto fused_convolution = wrap_type<FusedGroupConvolution>(consumers_count(1));
+    auto activation = wrap_type<ov::op::v0::Relu, ov::op::v0::Sigmoid, ov::op::v0::Clamp>({fused_convolution});
+
+    matcher_pass_callback callback = [](Matcher &m) {
+        return FusedConvCallbacks<FusedGroupConvolution>::sink_activation_to_fused_convolution(m);
     };
 
     auto m = std::make_shared<Matcher>(activation, matcher_name);
@@ -454,19 +485,157 @@ ov::rocm_gpu::pass::SinkSwishAddToFusedConvolution::SinkSwishAddToFusedConvoluti
 
 bool ov::rocm_gpu::pass::rocmConvolutionFusion::run_on_model(const std::shared_ptr<ov::Model>& m) {
     RUN_ON_FUNCTION_SCOPE(rocmConvolutionFusion);
+    // DEBUG: count Clamp nodes before fusion
+    {
+        int clamp_count = 0, fused_conv_count = 0, fused_group_count = 0;
+        for (auto& op : m->get_ordered_ops()) {
+            if (ov::is_type<ov::op::v0::Clamp>(op)) clamp_count++;
+            if (std::dynamic_pointer_cast<FusedConvolution>(op)) fused_conv_count++;
+            if (std::dynamic_pointer_cast<FusedGroupConvolution>(op)) fused_group_count++;
+        }
+        std::cerr << "[ConvFusion] PRE: Clamp=" << clamp_count
+                  << " FusedConv=" << fused_conv_count
+                  << " FusedGroupConv=" << fused_group_count << "\n";
+    }
     ov::pass::Manager manager(get_pass_config());
 
     manager.register_pass<rocmFuseMarkUpNodesOrder>();
 
-    auto fuse_conv_bias_add_activation = manager.register_pass<ov::pass::GraphRewrite>();
-    ADD_MATCHER(fuse_conv_bias_add_activation, FuseConvolutionWithBiasAdd)
-    ADD_MATCHER(fuse_conv_bias_add_activation, FuseConvolutionWithBiasAddAdd)
-    ADD_MATCHER(fuse_conv_bias_add_activation, SinkActivationToFusedConvolution)
-    // Group conv bias fusion runs in the same GraphRewrite pass so SinkSwishAddPass
-    // (next pass) can see FusedGroupConvolution and fuse Swish+Add into them.
-    ADD_MATCHER(fuse_conv_bias_add_activation, FuseGroupConvolutionWithBiasAdd)
-    ADD_MATCHER(fuse_conv_bias_add_activation, FuseGroupConvolutionWithBiasAddAdd)
-    fuse_conv_bias_add_activation->set_name("ov::rocm_gpu::pass::fuse_conv_bias_add_activation");
+    // Pre-pass: fold Reshape(Constant, dynamic_shape) → Constant for bias tensors.
+    // torch 2.9 dynamo exporter creates Conv → Add(Reshape(bias_const, ShapeOf...))
+    // where ShapeOf prevents standard constant folding. We fold it here so that
+    // FuseConvolutionWithBiasAdd can match Add(Conv, Constant).
+    struct FoldBiasReshapePass : ov::pass::ModelPass {
+        OPENVINO_RTTI("FoldBiasReshapePass", "0");
+        bool run_on_model(const std::shared_ptr<ov::Model>& model) override {
+            int folded = 0;
+            for (auto& op : model->get_ordered_ops()) {
+                auto reshape = std::dynamic_pointer_cast<ov::op::v1::Reshape>(op);
+                if (!reshape) continue;
+                auto data_const = std::dynamic_pointer_cast<ov::op::v0::Constant>(
+                    reshape->input(0).get_source_output().get_node_shared_ptr());
+                if (!data_const) continue;
+                // Output shape must be static
+                auto out_ps = reshape->get_output_partial_shape(0);
+                if (out_ps.is_dynamic()) continue;
+                // Create new constant with reshaped data
+                auto out_shape = out_ps.to_shape();
+                auto new_const = std::make_shared<ov::op::v0::Constant>(
+                    data_const->get_element_type(), out_shape, data_const->get_data_ptr());
+                new_const->set_friendly_name(reshape->get_friendly_name());
+                ov::replace_node(reshape, new_const);
+                folded++;
+            }
+            if (folded > 0)
+                std::cerr << "[FoldBiasReshape] folded " << folded << " Reshape(Constant)→Constant\n";
+            return folded > 0;
+        }
+    };
+    manager.register_pass<FoldBiasReshapePass>();
+
+    auto fuse_conv_bias_add = manager.register_pass<ov::pass::GraphRewrite>();
+    ADD_MATCHER(fuse_conv_bias_add, FuseConvolutionWithBiasAdd)
+    ADD_MATCHER(fuse_conv_bias_add, FuseConvolutionWithBiasAddAdd)
+    ADD_MATCHER(fuse_conv_bias_add, FuseGroupConvolutionWithBiasAdd)
+    ADD_MATCHER(fuse_conv_bias_add, FuseGroupConvolutionWithBiasAddAdd)
+    fuse_conv_bias_add->set_name("ov::rocm_gpu::pass::fuse_conv_bias_add");
+
+    auto sink_activation = manager.register_pass<ov::pass::GraphRewrite>();
+    ADD_MATCHER(sink_activation, SinkActivationToFusedConvolution)
+    ADD_MATCHER(sink_activation, SinkActivationToFusedGroupConvolution)
+    sink_activation->set_name("ov::rocm_gpu::pass::sink_activation");
+
+    // Manual Conv+Bias+Clamp fusion as a ModelPass.
+    // Handles the pattern: Conv → Add(bias) → Clamp(min=0)
+    // where bias may be Reshape(Constant) instead of a direct Constant.
+    // This covers both FusedConvolution and raw Convolution patterns.
+    struct FuseConvBiasClampPass : ov::pass::ModelPass {
+        OPENVINO_RTTI("FuseConvBiasClampPass", "0");
+        bool run_on_model(const std::shared_ptr<ov::Model>& model) override {
+            int fused = 0;
+            for (auto& op : model->get_ordered_ops()) {
+                auto clamp = ov::as_type_ptr<ov::op::v0::Clamp>(op);
+                if (!clamp || clamp->get_min() != 0.0) continue;
+
+                auto inp = clamp->input(0).get_source_output().get_node_shared_ptr();
+                auto n_consumers = inp->output(0).get_target_inputs().size();
+                {
+                    std::string consumer_types;
+                    for (auto& t : inp->output(0).get_target_inputs()) {
+                        if (!consumer_types.empty()) consumer_types += ", ";
+                        consumer_types += t.get_node()->get_type_name();
+                    }
+                    std::cerr << "[FuseConvBiasClamp] Clamp input: " << inp->get_type_name()
+                              << " consumers=" << n_consumers << " [" << consumer_types << "]"
+                              << " (" << inp->get_friendly_name() << ")\n";
+                }
+
+                // Case 1: Clamp input is already FusedConvolution
+                auto fc = std::dynamic_pointer_cast<FusedConvolution>(inp);
+                auto fgc = std::dynamic_pointer_cast<FusedGroupConvolution>(inp);
+                if (fc || fgc) {
+                    auto act = fc ? fc->get_activation() : fgc->get_activation();
+                    if (act != ActivationMode::NO_ACTIVATION) continue;
+                    if (fc) fc->set_activation(ActivationMode::CLIPPED_RELU);
+                    else    fgc->set_activation(ActivationMode::CLIPPED_RELU);
+                    auto target = fc ? std::static_pointer_cast<ov::Node>(fc)
+                                     : std::static_pointer_cast<ov::Node>(fgc);
+                    target->set_friendly_name(clamp->get_friendly_name());
+                    ov::replace_node(clamp, target);
+                    fused++;
+                    continue;
+                }
+
+                // Case 2: Clamp input is Add(Conv, bias)
+                auto add = std::dynamic_pointer_cast<ov::op::v1::Add>(inp);
+                if (!add || add->output(0).get_target_inputs().size() != 1) continue;
+                // Find Conv and bias among Add inputs
+                using BaseConv = ov::op::v1::Convolution;
+                using GroupConv = ov::op::v1::GroupConvolution;
+                std::shared_ptr<ov::Node> conv_node = nullptr;
+                ov::Output<ov::Node> bias_output;
+                for (int i = 0; i < 2; i++) {
+                    auto candidate = add->input(i).get_source_output().get_node_shared_ptr();
+                    if (ov::is_type<BaseConv>(candidate) || ov::is_type<GroupConv>(candidate)) {
+                        conv_node = candidate;
+                        bias_output = add->input(1 - i).get_source_output();
+                    }
+                }
+                if (!conv_node) continue;
+                if (conv_node->output(0).get_target_inputs().size() != 1) continue;
+                bool is_group = ov::is_type<GroupConv>(conv_node);
+                auto conv1 = std::dynamic_pointer_cast<BaseConv>(conv_node);
+                auto gconv1 = std::dynamic_pointer_cast<GroupConv>(conv_node);
+                if (is_group) {
+                    auto fused_node = std::make_shared<FusedGroupConvolution>(
+                        gconv1->input(0).get_source_output(),
+                        gconv1->input(1).get_source_output(),
+                        bias_output,
+                        gconv1->get_strides(), gconv1->get_pads_begin(),
+                        gconv1->get_pads_end(), gconv1->get_dilations(),
+                        gconv1->get_auto_pad(), ActivationMode::CLIPPED_RELU);
+                    fused_node->set_friendly_name(clamp->get_friendly_name());
+                    ov::replace_node(clamp, fused_node);
+                } else {
+                    auto fused_node = std::make_shared<FusedConvolution>(
+                        conv1->input(0).get_source_output(),
+                        conv1->input(1).get_source_output(),
+                        bias_output,
+                        conv1->get_strides(), conv1->get_pads_begin(),
+                        conv1->get_pads_end(), conv1->get_dilations(),
+                        conv1->get_auto_pad(), ActivationMode::CLIPPED_RELU);
+                    fused_node->set_friendly_name(clamp->get_friendly_name());
+                    ov::replace_node(clamp, fused_node);
+                }
+                fused++;
+            }
+            if (fused > 0)
+                std::cerr << "[FuseConvBiasClamp] fused " << fused
+                          << " Conv+Bias+Clamp(min=0)→CLIPPED_RELU\n";
+            return fused > 0;
+        }
+    };
+    manager.register_pass<FuseConvBiasClampPass>();
 
     // Fuse FusedConvolution → Swish → Add(skip) into 5-arg Conv+Bias+SiLU+Add kernel.
     // Implemented as ModelPass (imperative traversal) because MatcherPass's pattern
@@ -680,6 +849,41 @@ bool ov::rocm_gpu::pass::rocmConvolutionFusion::run_on_model(const std::shared_p
     };
     // SinkSwishAddPass: fuse FusedConvolution → Swish → Add(skip) into 5-arg kernel.
     manager.register_pass<SinkSwishAddPass>();
+
+    // SinkReluToFusedConvAddPass: sink ReLU into FusedConv(has_add=true).
+    // After FuseConvolutionWithBiasAddAdd, residual blocks become:
+    //   FusedConv(bias, skip, NO_ACT) → ReLU
+    // This pass sets activation=RELU on the FusedConv, eliminating standalone ReLU.
+    struct SinkReluToFusedConvAddPass : ov::pass::ModelPass {
+        OPENVINO_RTTI("SinkReluToFusedConvAddPass", "0");
+        bool run_on_model(const std::shared_ptr<ov::Model>& model) override {
+            int fused = 0;
+            for (auto& op : model->get_ordered_ops()) {
+                auto relu = ov::as_type_ptr<ov::op::v0::Relu>(op);
+                if (!relu) continue;
+                auto inp = relu->input(0).get_source_output().get_node_shared_ptr();
+                auto fc = std::dynamic_pointer_cast<FusedConvolution>(inp);
+                auto fgc = std::dynamic_pointer_cast<FusedGroupConvolution>(inp);
+                if (!fc && !fgc) continue;
+                auto act = fc ? fc->get_activation() : fgc->get_activation();
+                if (act != ActivationMode::NO_ACTIVATION) continue;
+                bool has_add = fc ? fc->has_add_node() : fgc->has_add_node();
+                if (!has_add) continue;
+                if (fc)  fc->set_activation(ActivationMode::RELU);
+                else     fgc->set_activation(ActivationMode::RELU);
+                auto target = fc ? std::static_pointer_cast<ov::Node>(fc)
+                                 : std::static_pointer_cast<ov::Node>(fgc);
+                target->set_friendly_name(relu->get_friendly_name());
+                ov::replace_node(relu, target);
+                fused++;
+            }
+            if (fused > 0)
+                std::cerr << "[SinkReluToFusedConvAdd] fused " << fused
+                          << " FusedConv(has_add)+ReLU\n";
+            return fused > 0;
+        }
+    };
+    manager.register_pass<SinkReluToFusedConvAddPass>();
 
     // FuseConvSliceOutSiluAddPass: detect FusedConvolution → VariadicSplit(axis=1) → Swish → Add(skip)
     // and replace with FusedConvolutionSliceOut (output-side slice fused into conv kernel).
@@ -1051,6 +1255,94 @@ bool ov::rocm_gpu::pass::rocmConvolutionFusion::run_on_model(const std::shared_p
         }
     };
     manager.register_pass<EliminateFusedSiluSwishPass>();
+
+
+    // ── Conv(no bias) → Relu direct fusion ─────────────────────────────────
+    // ResNet-like models export Conv without bias (BN folded, bias=0).
+    // Standard pass only matches Conv→Add(bias)→FusedConv→Relu.
+    // This pattern directly creates FusedConvolution(zero_bias, RELU) from Conv→Relu.
+    struct FuseConvReluDirect : public ov::pass::MatcherPass {
+        OPENVINO_RTTI("FuseConvReluDirect", "0");
+        FuseConvReluDirect() {
+            auto conv = wrap_type<ov::op::v1::Convolution>(consumers_count(1));
+            auto relu = wrap_type<ov::op::v0::Relu>({conv});
+
+            matcher_pass_callback callback = [](Matcher &m) {
+                auto relu_node = m.get_match_root();
+                auto conv_node = std::dynamic_pointer_cast<ov::op::v1::Convolution>(
+                    relu_node->input(0).get_source_output().get_node_shared_ptr());
+                if (!conv_node || conv_node->inputs().size() != 2) return false;
+
+                const auto& data = conv_node->input(0).get_source_output();
+                const auto& filters = conv_node->input(1).get_source_output();
+
+                // Create zero bias constant matching output channels
+                auto out_shape = conv_node->get_output_shape(0);
+                size_t out_channels = out_shape.size() > 1 ? out_shape[1] : 1;
+                // Bias must be ND matching conv output rank (e.g. {1, C, 1, 1} for NCHW)
+                ov::Shape bias_shape(out_shape.size(), 1);
+                bias_shape[1] = out_channels;
+                auto zero_bias = ov::op::v0::Constant::create(
+                    conv_node->get_output_element_type(0), bias_shape,
+                    std::vector<float>(out_channels, 0.0f));
+
+                auto fused = std::make_shared<FusedConvolution>(
+                    data, filters, zero_bias->output(0),
+                    conv_node->get_strides(), conv_node->get_pads_begin(),
+                    conv_node->get_pads_end(), conv_node->get_dilations(),
+                    conv_node->get_auto_pad(), ActivationMode::RELU);
+
+                fused->set_friendly_name(relu_node->get_friendly_name());
+                ov::replace_node(relu_node, fused);
+                return true;
+            };
+
+            auto m = std::make_shared<Matcher>(relu, "FuseConvReluDirect");
+            register_matcher(m, callback);
+        }
+    };
+    manager.register_pass<FuseConvReluDirect>();
+
+    // Same for GroupConvolution → Relu
+    struct FuseGroupConvReluDirect : public ov::pass::MatcherPass {
+        OPENVINO_RTTI("FuseGroupConvReluDirect", "0");
+        FuseGroupConvReluDirect() {
+            auto conv = wrap_type<ov::op::v1::GroupConvolution>(consumers_count(1));
+            auto relu = wrap_type<ov::op::v0::Relu>({conv});
+
+            matcher_pass_callback callback = [](Matcher &m) {
+                auto relu_node = m.get_match_root();
+                auto conv_node = std::dynamic_pointer_cast<ov::op::v1::GroupConvolution>(
+                    relu_node->input(0).get_source_output().get_node_shared_ptr());
+                if (!conv_node || conv_node->inputs().size() != 2) return false;
+
+                const auto& data = conv_node->input(0).get_source_output();
+                const auto& filters = conv_node->input(1).get_source_output();
+
+                auto out_shape = conv_node->get_output_shape(0);
+                size_t out_channels = out_shape.size() > 1 ? out_shape[1] : 1;
+                ov::Shape bias_shape(out_shape.size(), 1);
+                bias_shape[1] = out_channels;
+                auto zero_bias = ov::op::v0::Constant::create(
+                    conv_node->get_output_element_type(0), bias_shape,
+                    std::vector<float>(out_channels, 0.0f));
+
+                auto fused = std::make_shared<FusedGroupConvolution>(
+                    data, filters, zero_bias->output(0),
+                    conv_node->get_strides(), conv_node->get_pads_begin(),
+                    conv_node->get_pads_end(), conv_node->get_dilations(),
+                    conv_node->get_auto_pad(), ActivationMode::RELU);
+
+                fused->set_friendly_name(relu_node->get_friendly_name());
+                ov::replace_node(relu_node, fused);
+                return true;
+            };
+
+            auto m = std::make_shared<Matcher>(relu, "FuseGroupConvReluDirect");
+            register_matcher(m, callback);
+        }
+    };
+    manager.register_pass<FuseGroupConvReluDirect>();
 
     manager.register_pass<rocmFuseConvBackpropDataAdd>();
     manager.register_pass<rocmFuseCleanUpNodesOrder>();

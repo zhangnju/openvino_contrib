@@ -25,6 +25,11 @@ static rocmlir::ConvParams to_rocmlir_params(
     OPENVINO_ASSERT(p.NumberOfSpatialDims() == 2,
                     "ConvolutionRocMLIR: only 2-D convolution supported");
 
+    // Allow falling back to MIOpen for debugging
+    if (std::getenv("ROCM_DISABLE_ROCMLIR_CONV"))
+        throw std::runtime_error("rocMLIR conv disabled by ROCM_DISABLE_ROCMLIR_CONV");
+
+
     rocmlir::ConvParams rp;
     // Input N×C×H×W
     rp.N = static_cast<int>(p.input_shape_[0]);

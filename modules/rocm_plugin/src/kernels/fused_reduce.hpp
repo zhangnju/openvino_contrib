@@ -24,6 +24,14 @@ void launch_masked_softmax_fused(
     const void* scores, const void* mask, void* out,
     int heads, int sq, int sk);
 
+// swin fused scale+bias+softmax: softmax(scores*temp[h] + bias[h,sq,sk]) along last dim
+// scores[heads,sq,sk], temp[heads] (nullptr = no scale), bias[heads,sq,sk] → out[heads,sq,sk]
+// mask may be nullptr (non-shifted window); when present it is [B,sq,sk] broadcast over heads.
+void launch_swin_scale_bias_softmax(
+    hipStream_t stream,
+    const void* scores, const void* bias, const void* mask, void* out,
+    int B, int heads, int sq, int sk, const void* temp = nullptr);
+
 // Fused bias+GELU: add bias then apply GELU elementwise
 // gemm_out[seq, out_dim], bias[out_dim] → out[seq, out_dim]
 void launch_bias_gelu_fused(
@@ -31,6 +39,12 @@ void launch_bias_gelu_fused(
     const void* gemm_out, const void* bias, void* out,
     int seq, int out_dim);
 
+void launch_plain_softmax(
+        hipStream_t stream,
+        const void* input, void* output,
+        size_t total_rows, int cols);
+
 }  // namespace kernel
+
 }  // namespace rocm_gpu
 }  // namespace ov

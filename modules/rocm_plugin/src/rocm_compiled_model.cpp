@@ -261,6 +261,8 @@ size_t CompiledModel::get_optimal_number_of_streams(size_t const_blob_size,
     const size_t max_streams_supported = max_concurrent_streams(device);
     const auto available_infer_requests = (free - const_blob_size) / memory_blob_size;
     if (0 == available_infer_requests) {
+        fprintf(stderr, "[OOM] free=%.1fGB const=%.1fMB mutable=%.1fGB — model requires more VRAM than available\n",
+                free / 1073741824.0, const_blob_size / 1048576.0, memory_blob_size / 1073741824.0);
         throw_ov_exception("Not enough memory even for single InferRequest!");
     }
     const size_t num_streams = config_.get_optimal_number_of_streams();

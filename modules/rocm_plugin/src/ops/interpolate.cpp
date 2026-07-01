@@ -37,6 +37,7 @@ static OperationBase::Ptr interpolateFactory(const CreationContext& context,
             }
             break;
         case InterpolateMode::LINEAR:
+        case InterpolateMode::LINEAR_ONNX:
             try {
                 return std::make_shared<InterpolateLinearOp>(
                     context, *node, IndexCollection{inputIds}, IndexCollection{outputIds});

@@ -95,8 +95,16 @@ void SubGraph::initExecuteSequence(bool isStableParams, bool isStableResults) {
         // buffer while pe_conv and pe_add (GPU-async) are still executing on the stream.
         // Since the GPU stream is sequential, extending by 1 step is sufficient:
         // pe_add completes before the next op's kernel launches.
-        operation->SetWorkbufferIds(
-            opBuffersExtractor.processWorkbufferRequest(node_idx, operation->GetWorkBufferRequest()));
+        {
+            auto wbreq = operation->GetWorkBufferRequest();
+            size_t total_imm = 0;
+            for (auto s : wbreq.immutable_sizes) total_imm += s;
+            if (total_imm > 10*1024*1024)
+                fprintf(stderr, "[WB-trace] node=%d op=%s imm=%.1fMB (%zu bufs)\n",
+                    node_idx, operation->GetName().c_str(), total_imm/1048576.0, wbreq.immutable_sizes.size());
+            operation->SetWorkbufferIds(
+                opBuffersExtractor.processWorkbufferRequest(node_idx, wbreq));
+        }
         if (InitNeeded == operation->SetWorkbufferIds(opBuffersExtractor.processWorkbufferRequest(
                               node_idx, operation->GetWorkBufferRequest()))) {
             init_sequence.push_back(operation);

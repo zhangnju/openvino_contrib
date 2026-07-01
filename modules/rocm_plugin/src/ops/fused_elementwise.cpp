@@ -40,6 +40,7 @@ FusedElementwiseOp::FusedElementwiseOp(
     const auto& shape = node->get_output_shape(0);
     num_elements_ = 1;
     for (auto d : shape) num_elements_ *= static_cast<int64_t>(d);
+    if (std::getenv("ROCM_TRACE_EW")) fprintf(stderr, "[FusedEW] %s: elems=%lld chain=%d\n", GetName().c_str(), (long long)num_elements_, chain_len_);
 
     // Encode steps
     num_aux_ = 0;

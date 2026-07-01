@@ -16,6 +16,7 @@
 #include <fmt/format.h>
 #include <openvino/core/except.hpp>
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include <miopen/miopen.h>
 
 namespace ov {
@@ -55,6 +56,34 @@ static rocmlir::ConvParams to_rocmlir(
     rp.num_cu = props.multiProcessorCount;
     return rp;
 }
+
+namespace kernel {
+
+__global__ static void relu_inplace_f16_kernel(__half* data, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    __half v = data[idx];
+    data[idx] = __hgt(v, __float2half(0.0f)) ? v : __float2half(0.0f);
+}
+
+__global__ static void relu_inplace_f32_kernel(float* data, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    data[idx] = fmaxf(data[idx], 0.0f);
+}
+
+void launch_relu_inplace(void* data, int n, bool fp16, hipStream_t stream) {
+    constexpr int BLOCK = 256;
+    int grid = (n + BLOCK - 1) / BLOCK;
+    if (fp16)
+        hipLaunchKernelGGL(relu_inplace_f16_kernel, grid, BLOCK, 0, stream,
+                           reinterpret_cast<__half*>(data), n);
+    else
+        hipLaunchKernelGGL(relu_inplace_f32_kernel, grid, BLOCK, 0, stream,
+                           reinterpret_cast<float*>(data), n);
+}
+
+}  // namespace kernel
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constructor
@@ -270,6 +299,21 @@ FusedConvolutionRocMLIR::FusedConvolutionRocMLIR(
         kernel_ = &rocmlir::RocMLIRKernelCache::global()
                        .get_or_compile_fused_bias_act(conv_params_, rocmlir::Activation::Sigmoid);
         }
+    } else if (activation_ == nodes::ActivationMode::RELU && !has_add_) {
+        kernel_ = &rocmlir::RocMLIRKernelCache::global().get_or_compile_fused_bias_act(conv_params_, rocmlir::Activation::ReLU);
+        relu_fused_ = true;
+    } else if (activation_ == nodes::ActivationMode::RELU && has_add_) {
+        // Conv+Bias+SkipAdd+ReLU: residual block pattern (ResNet).
+        // order: output = ReLU(Conv(x) + bias + skip)
+        // Use generate_fused_epilogue_ir with relu variant (conv+bias+add(skip)+relu).
+        auto compiled = rocmlir::compile_conv_skip_relu(conv_params_, "");
+        auto& stored = rocmlir::RocMLIRKernelCache::global()
+                           .insert_fused_skip_relu(conv_params_, std::move(compiled));
+        kernel_ = &stored;
+        relu_fused_ = true;
+    } else if (activation_ == nodes::ActivationMode::CLIPPED_RELU && !has_add_) {
+        kernel_ = &rocmlir::RocMLIRKernelCache::global().get_or_compile_fused_bias_act(conv_params_, rocmlir::Activation::ReLU6);
+        relu_fused_ = true;
     } else if (activation_ == nodes::ActivationMode::NO_ACTIVATION && has_add_) {
         // Conv+Bias+SkipAdd (no SiLU): matches MIGraphX mlir_convolution_broadcast_add_add.
         // Use migraphx kernel when ROCMLIR_EPILOGUE_FUSION=1 or ROCMLIR_CONV_SKIP_FUSION=1.
@@ -498,6 +542,14 @@ void FusedConvolutionRocMLIR::Execute(const InferenceRequestContext& ctx,
     if (activation_ == nodes::ActivationMode::SWISH &&
         swish_kernel_.has_value() && !info.silu_fused) {
         (*swish_kernel_)(ctx.getThreadContext().stream().get(), d_output, d_output);
+    }
+
+    // ── Step 5: Relu activation (when not fused into kernel) ──────────────────
+    if (activation_ == nodes::ActivationMode::RELU && !relu_fused_) {
+        const int total = conv_params_.N * conv_params_.K *
+                          conv_params_.out_h() * conv_params_.out_w();
+        kernel::launch_relu_inplace(d_output, total, conv_params_.fp16,
+                                    ctx.getThreadContext().stream().get());
     }
 }
 

@@ -34,6 +34,9 @@ private:
     std::array<int, 4> shape_;
     miopenDataType_t type_;
     rocm::DnnTensorDescriptor tensor_descriptor_;
+    bool use_custom_kernel_ = false;
+    size_t custom_rows_ = 0;
+    int custom_cols_ = 0;
 };
 
 }  // namespace rocm_gpu

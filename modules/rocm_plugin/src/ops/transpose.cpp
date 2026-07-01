@@ -44,6 +44,7 @@ TransposeOp::TransposeOp(const CreationContext& context,
     if (perm_.has_value()) {
         device_buf_ = kernel::allocTransposeDeviceBuffers(src_shape_.data(), perm_->data(), ndim_);
     }
+
 }
 
 TransposeOp::~TransposeOp() {

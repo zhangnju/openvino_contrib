@@ -439,6 +439,16 @@ CompiledConv compile_mlir_ir(const std::string& mlir_ir,
     return compile_mlir_with_pipeline(mlir_ir, arch, driver, "full", "ov_rocmlir_conv");
 }
 
+CompiledConv compile_mlir_ir_migraphx(const std::string& mlir_ir,
+                                       const std::string& arch,
+                                       const std::string& rocmlir_driver_path) {
+    const std::string driver = rocmlir_driver_path.empty()
+                               ? find_rocmlir_driver()
+                               : rocmlir_driver_path;
+    return compile_mlir_with_pipeline(mlir_ir, arch, driver,
+                                      "migraphx,highlevel,gpu,rocdl,binary", "ov_rtd");
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // High-level compile helpers — use rocmlir-gen to produce valid MLIR IR
@@ -757,6 +767,21 @@ static std::string get_tuned_perf_config(const ConvParams& p,
         return "";  // Use rocmlir-gen heuristic
     }
     // ROCMLIR_ENABLE_TUNING=1: fall through to exhaustive search + persistent cache.
+
+    // 2b. Skip tuning for grouped/depthwise convolutions (groups > 1).
+    // The curated search space targets standard convolutions (groups=1).
+    // Depthwise convs have K_per_group=1, making most tile configs oversized
+    // and slower than the rocmlir-gen default. Use the heuristic instead.
+    if (p.groups > 1) return "";
+
+    // 2c. Skip tuning for small convolutions where isolated profiling is unreliable.
+    // time_perf_config() allocates fresh buffers per candidate, which doesn't capture
+    // L2 cache reuse across consecutive layers. For small GEMMs the heuristic is better.
+    {
+        const long long gemm_flops = (long long)p.N * p.K * (p.C / p.groups) *
+                                      p.out_h() * p.out_w() * p.R * p.S * 2;
+        if (gemm_flops < 50000000LL) return "";  // < 50M FLOPs: heuristic is good enough
+    }
 
     // 3. Load persistent cache on first call
     auto& cache = PerfConfigCache::instance();
@@ -2578,6 +2603,86 @@ CompiledConv compile_conv_fused_skip(const ConvParams& p, const std::string& drv
         return cached; } }
 
     const std::string mlir_ir = generate_fused_skip_ir(p);
+    auto compiled = compile_migraphx_ir(mlir_ir, p.arch, driver);
+    compiled.bias_fused     = true;
+    compiled.silu_fused     = false;
+    compiled.skip_add_fused = true;
+    kc.save(cache_key, p.arch, compiled);
+    return compiled;
+}
+
+// Conv+Bias+SkipAdd+ReLU: output = ReLU(Conv(input) + bias + skip)
+// mlir_convolution_broadcast_add_add_relu (4-arg kernel).
+static std::string generate_fused_skip_relu_ir(const ConvParams& p) {
+    const std::string dt = p.fp16 ? "f16" : "f32";
+    const int OH = p.out_h(), OW = p.out_w();
+    const size_t in_s   = (size_t)p.C * p.H * p.W;
+    const size_t in_s1  = (size_t)p.H * p.W;
+    const size_t flt_s  = (size_t)(p.C/p.groups) * p.R * p.S;
+    const size_t out_s  = (size_t)p.K * OH * OW;
+    const size_t out_s1 = (size_t)OH * OW;
+
+    auto sh = [&](std::initializer_list<int> dims, std::initializer_list<size_t> strides) {
+        std::ostringstream s;
+        s << "<";
+        bool f = true;
+        for (int d : dims) { if (!f) s << "x"; s << d; f = false; }
+        s << "x" << dt << ", ";
+        f = true;
+        for (size_t st : strides) { if (!f) s << "x"; s << st; f = false; }
+        s << ">";
+        return s.str();
+    };
+
+    const std::string in_sh  = sh({p.N, p.C, p.H, p.W},  {in_s, in_s1, (size_t)p.W, 1});
+    const std::string flt_sh = sh({p.K, p.C/p.groups, p.R, p.S}, {flt_s, (size_t)p.R*p.S, (size_t)p.S, 1});
+    const std::string out_sh = sh({p.N, p.K, OH, OW}, {out_s, out_s1, (size_t)OW, 1});
+    const std::string bias_sh = std::string("<") + std::to_string(p.K) + "x" + dt + ", 1>";
+    const std::string out_full = "!migraphx.shaped" + out_sh;
+    const std::string bias_bc_sh = "<" + std::to_string(p.N) + "x" + std::to_string(p.K)
+        + "x" + std::to_string(OH) + "x" + std::to_string(OW) + "x" + dt + ", 0x1x0x0>";
+
+    std::ostringstream ir;
+    ir << "module {\n";
+    ir << "  func.func @mlir_convolution_broadcast_add_add_relu(\n";
+    ir << "      %arg0: !migraphx.shaped" << in_sh  << ",\n";
+    ir << "      %arg1: !migraphx.shaped" << flt_sh << ",\n";
+    ir << "      %arg2: !migraphx.shaped" << bias_sh << ",\n";
+    ir << "      %arg3: " << out_full << ")\n";
+    ir << "      -> " << out_full << "\n";
+    ir << "      attributes {arch = \"" << arch_triple(p.arch) << "\","
+       << " kernel = \"mixr\", num_cu = " << p.num_cu << " : i64} {\n";
+
+    ir << "    %0 = migraphx.convolution %arg0, %arg1 {"
+       << "dilation = [" << p.dilation_h << ", " << p.dilation_w << "], "
+       << "group = " << p.groups << " : i64, "
+       << "padding = [" << p.pad_h << ", " << p.pad_h << ", " << p.pad_w << ", " << p.pad_w << "], "
+       << "padding_mode = 0 : i64, stride = [" << p.stride_h << ", " << p.stride_w << "]"
+       << "} : !migraphx.shaped" << in_sh << ", !migraphx.shaped" << flt_sh
+       << " -> " << out_full << "\n";
+    ir << "    %1 = migraphx.broadcast %arg2 {axis = 1 : i64, out_lens = ["
+       << p.N << ", " << p.K << ", " << OH << ", " << OW << "]} : "
+       << "!migraphx.shaped" << bias_sh << " -> !migraphx.shaped" << bias_bc_sh << "\n";
+    ir << "    %2 = migraphx.add %0, %1 : " << out_full << ", !migraphx.shaped" << bias_bc_sh
+       << " -> " << out_full << "\n";
+    ir << "    %3 = migraphx.add %2, %arg3 : " << out_full << ", " << out_full
+       << " -> " << out_full << "\n";
+    ir << "    %4 = migraphx.relu %3 : " << out_full << " -> " << out_full << "\n";
+    ir << "    return %4 : " << out_full << "\n";
+    ir << "  }\n}\n";
+    return ir.str();
+}
+
+CompiledConv compile_conv_skip_relu(const ConvParams& p, const std::string& drv) {
+    const std::string driver = drv.empty() ? find_rocmlir_driver() : drv;
+
+    auto& kc = HsacoKernelCache::instance();
+    const size_t cache_key = p.hash() ^ static_cast<size_t>(0xB1A5B1A5B1A50007ULL);
+    { CompiledConv cached; if (kc.load(cache_key, p.arch, cached)) {
+        std::cerr << "[FusedEpilogue-cache] loaded skip_relu kernel=" << cached.kernel_name << "\n";
+        return cached; } }
+
+    const std::string mlir_ir = generate_fused_skip_relu_ir(p);
     auto compiled = compile_migraphx_ir(mlir_ir, p.arch, driver);
     compiled.bias_fused     = true;
     compiled.silu_fused     = false;

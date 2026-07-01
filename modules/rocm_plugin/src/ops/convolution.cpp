@@ -22,6 +22,10 @@
 #include "convolution_ck_wmma.hpp"
 #endif  // ENABLE_CK_WMMA
 
+#ifdef ENABLE_WINOGRAD
+#include "winograd_conv_op.hpp"
+#endif  // ENABLE_WINOGRAD
+
 namespace ov {
 namespace rocm_gpu {
 
@@ -32,6 +36,17 @@ static OperationBase::Ptr convolutionFactory(const CreationContext& context,
     using IndexCollection = OperationBase::IndexCollection;
     const Convolution::Details::ConvolutionParams params{downcast<const ov::op::v1::Convolution>(node)};
     std::stringstream exception_msg;
+
+#ifdef ENABLE_WINOGRAD
+    if (WinogradConvOp::isEligible(params)) {
+        try {
+            return std::make_shared<WinogradConvOp>(
+                context, *node, IndexCollection{inputIds}, IndexCollection{outputIds}, params);
+        } catch (const std::exception& e) {
+            exception_msg << "\nFailed WinogradConvOp: " << e.what();
+        }
+    }
+#endif  // ENABLE_WINOGRAD
 
     // Priority 0: CK WMMA + rocMLIR auto-selection (RDNA4/gfx12xx, FP16 only)
     // On first run profiles both kernels and permanently selects the faster one.

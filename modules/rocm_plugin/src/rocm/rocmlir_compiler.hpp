@@ -85,7 +85,7 @@ struct CompiledConv {
 // ───────────────────────────────────────────────────────────────────────────
 // Activation type for fused kernels
 // ───────────────────────────────────────────────────────────────────────────
-enum class Activation { None, ReLU, Sigmoid };
+enum class Activation { None, ReLU, Sigmoid, ReLU6 };
 
 // ───────────────────────────────────────────────────────────────────────────
 // Compiler interface
@@ -107,6 +107,11 @@ std::string generate_fused_conv_bias_act_ir(const ConvParams& p, Activation act)
 CompiledConv compile_mlir_ir(const std::string& mlir_ir,
                               const std::string& arch,
                               const std::string& rocmlir_driver_path = "");
+
+// Same but uses the migraphx pipeline (for dot/gemm IR, not conv).
+CompiledConv compile_mlir_ir_migraphx(const std::string& mlir_ir,
+                                       const std::string& arch,
+                                       const std::string& rocmlir_driver_path = "");
 
 // High-level: generate + compile convolution kernel.
 CompiledConv compile_conv(const ConvParams& p,
@@ -155,6 +160,12 @@ CompiledConv compile_conv_fused_epilogue(const ConvParams& p,
                                     const std::string& rocmlir_driver_path = "",
                                     bool with_skip = false,
                                     bool with_silu_add = false);
+
+// Conv+Bias+SkipAdd+ReLU: residual block pattern (ResNet).
+// 5-arg kernel: (input, filter, bias, skip, output)
+// output = ReLU(Conv(input) + bias + skip)
+CompiledConv compile_conv_skip_relu(const ConvParams& p,
+                                     const std::string& rocmlir_driver_path = "");
 
 // Conv+Bias+SkipAdd (NO SiLU): mlir_convolution_broadcast_add_add (4-arg kernel).
 // Fuses conv+bias+skip_add WITHOUT silu into one kernel.

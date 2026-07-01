@@ -145,6 +145,28 @@ GatherOp::GatherOp(const CreationContext& context,
         grid_dim_y = data_length;
     }
 
+    // When blocks_per_grid exceeds GPU z-dim limit (65536 on gfx1100),
+    // increase els_per_thread to reduce blocks_per_grid. This doesn't change
+    // the kernel — each thread simply processes more elements.
+    unsigned actual_els_per_thread_chunks = ELS_PER_THREAD_CHUNKS;
+    unsigned actual_els_per_thread_dicts = ELS_PER_THREAD_DICTS;
+    if (blocks_per_grid > (unsigned)max_grid_size[2]) {
+        if (gather_chunks) {
+            unsigned scale = (blocks_per_grid + max_grid_size[2] - 1) / max_grid_size[2];
+            actual_els_per_thread_chunks = ELS_PER_THREAD_CHUNKS * scale;
+            unsigned new_num_chunks = (data_length + actual_els_per_thread_chunks - 1) / actual_els_per_thread_chunks;
+            blocks_per_grid = (new_num_chunks + max_block_size - 1) / max_block_size;
+            threads_per_block = blocks_per_grid == 1 ? new_num_chunks : max_block_size;
+        } else {
+            unsigned scale = (blocks_per_grid + max_grid_size[2] - 1) / max_grid_size[2];
+            actual_els_per_thread_dicts = ELS_PER_THREAD_DICTS * scale;
+            unsigned new_blocks = (num_dicts + max_block_size * actual_els_per_thread_dicts - 1) /
+                                  (max_block_size * actual_els_per_thread_dicts);
+            blocks_per_grid = new_blocks;
+            threads_per_block = blocks_per_grid == 1 ? num_dicts : max_block_size;
+        }
+    }
+
     OPENVINO_ASSERT(grid_dim_x <= max_grid_size[0], "Node name: ", GetName());
     OPENVINO_ASSERT(grid_dim_y <= max_grid_size[1], "Node name: ", GetName());
     OPENVINO_ASSERT(blocks_per_grid <= max_grid_size[2], "Node name: ", GetName());
@@ -163,8 +185,8 @@ GatherOp::GatherOp(const CreationContext& context,
                                     dicts_batch_stride,
                                     indices_batch_stride,
                                     out_batch_stride,
-                                    ELS_PER_THREAD_CHUNKS,
-                                    ELS_PER_THREAD_DICTS};
+                                    actual_els_per_thread_chunks,
+                                    actual_els_per_thread_dicts};
 }
 
 void GatherOp::Execute(const InferenceRequestContext& context,

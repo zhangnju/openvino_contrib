@@ -50,6 +50,12 @@ public:
     SinkActivationToFusedConvolution();
 };
 
+class SinkActivationToFusedGroupConvolution : public ov::pass::MatcherPass {
+public:
+    OPENVINO_RTTI("SinkActivationToFusedGroupConvolution", "0");
+    SinkActivationToFusedGroupConvolution();
+};
+
 // Fuses FusedConvolution → Swish → Add(skip) into FusedConvolution(4-inputs, SWISH).
 // This enables rocMLIR to compile a single Conv+Bias+SiLU+SkipAdd kernel, eliminating
 // two separate kernel launches (SwishOp + elementwise Add).

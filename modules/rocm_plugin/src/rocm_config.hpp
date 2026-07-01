@@ -51,7 +51,7 @@ private:
     int device_id = 0;
     bool is_profiling_enabled = false;
     bool operation_benchmark = false;
-    bool use_hip_graph = false;
+    bool use_hip_graph = true;
     bool exclusive_async_requests = false;
     uint32_t hint_num_requests = 0;
     ov::streams::Num num_streams = 0;

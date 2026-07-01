@@ -8,6 +8,7 @@
 
 #include "converters.hpp"
 #include "kernels/variance_normalization_factor.hpp"
+#include "kernels/mvn_fast.hpp"
 #include "openvino/op/mvn.hpp"
 
 namespace ov {
@@ -88,6 +89,10 @@ private:
     const void* dOne{&rocm::NumericConst<rocm::constants::one>(comp_type_)};
     const void* dMinusOne{&rocm::NumericConst<rocm::constants::minusOne>(comp_type_)};
     const void* dZero{&rocm::NumericConst<rocm::constants::zero>(comp_type_)};
+
+    // Fast MVN path: native warp-per-row kernel, replaces MIOpen gridwise_generic_reduce.
+    bool fast_ok_ = false;
+    int fast_rows_ = 0, fast_cols_ = 0;
 };
 
 inline WorkbufferRequest MvnOp::GetWorkBufferRequest() const {

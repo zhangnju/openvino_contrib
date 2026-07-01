@@ -279,6 +279,13 @@ void OperationBuffersExtractor::extractReshapeTensors(const NodePtr& node, int n
 void OperationBuffersExtractor::extractMutableTensors(const NodePtr& node, int node_idx) {
     for (const auto& output : node->outputs()) {
         auto tensorByteSize = GetTensorByteSize(output);
+        if (getenv("ROCM_TRACE_MEMORY") && tensorByteSize > 1024ULL * 1024 * 1024) {
+            fprintf(stderr, "[MEM-BIG] id=%d node=%s op=%s shape=[", next_buffer_id_,
+                    node->get_friendly_name().c_str(), node->get_type_info().name);
+            for (size_t i = 0; i < output.get_shape().size(); i++)
+                fprintf(stderr, "%s%zu", i?",":"", output.get_shape()[i]);
+            fprintf(stderr, "] size=%.1fMB\n", tensorByteSize / 1048576.0);
+        }
         mutable_tensor_sizes_[next_buffer_id_] = tensorByteSize;
         mutable_buffers_.emplace(std::make_pair(next_buffer_id_, BufferDesc{node_idx, node_idx, tensorByteSize}));
         tensor_names_.emplace(GetTensorNameInternal(output), std::make_shared<TensorID>(next_buffer_id_));
@@ -344,6 +351,8 @@ WorkbufferIds OperationBuffersExtractor::processWorkbufferRequest(int node_idx, 
     for (auto size : request.immutable_sizes) {
         immutable_workbuffers_.emplace(next_buffer_id_, size);
         result.immutableIds.push_back(next_buffer_id_);
+        if (size > 1024*1024)
+            fprintf(stderr, "[ImmWB-op] node=%d id=%zu size=%.1fMB\n", node_idx, (size_t)next_buffer_id_, size/1048576.0);
         next_buffer_id_++;
     }
     for (auto size : request.mutable_sizes) {
@@ -397,9 +406,15 @@ MemoryModel::Ptr OperationBuffersExtractor::createMutableMemoryModel() const {
 MemoryModel::Ptr OperationBuffersExtractor::createImmutableMemoryModel() const {
     ImmutableMemoryModelBuilder immutable_workbuffer_model_builder;
     const auto& immutable_workbufer_sizes = immutableWorkbufferSizes();
+    size_t total_immutable = 0;
     for (const auto& index : immutable_workbufer_sizes) {
         immutable_workbuffer_model_builder.addAllocation(index.first, index.second);
+        total_immutable += index.second;
+        if (index.second > 1024*1024)
+            fprintf(stderr, "[ImmWB] id=%zu size=%.1fMB\n", (size_t)index.first, index.second/1048576.0);
     }
+    if (total_immutable > 1024*1024*100)
+        fprintf(stderr, "[ImmWB] TOTAL=%.1fMB (%zu entries)\n", total_immutable/1048576.0, immutable_workbufer_sizes.size());
     return immutable_workbuffer_model_builder.build();
 }
 

@@ -88,9 +88,9 @@ const KernelEntry& RocMLIRKernelCache::get_or_compile_fused_bias(
 
 const KernelEntry& RocMLIRKernelCache::get_or_compile_fused_bias_act(
         const ConvParams& p, Activation act, const std::string& driver) {
-    auto* target_cache = (act == Activation::ReLU)
-                         ? &fused_bias_relu_cache_
-                         : &fused_bias_sigmoid_cache_;
+    auto* target_cache = (act == Activation::ReLU)    ? &fused_bias_relu_cache_
+                       : (act == Activation::ReLU6)   ? &fused_bias_relu6_cache_
+                       : &fused_bias_sigmoid_cache_;
     const size_t key = p.hash();
     std::lock_guard<std::mutex> lk(mu_);
     auto it = target_cache->find(key);
@@ -188,6 +188,21 @@ const KernelEntry& RocMLIRKernelCache::insert_fused_epilogue_silu_add(const Conv
     return *ptr;
 }
 
+const KernelEntry& RocMLIRKernelCache::insert_fused_skip_relu(const ConvParams& p, CompiledConv&& compiled) {
+    std::lock_guard<std::mutex> lk(mu_);
+    const size_t key = p.hash();
+    auto it = fused_skip_relu_cache_.find(key);
+    if (it != fused_skip_relu_cache_.end()) return *it->second;
+    compiled.bias_fused = true;
+    compiled.silu_fused = false;
+    compiled.skip_add_fused = true;
+    auto entry = std::make_unique<KernelEntry>(load_kernel(std::move(compiled)));
+    entry->params = p;
+    auto* ptr = entry.get();
+    fused_skip_relu_cache_[key] = std::move(entry);
+    return *ptr;
+}
+
 void RocMLIRKernelCache::clear() {
     std::lock_guard<std::mutex> lk(mu_);
     auto unload = [](auto& m) {
@@ -197,11 +212,13 @@ void RocMLIRKernelCache::clear() {
     unload(cache_);
     unload(fused_bias_cache_);
     unload(fused_bias_relu_cache_);
+    unload(fused_bias_relu6_cache_);
     unload(fused_bias_sigmoid_cache_);
     unload(fused_bias_silu_add_cache_);
     unload(slice_conv_bias_silu_cache_);
     unload(fused_epilogue_silu_cache_);
     unload(fused_epilogue_silu_add_cache_);
+    unload(fused_skip_relu_cache_);
 }
 
 } // namespace rocmlir

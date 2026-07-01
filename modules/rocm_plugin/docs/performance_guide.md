@@ -16,6 +16,8 @@
 7. [各架构性能对比](#7-各架构性能对比)
 8. [优化历程与技术细节](#8-优化历程与技术细节)
 9. [附录：常见问题](#9-附录常见问题)
+10. [BERT/Transformer 模型优化](#10-berttransformer-模型优化)
+11. [Triton Flash Attention](#11-triton-flash-attention)
 
 ---
 
@@ -27,6 +29,7 @@
 | ROCm | **7.2.x** | 含 HIP、MIOpen、rocBLAS |
 | GPU | gfx1201 / gfx1100 / gfx950 | 见下表 |
 | Python | 3.10+ | 用于调优脚本 |
+| Triton | >= 3.5.0 | Flash Attention AOT 编译（`pip install triton`） |
 | CMake | 3.23+（pip install cmake） | |
 | Host 编译器 | `gcc/g++` 13.x | rocMLIR 构建用 |
 
@@ -106,6 +109,9 @@ done
 | `0001-rocmlir-fix-AlignTiling-build-error.patch` | 修复 `AlignTiling.cpp` 在 g++ Release 构建时的语法错误 | 必须（否则编译失败） |
 | `0002-tosatorock-features.patch` | 修复 `TosaToRock.cpp`：`ForwardConvConverter` 生成的 `rock.conv` 现在正确传入 GPU arch features（wmma\|dot\|...），使 `rock-affix-params` 能选择 WMMA 优化的 tile 配置 | 必须（fused_epilogue 调优需要） |
 | `0003-driver-tuning-fallback.patch` | 为 `rocmlir-driver` 添加 `--tuning-fallback` 选项（默认 true）：注入的 perf_config 无效时自动 fallback 到 heuristic，避免 "Lowering failed" | 必须（fused_epilogue 调优需要） |
+| `0004-lds-bank-conflict-fix-f16-kpack.patch` | 修复 `loweringUtils.cpp`：f16 kpack>1 时 LDS stride 从 1 改为 bankWidth/elemBytes，避免相邻 lane 命中同一 4-byte bank | 推荐（gfx1100 WMMA ~3-5%） |
+| `0005-wmma-vgpr-occupancy-filter.patch` | `GridwiseGemmParams.cpp`：估算 VGPR 用量，拒绝 occupancy<50% 的 tuning config（gfx1100 wave32, 1536 VGPRs/SIMD） | 推荐（避免低占用率 config） |
+| `0006-wmma-occupancy-downgrade-and-b-prefetch.patch` | 两项 WMMA 优化：(1) double-buffer VGPR 超标时降级为 single-buffer (2) nRepeats<=4 时预取所有 B tile 再做 WMMA，分离 ds_load 和 v_wmma | 推荐（gfx1100 +5-7%） |
 
 ### 2.4 安装
 
@@ -1040,3 +1046,166 @@ benchmark_app ... -niter 800  # 正式测试
 #### 不使用 INT8
 
 bertsquad-12-int8.onnx 使用 `MatMulInteger` + `FusedMatMul` 格式，当前 OV ROCm 和 MIGraphX 均不支持，建议使用 FP16 版本。
+
+---
+
+## 11. Triton Flash Attention
+
+对于包含长序列 self-attention 的模型（如 petr_large Sq=41760、bevformer_v2 Sq=10000），
+标准的 `MatMul(QK) → Softmax → MatMul(AV)` 路径会产生 O(Sq²) 的 score matrix 中间 tensor，
+可能导致显存不足（petr_large 单个 score matrix `[8, 41760, 41760]` = 26.6GB）。
+
+Plugin 内置了基于 Triton 的 Flash Attention fusion pass，将 QK·Softmax·AV 融合为单个 kernel，
+**不 materialize score matrix**，显存占用从 O(Sq²) 降至 O(Sq)。
+
+### 11.1 依赖
+
+| 组件 | 版本 | 安装 |
+|------|------|------|
+| **Triton** | >= 3.5.0 | `pip install triton` 或使用 ROCm 配套版本 |
+| torch | (可选) | 仅 autotune 需要；无 torch 时使用 heuristic 默认配置 |
+
+> **不需要** `flash_attn` pip 包。Kernel 源码（来自 [dao-AILab/flash-attention](https://github.com/dao-ailab/flash-attention)，BSD-3 许可）已内嵌在 AOT 编译脚本中。
+
+### 11.2 工作原理
+
+```
+模型加载时 (首次, ~30-75s one-time cost):
+  FlashAttentionTritonFusionPass 匹配图中的 QK MatMul → Softmax → AV MatMul
+    ↓ (仅 Sq > 512 && Sk > 512 时触发)
+  C++ 调用 python3 triton_flash_attn_aot.py (AOT 编译)
+    ├─ 生成搜索空间 (基于 headdim/LDS/寄存器约束)
+    ├─ GPU microbenchmark 每个候选 config
+    ├─ 选最快 → triton.compile() → HSACO (GPU 二进制)
+    └─ 缓存到 ~/.cache/ov_triton_fa/
+
+模型加载时 (后续, ~0ms):
+    cache hit → 直接加载 HSACO
+
+推理时:
+    hipModuleLaunchKernel (纯 HIP, 无 Python 依赖)
+```
+
+### 11.3 Autotune 搜索空间
+
+Flash attention kernel 有三个关键 tile 参数：
+
+| 参数 | 含义 | 影响 |
+|------|------|------|
+| BLOCK_M | Q tile 行数 (输出 tile 高度) | 决定 grid 大小和寄存器压力 |
+| BLOCK_N | K/V tile 行数 (K-loop 步长) | 决定 LDS 用量和 loop 次数 |
+| num_warps | workgroup 内的 warp 数 | 决定线程级并行度 |
+
+**Kernel 内部数据流：**
+
+```
+每个 workgroup 处理一个 [BLOCK_M, D] 的输出 tile:
+
+  Q tile [BLOCK_M, D] ── 常驻寄存器 (整个 K-loop 不换)
+
+  for k = 0 to Sk step BLOCK_N:        ← K-loop
+      K tile [BLOCK_N, D] ── HBM → LDS
+      V tile [BLOCK_N, D] ── HBM → LDS
+
+      S = Q × K^T       [BLOCK_M, BLOCK_N]  ── 寄存器
+      P = softmax(S)     [BLOCK_M, BLOCK_N]  ── 寄存器 (online softmax)
+      O += P × V         [BLOCK_M, D]        ── 寄存器累加
+
+  写回 O [BLOCK_M, D] → HBM
+```
+
+**硬件约束 (gfx1100 RDNA3, wave32)：**
+
+| 约束 | 公式 | 说明 |
+|------|------|------|
+| LDS 容量 | `2 × BLOCK_N × D × 2B ≤ 64KB` | K tile + V tile 同时在 LDS |
+| 寄存器压力 | `(BLOCK_M / num_warps) × D ≤ ~1024` | Q tile 分配到每个 warp |
+| 线程合理性 | `num_warps × 32 ≤ BLOCK_M × BLOCK_N` | 不能比 tile 元素还多 |
+
+**经验剪枝规则：**
+
+| 规则 | 原因 |
+|------|------|
+| `BLOCK_M ≥ 128` 时 `warps ≥ 2` | 大 tile 需要多 warp 并行处理行 |
+| `BLOCK_M ≤ 32` 时 `warps < 8` | 小 tile 不需要太多 warp |
+| `BLOCK_M = 16` 时 `warps < 4` | 16 行 / 4 warp = 每 warp 4 行, 线程利用率低 |
+| `BLOCK_N = 32` 且 `BLOCK_M ≤ 32` 时跳过 | K-loop 步长太小, loop overhead 大 |
+| `D ≤ 32` 且 `BLOCK_M > 64` 时 `warps ≥ 4` | 小 D 下大 BM 的寄存器利用率低 |
+| `D ≥ 128` 时 `BLOCK_M ≥ 32` | 大 D 需要大 tile 摊销 K/V 加载开销 |
+
+**各 headdim 的搜索空间大小：**
+
+| headdim | 候选 configs | autotune 耗时 |
+|---------|-------------|---------------|
+| D = 32 | ~25 | ~75s |
+| D = 64 | ~17 | ~51s |
+| D = 128 | ~5 | ~15s |
+
+### 11.4 gfx1100 调优结果
+
+以 bevformer_v2 的 attention shape (B=8, H=1, Sq=Sk=10000, D=32) 为例：
+
+| Config | 耗时 (ms) | vs 默认 |
+|--------|----------|---------|
+| **BM=16, BN=64, w=1** | **0.07** | **baseline (最优)** |
+| BM=32, BN=64, w=2 | 0.08 | +14% |
+| BM=16, BN=128, w=2 | 0.09 | +29% |
+| BM=64, BN=128, w=4 | 0.16 | +129% |
+| BM=128, BN=128, w=4 | 0.32 | +357% |
+
+**为什么 D=32 时 BM=16, BN=64, w=1 最快：**
+
+- Q tile 只有 16×32 = 512 elements, 1 warp 完全放进寄存器, 零寄存器溢出 (spill)
+- BN=64: K-loop 每步处理 64 个 key, LDS 仅用 2×64×32×2 = 8KB (64KB 的 12.5%)
+- 1 warp = 32 线程, grid blocks = (Sq/16) × (B×H) = 625×8 = 5000 blocks → GPU 30 CUs 完全占满
+- 对比 BM=128, BN=128, w=4: Q tile = 32×32 = 1024/warp 寄存器压力大, grid 仅 79×8 = 632 blocks, occupancy 低
+
+**端到端效果：**
+
+| 模型 | Sq×Sk | 默认 (128×128) | 调优后 (16×64) | 提升 |
+|------|-------|---------------|----------------|------|
+| bevformer_v2 | 10000×10000 | 6.4 FPS | **11.5 FPS** | **+80%** |
+| petr_large | 41760×41760 | 5.2 FPS | **11.1 FPS** | **+114%** |
+
+### 11.5 环境变量
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `ROCM_DISABLE_FLASH_ATTN` | 未设置 (启用) | 设为 `1` 禁用 flash attention fusion |
+| `ROCM_TRACE_TRITON_FA` | 未设置 | 设为 `1` 打印 fusion 匹配和 kernel 加载信息 |
+| `ROCM_TRITON_FA_SCRIPT` | (自动检测) | 覆盖 AOT 编译脚本路径 |
+
+### 11.6 手动 AOT 编译 / 预热缓存
+
+可在部署前预编译所有 attention shape，避免首次运行的 autotune 延迟：
+
+```bash
+SCRIPT=<plugin_src>/rocm/triton_flash_attn_aot.py
+
+# bevformer_v2 的 attention shapes
+python3 $SCRIPT --seqlen_q=10000 --seqlen_k=10000 --headdim=32 --arch=gfx1100
+python3 $SCRIPT --seqlen_q=10000 --seqlen_k=8700  --headdim=32 --arch=gfx1100
+python3 $SCRIPT --seqlen_q=900   --seqlen_k=10000 --headdim=32 --arch=gfx1100
+
+# petr_large 的 attention shapes
+python3 $SCRIPT --seqlen_q=41760 --seqlen_k=41760 --headdim=32 --arch=gfx1100
+
+# 缓存位于 ~/.cache/ov_triton_fa/，可拷贝到目标机器
+```
+
+### 11.7 支持的 Attention Pattern
+
+Fusion pass 匹配以下图结构：
+
+```
+          ┌─ Q ──┐
+MatMul(QK)│      ├──→ [Add(bias)] ──→ Softmax ──→ MatMul(AV) ──→ Output
+          └─ K ──┘    [Mul(scale)]                    └─ V ──┘
+
+条件:
+  - Softmax axis = last dim
+  - Q/K/V 为 fp16
+  - headdim (D) ≤ 128
+  - Sq > 512 且 Sk > 512 (小 attention 不使用 flash)
+  - Q layout: [B,H,Sq,D] 或 [B,Sq,H,D] 或 [BH,Sq,D]
+```

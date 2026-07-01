@@ -81,6 +81,14 @@ if(ENABLE_CK_WMMA)
         set(ENABLE_CK_WMMA OFF)
     endif()
 endif()
+# ── Winograd F(4,3) backend ─────────────────────────────────────────────────
+# 3×3 stride=1 dilation=1 groups=1 fp16 convolutions via Winograd transform.
+# Uses rocBLAS strided batched GEMM (already linked) — no extra dependencies.
+option(ENABLE_WINOGRAD "Enable Winograd F(4,3) convolution backend" ON)
+if(ENABLE_WINOGRAD)
+    message(STATUS "[rocm_gpu] Winograd F(4,3) conv backend enabled")
+    add_definitions(-DENABLE_WINOGRAD)
+endif()
 # ─────────────────────────────────────────────────────────────────────────────
 
 find_package(OpenVINODeveloperPackage REQUIRED

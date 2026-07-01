@@ -25,6 +25,18 @@ static __global__ void GeluErfOpImpl_fp16(const __half* in, __half* out) {
     out[i] = __float2half(y);
 }
 
+// f16 GELU-Erf vec2: 2 elements per thread via half2 load/store
+static __global__ void GeluErfOpImpl_fp16_vec2(const __half2* in, __half2* out, unsigned n2) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n2) return;
+    __half2 h = in[i];
+    float x0 = __half2float(__low2half(h));
+    float x1 = __half2float(__high2half(h));
+    float y0 = 0.5f * x0 * (1.0f + rocmath::erff(x0 * 0.7071067811865475f));
+    float y1 = 0.5f * x1 * (1.0f + rocmath::erff(x1 * 0.7071067811865475f));
+    out[i] = __halves2half2(__float2half(y0), __float2half(y1));
+}
+
 // f32 GELU-Tanh kernel
 static __global__ void GeluTanhOpImpl_fp32(const float* in, float* out) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -55,8 +67,17 @@ void GeluErf::operator()(hipStream_t stream, const void* in0, void* out) const {
                 static_cast<const float*>(in0), static_cast<float*>(out));
             break;
         case Type_t::f16:
-            GeluErfOpImpl_fp16<<<num_blocks_, threads_per_block_, 0, stream>>>(
-                static_cast<const __half*>(in0), static_cast<__half*>(out));
+            if (num_elements_ % 2 == 0) {
+                unsigned n2 = num_elements_ / 2;
+                unsigned blk = 256;
+                unsigned grd = (n2 + blk - 1) / blk;
+                GeluErfOpImpl_fp16_vec2<<<grd, blk, 0, stream>>>(
+                    reinterpret_cast<const __half2*>(in0),
+                    reinterpret_cast<__half2*>(out), n2);
+            } else {
+                GeluErfOpImpl_fp16<<<num_blocks_, threads_per_block_, 0, stream>>>(
+                    static_cast<const __half*>(in0), static_cast<__half*>(out));
+            }
             break;
         default:
             throw_ov_exception(fmt::format("Input element type = {} is not supported by GeluErf operation !!",

@@ -45,8 +45,6 @@
 #include "transformations/common_optimizations/reshape_prelu.hpp"
 #include "transformer/rocmlir_conv_decompose_transformation.hpp"
 #include "transformer/elementwise_fusion_transformation.hpp"
-#include "transformer/quantize_convert_elision_pass.hpp"
-#include "transformer/matmul_dequant_convert_pass.hpp"
 #include "transformer/variadic_split_zero_copy.hpp"
 #include "transformer/rocm_attention_fusion.hpp"
 #include "transformer/layer_norm_fusion.hpp"
@@ -58,7 +56,18 @@
 #include "transformer/force_f16_matmul_pass.hpp"
 #include "transformer/fused_qkv_pass.hpp"
 #include "transformer/dead_code_elimination.hpp"
+#include "transformer/zero_constant_propagation.hpp"
+#include "transformer/quantize_convert_elision_pass.hpp"
+#include "transformer/matmul_dequant_convert_pass.hpp"
 #include "transformer/dynamic_quantize_fusion_pass.hpp"
+#include "transformer/qkv_transpose_split_fusion.hpp"
+#include "transformer/swin_fused_softmax_pass.hpp"
+#include "transformer/l2_normalize_fusion.hpp"
+#include "transformer/flash_attention_triton_fusion.hpp"
+#include "transformer/swin_flash_attention_fusion.hpp"
+#include "transformer/fused_mvn_epilogue_fusion.hpp"
+#include "transformer/fused_rtd_fusion.hpp"
+#include "transformer/roll_fusion.hpp"
 
 using namespace ov::rocm_gpu;
 
@@ -70,9 +79,6 @@ void GraphTransformer::transform(const rocm::Device& device,
         inference_precision = ov::element::f32;
     }
 
-    // For INT8 quantized models, do not downscale f32→f16: the quantization path
-    // uses f32 for scale/bias nodes (Round, Maximum, Minimum, Gather) whose HIP
-    // kernels don't support f16.  Force f32 inference precision in this case.
     bool has_int8_matmul = false;
     for (const auto& node : model->get_ordered_ops()) {
         if (node->get_type_name() == std::string("MatMul") &&
@@ -136,19 +142,21 @@ void GraphTransformer::transform(const rocm::Device& device,
     [[maybe_unused]] const auto& originOpsSize = originOps.size();
 
     pass_manager.register_pass<ov::pass::InitNodeInfo>();
-    // Remove Identity (StopGradient) nodes BEFORE ConvertPrecision so that
-    // MVNFusion (inside CommonOptimizations) can match BERT-style LayerNorm.
-    // Without this, ConvertPrecision turns Identity→Convert(f16→f16), and
-    // MVNFusion's pattern does not skip through Convert nodes.
+    // FFN pair fusion: fuse MatMul(FFN-up) -> Gelu -> MatMul(FFN-down) into a single
+    // TOSA-compiled rock.gemm_elementwise_gemm mega-kernel. Intermediate FFN activation
+    // stays in registers/LDS, never hits HBM. Must run at the earliest point where the
+    // OV Gelu op is still intact (before any decomposition or precision conversion).
+    {
+    }
+    // MVN-epilogue fusion on the clean frontend form (before ConvertPrecision creates reuse).
+    // At this point MVN→Mul(gamma) has single consumer; after ConvertPrecision it becomes Mul→2-Add.
+    pass_manager.register_pass<ov::rocm_gpu::pass::FusedMvnEpilogueFusionPass>();
+
+    // Remove Identity (StopGradient) nodes BEFORE ConvertPrecision.
     pass_manager.register_pass<ov::pass::NopElimination>();
     pass_manager.register_pass<ov::pass::ConvertPrecision>(fp_convert_precision_map, empty_fuse_map, true, false);
     pass_manager.register_pass<ov::pass::CommonOptimizations>();
     pass_manager.register_pass<ov::pass::ReshapePRelu>();
-    // Fuse the onnx DynamicQuantizeLinear decomposition (ReduceMin/Max/Sub/Div/
-    // Round/Clamp/Convert → single nodes::DynamicQuantize) for INT8 models.
-    // Gated by env (default ON); set ROCM_DISABLE_DQL_FUSION=1 to bisect crashes.
-    if (!std::getenv("ROCM_DISABLE_DQL_FUSION"))
-        pass_manager.register_pass<ov::rocm_gpu::pass::DynamicQuantizeFusionPass>();
     // Do we actually need this transformations in plugin?
     // Having duplicated results seems to be rare case in real world.
     // But currently it affects the rocmInferRequest which implementation
@@ -197,18 +205,24 @@ void GraphTransformer::transform(const rocm::Device& device,
     // pass_manager.register_pass<ov::rocm_gpu::pass::RocMLIRGroupConvDecompose>();
 #endif
 
+    if (!std::getenv("ROCM_DISABLE_DQL_FUSION"))
+        pass_manager.register_pass<ov::rocm_gpu::pass::DynamicQuantizeFusionPass>();
     pass_manager.register_pass<ov::rocm_gpu::pass::ConvolutionAsymPaddingTransformation>();
     pass_manager.register_pass<ov::rocm_gpu::pass::GroupConvolutionAsymPaddingTransformation>();
     pass_manager.register_pass<ov::rocm_gpu::pass::rocmConvolutionFusion>();
     pass_manager.register_pass<ov::rocm_gpu::pass::ConvolutionBackpropDataAsymPaddingTransformation>();
     pass_manager.register_pass<ov::rocm_gpu::pass::GroupConvolutionBackpropDataAsymPaddingTransformation>();
     pass_manager.register_pass<ov::rocm_gpu::pass::FusedConvBackpropDataAsymPaddingTransformation>();
+    // FusedRTD: fuse Reshape->Transpose->Reshape->MatMul into one rocMLIR kernel.
+    {
+    }
     pass_manager.register_pass<ov::rocm_gpu::pass::TransposeMatMulTransformation>();
     pass_manager.register_pass<ov::rocm_gpu::pass::FullyConnectedTransformation>();
     // Remove MatMul nodes that became dead after FC fusion (original Q/K/V projection MatMuls)
     pass_manager.register_pass<ov::rocm_gpu::pass::DeadMatMulElimination>();
     pass_manager.register_pass<ov::rocm_gpu::pass::ConcatTransformation>();
     pass_manager.register_pass<ov::rocm_gpu::pass::ReduceTransformation>();
+    pass_manager.register_pass<ov::rocm_gpu::pass::ZeroConstantPropagation>();
     pass_manager.register_pass<ov::rocm_gpu::pass::DetectionOutputFixInputTypesTransformation>();
 
     // Fuse Add(scores, mask) → Softmax into FusedMaskedSoftmax kernel.
@@ -229,6 +243,9 @@ void GraphTransformer::transform(const rocm::Device& device,
     // Fuse Add(scores, mask) + Softmax into a single kernel for non-attention softmaxes.
     // Runs AFTER BertSelfAttentionFusion to avoid consuming Softmax nodes needed for attention.
     // Must run BEFORE ElementwiseFusionPass which might absorb the mask Add.
+    // Swin fused softmax: scale + bias + [mask] + softmax in one kernel.
+    // SwinFusedSoftmax: fuse Add+Softmax (swin bias) and plain Softmax (bevformer large sk)
+    pass_manager.register_pass<ov::rocm_gpu::pass::SwinFusedSoftmaxPass>();
     pass_manager.register_pass<ov::rocm_gpu::pass::FusedMaskedSoftmaxPass>();
 
     // Fuse FC+GELU pairs into FusedFCGELU (hipBLASLt GEMM+bias+GELU single kernel).
@@ -246,12 +263,53 @@ void GraphTransformer::transform(const rocm::Device& device,
 
     // Clean up identity/no-op nodes after LayerNormFusionPass.
     pass_manager.register_pass<ov::pass::NopElimination>();
+    // FusedMVNEpilogue: fuse MVN + Multiply(gamma) + Add(beta) into single LayerNorm kernel.
+    pass_manager.register_pass<ov::rocm_gpu::pass::FusedMvnEpilogueFusionPass>();
 
-    // pass_manager.register_pass<ov::rocm_gpu::pass::RocmDCE>();
+    // L2Normalize: fuse Power(2)+ReduceSum+Sqrt+Maximum+Divide into single kernel.
+    pass_manager.register_pass<ov::rocm_gpu::pass::L2NormalizeFusionPass>();
+
+    // Triton Flash Attention: fuse Q*K^T softmax * V into a single Triton kernel.
+    // Default ON — the pass only fires for Sq/Sk > 512 (large attention), so small
+    // models are unaffected. Disable with ROCM_DISABLE_FLASH_ATTN=1.
+    if (!std::getenv("ROCM_DISABLE_FLASH_ATTN")) {
+        std::string fa_arch = device.props().gcnArchName;
+        if (auto p = fa_arch.find(':'); p != std::string::npos) fa_arch = fa_arch.substr(0, p);
+        pass_manager.register_pass<ov::rocm_gpu::pass::FlashAttentionTritonFusionPass>(fa_arch);
+    }
+
+    // RollFusion: disabled — VariadicSplit+Concat is already zero-copy via alias.
+    // Roll kernel does actual data copy, which is slower than the zero-copy path.
+    // pass_manager.register_pass<ov::rocm_gpu::pass::RollFusionPass>();
+
+    // QKVTransposeSplit: fuse Reshape+Transpose+3×Gather into single kernel for Swin QKV unbind.
+    pass_manager.register_pass<ov::rocm_gpu::pass::QKVTransposeSplitFusionPass>();
+
+    // SwinFlashAttention: fuse QK MatMul + Softmax + PV MatMul into WMMA kernel.
+    // Currently slower than rocBLAS GEMM for sq=49 shapes — disabled by default.
+    // Enable with ROCM_ENABLE_SWIN_FLASH_ATTN=1 for testing.
+    if (std::getenv("ROCM_ENABLE_SWIN_FLASH_ATTN"))
+        pass_manager.register_pass<ov::rocm_gpu::pass::SwinFlashAttentionFusionPass>();
+
+    pass_manager.register_pass<ov::pass::NopElimination>();
+
+    pass_manager.register_pass<ov::rocm_gpu::pass::RocmDCE>();
 
     // Upgrade LayerNorm nodes to FusedLayerNorm (native f16 HIP kernel).
     // Uses Welford online algorithm for single-pass mean+variance computation.
     pass_manager.register_pass<ov::rocm_gpu::pass::FusedLayerNormPass>();
+
+    // FusedRTD: fold Reshape→Transpose→MatMul into one rocMLIR kernel.
+    // Currently only handles 2D MatMul → output transform.
+    // Full RTD (input reshape+transpose into dot) needs batched-dot IR — WIP.
+    // FusedRTD: fold MatMul→Transpose→Reshape into one rocMLIR kernel.
+    // Disable with ROCM_DISABLE_RTD=1.
+    if (!std::getenv("ROCM_DISABLE_RTD")) {
+        std::string rtd_arch = device.props().gcnArchName;
+        if (auto p = rtd_arch.find(':'); p != std::string::npos) rtd_arch = rtd_arch.substr(0, p);
+        pass_manager.register_pass<ov::rocm_gpu::pass::FusedRTDFusionPass>(
+            rtd_arch, device.props().multiProcessorCount);
+    }
 
     // Force MatMul/FullyConnected outputs to f16 when both inputs are f16.
     // ConvertPrecision keeps MatMul outputs as f32 for accumulation accuracy, which
@@ -275,24 +333,14 @@ void GraphTransformer::transform(const rocm::Device& device,
         pass_manager.register_pass<ov::rocm_gpu::pass::RemoveRedundantConvertTransformation>();
     }
 
-    // INT8: retype each i32 MatMulInteger output to f32 and elide the dequant
-    // epilogue's Convert(i32->f32). The executor's i32 GEMM already computes in
-    // f32; this removes the f32->i32->f32 round-trip (cast_f32_to_i32 + Convert).
-    // Run BEFORE ElementwiseFusionPass so the dequant chain fuses on the f32 head.
-    pass_manager.register_pass<ov::rocm_gpu::pass::MatMulDequantConvertPass>();
-
     // Fuse chains of elementwise ops (Swish, Mul, Add, Sigmoid, etc.) into a single
     // FusedElementwise kernel launch. Run AFTER conv fusion (which handles Conv+SiLU)
     // and AFTER NopElimination. The pass eliminates ~150+ individual kernel launches
     // in yolo26x by reading each intermediate tensor only once.
     // NOTE: ElementwiseFusionPass correctly handles pe(V) Add nodes (attention pe Add) via
     // a fixed aux-input calculation for binary-op chain roots.
+    pass_manager.register_pass<ov::rocm_gpu::pass::MatMulDequantConvertPass>();
     pass_manager.register_pass<ov::rocm_gpu::pass::ElementwiseFusionPass>();
-
-    // Elide the redundant u8 round-trip in the INT8 activation-quantize epilogue:
-    // Round+Clamp(0,255) already produce integer-valued f32, so Convert(f32->u8)->
-    // Convert(u8->f32) is a no-op and Convert(u8->i32) == Convert(f32->i32). The
-    // GEMM casts i32 operands to f16 anyway, so the u8 intermediate is pure overhead.
     pass_manager.register_pass<ov::rocm_gpu::pass::QuantizeConvertElisionPass>();
 
     // Fuse Attention MatMul patterns (Reshape+Split+Transpose+MatMul) via MIGraphX MLIR.
@@ -308,6 +356,7 @@ void GraphTransformer::transform(const rocm::Device& device,
         pass_manager.register_pass<ov::rocm_gpu::pass::RocmAttentionFusionPass>(arch, enable_pe_fusion);
     }
 
+    // QKV transpose+split fusion (swin QKV unbind).
     // Zero-copy VariadicSplit: replace channel-axis VariadicSplit with VariadicSplitAlias.
     // The memory planner (rocm_op_buffers_extractor) assigns alias outputs as sub-ranges
     // of the input buffer, eliminating GPU data copies entirely (as MIGraphX does with

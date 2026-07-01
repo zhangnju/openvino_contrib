@@ -168,25 +168,11 @@ InterpolateLinear::InterpolateLinear(std::vector<size_t> in_shape,
 }
 
 void InterpolateLinear::operator()(const hipStream_t stream, const void* input, void* output) const {
-    const float* input_fp32 = nullptr;
-    float *output_fp32 = nullptr;
     switch (element_type_) {
-        /*
         case Type_t::f16:
-            return callKernel<__half, __half>(stream, input, output);
-        */
+            return callKernel(stream, static_cast<const float*>(input), static_cast<float*>(output));
         case Type_t::f32:
-            return callKernel(stream, input_fp32, output_fp32);
-        /*
-#ifdef rocm_HAS_BF16_TYPE
-        case Type_t::bf16:
-            return callKernel<hip_bfloat16, hip_bfloat16>(stream, input, output);
-#endif
-        case Type_t::i8:
-            return callKernel<int8_t, float>(stream, input, output);
-        case Type_t::u8:
-            return callKernel<uint8_t, float>(stream, input, output);
-        */
+            return callKernel(stream, static_cast<const float*>(input), static_cast<float*>(output));
         default:
             throw_ov_exception(
                 fmt::format("Element type = {} is not supported by InterpolateLinear operation.", element_type_));

@@ -185,6 +185,198 @@ masked_softmax_fused_kernel(
     }
 }
 
+// ── swin fused scale+bias+softmax ────────────────────────────────────────────
+// Computes: softmax( scores[h,sq,sk] * temp[h] + bias[h,sq,sk] ) over last dim.
+// temp = per-head scalar (heads), bias = per-head [heads, sq, sk] (batch=1 squeezed).
+// One block per (head, seq) row. Numerically stable (subtract max), f32 accumulate.
+// softmax(scores + bias) over last dim. scores/out: [B, heads, sq, sk];
+// bias: [heads, sq, sk] (per-head, broadcast over B windows). The per-head temperature
+// scale is already folded into the QK MatMul upstream by OV, so no scale here.
+__global__ void __launch_bounds__(256)
+swin_scale_bias_softmax_kernel(
+        const __half* __restrict__ scores,  // [B, heads, sq, sk]
+        const __half* __restrict__ bias,    // [heads, sq, sk] (broadcast over B)
+        const __half* __restrict__ mask,    // [B, sq, sk] (broadcast over heads) or nullptr
+        __half* __restrict__ out,           // [B, heads, sq, sk]
+        int B, int heads, int sq, int sk, const __half* __restrict__ temp)
+{
+    extern __shared__ float smem[];
+    const int total_rows = B * heads * sq;
+    if (blockIdx.x >= total_rows) return;
+
+    const int seq      = blockIdx.x % sq;
+    const int bh       = blockIdx.x / sq;       // flat (b,head)
+    const int head     = bh % heads;
+    const int b        = bh / heads;
+
+    const __half* row_scores = scores + ((size_t)bh * sq + seq) * sk;          // per (b,head,seq)
+    const __half* row_bias   = bias   + ((size_t)head * sq + seq) * sk;        // broadcast over b
+    const __half* row_mask   = mask ? mask + ((size_t)b * sq + seq) * sk : nullptr;  // broadcast over head
+    __half*       row_out     = out    + ((size_t)bh * sq + seq) * sk;
+    const float tscale = temp ? __half2float(temp[head]) : 1.0f;
+
+    // block_reduce_* return the result only in warp 0; broadcast to all threads via smem[0].
+    __shared__ float bcast;
+
+    float row_max = -1e30f;
+    for (int i = threadIdx.x; i < sk; i += blockDim.x) {
+        float s = __half2float(row_scores[i]) * tscale + __half2float(row_bias[i]);
+        if (row_mask) s += __half2float(row_mask[i]);
+        row_max = fmaxf(row_max, s);
+    }
+    row_max = block_reduce_max(row_max, smem);
+    if (threadIdx.x == 0) bcast = row_max;
+    __syncthreads();
+    row_max = bcast;
+    __syncthreads();
+
+    float exp_sum = 0.f;
+    for (int i = threadIdx.x; i < sk; i += blockDim.x) {
+        float s = __half2float(row_scores[i]) * tscale + __half2float(row_bias[i]);
+        if (row_mask) s += __half2float(row_mask[i]);
+        exp_sum += expf(s - row_max);
+    }
+    exp_sum = block_reduce_sum(exp_sum, smem);
+    if (threadIdx.x == 0) bcast = exp_sum;
+    __syncthreads();
+    exp_sum = bcast;
+    __syncthreads();
+
+    const float inv_sum = 1.f / exp_sum;
+    for (int i = threadIdx.x; i < sk; i += blockDim.x) {
+        float s = __half2float(row_scores[i]) * tscale + __half2float(row_bias[i]);
+        if (row_mask) s += __half2float(row_mask[i]);
+        row_out[i] = __float2half(expf(s - row_max) * inv_sum);
+    }
+}
+
+// Warp-per-row variant: one warp (32 lanes) handles a full row. No shared mem / syncthreads —
+// reductions are pure __shfl. Best when sk is small (swin sk=64 → 2 elems/lane). 4 warps/block.
+__device__ __forceinline__ float sm_warp_max(float v) {
+    for (int m = 16; m > 0; m >>= 1) v = fmaxf(v, __shfl_xor(v, m));
+    return v;
+}
+__device__ __forceinline__ float sm_warp_sum(float v) {
+    for (int m = 16; m > 0; m >>= 1) v += __shfl_xor(v, m);
+    return v;
+}
+// Register-cached warp-per-row: each lane loads its ≤8 elements (sk≤256) ONCE into registers,
+// fusing scores+bias(+mask) on load. Eliminates the 2 redundant HBM read passes and the 2nd exp
+// of the 3-pass version (this is a memory-bound kernel). For swin sk=64 each lane holds 2 elems.
+__global__ void __launch_bounds__(128)
+swin_scale_bias_softmax_warp_kernel(
+        const __half* __restrict__ scores, const __half* __restrict__ bias,
+        const __half* __restrict__ mask, __half* __restrict__ out,
+        int B, int heads, int sq, int sk, const __half* __restrict__ temp) {
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    const size_t rowid = (size_t)blockIdx.x * (blockDim.x / 32) + warp;
+    const size_t total_rows = (size_t)B * heads * sq;
+    if (rowid >= total_rows) return;
+
+    const int seq  = rowid % sq;
+    const size_t bh = rowid / sq;
+    const int head = bh % heads;
+    const size_t b = bh / heads;
+    const __half* rs = scores + (bh * sq + seq) * sk;
+    const __half* rb = bias   + ((size_t)head * sq + seq) * sk;
+    const __half* rm = mask ? mask + (b * sq + seq) * sk : nullptr;
+    __half*       ro = out    + (bh * sq + seq) * sk;
+    const float tscale = temp ? __half2float(temp[head]) : 1.0f;
+
+    float reg[16];                      // ceil(256/32)*2 = 16 max (half2 → 2 vals/iter)
+    int n = 0;
+    float m = -1e30f;
+    if ((sk & 1) == 0) {                 // even sk → half2 vectorized loads (swin sk=64)
+        const int sk2 = sk >> 1;
+        const __half2* rs2 = (const __half2*)rs;
+        const __half2* rb2 = (const __half2*)rb;
+        const __half2* rm2 = rm ? (const __half2*)rm : nullptr;
+        for (int j = lane; j < sk2; j += 32) {
+            __half2 sc = rs2[j];
+            float a = __half2float(__low2half(sc)) * tscale + __half2float(__low2half(rb2[j]));
+            float c = __half2float(__high2half(sc)) * tscale + __half2float(__high2half(rb2[j]));
+            if (rm2) { a += __half2float(__low2half(rm2[j])); c += __half2float(__high2half(rm2[j])); }
+            reg[n++] = a; reg[n++] = c;
+            m = fmaxf(m, fmaxf(a, c));
+        }
+        m = sm_warp_max(m);
+        float sum = 0.f;
+        for (int i = 0; i < n; ++i) { reg[i] = __expf(reg[i] - m); sum += reg[i]; }
+        sum = sm_warp_sum(sum);
+        const float inv = 1.f / sum;
+        __half2* ro2 = (__half2*)ro;
+        for (int i = 0, j = lane; i < n; i += 2, j += 32)
+            ro2[j] = __halves2half2(__float2half(reg[i] * inv), __float2half(reg[i+1] * inv));
+        return;
+    }
+    for (int j = lane; j < sk; j += 32, ++n) {
+        float s = __half2float(rs[j]) * tscale + __half2float(rb[j]);
+        if (rm) s += __half2float(rm[j]);
+        reg[n] = s;
+        m = fmaxf(m, s);
+    }
+    m = sm_warp_max(m);
+    float sum = 0.f;
+    for (int i = 0; i < n; ++i) { reg[i] = __expf(reg[i] - m); sum += reg[i]; }
+    sum = sm_warp_sum(sum);
+    const float inv = 1.f / sum;
+    for (int i = 0, j = lane; i < n; ++i, j += 32) ro[j] = __float2half(reg[i] * inv);
+}
+
+
+// ── Plain softmax warp kernel (fallback for large N where MIOpen crashes) ──────
+// One warp per row. Each row has `cols` elements. cols <= 256 (register tiling).
+// No bias/mask/temperature — just plain softmax over the last dimension.
+__global__ void __launch_bounds__(128)
+plain_softmax_warp_kernel(
+        const __half* __restrict__ input,
+        __half* __restrict__ output,
+        size_t total_rows, int cols) {
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    const size_t rowid = (size_t)blockIdx.x * (blockDim.x / 32) + warp;
+    if (rowid >= total_rows) return;
+
+    const __half* ri = input  + rowid * cols;
+    __half*       ro = output + rowid * cols;
+
+    float reg[8];
+    int n = 0;
+    float m = -1e30f;
+
+    if ((cols & 1) == 0) {
+        const int cols2 = cols >> 1;
+        const __half2* ri2 = (const __half2*)ri;
+        for (int j = lane; j < cols2; j += 32) {
+            __half2 v = ri2[j];
+            float a = __half2float(__low2half(v));
+            float c = __half2float(__high2half(v));
+            reg[n++] = a; reg[n++] = c;
+            m = fmaxf(m, fmaxf(a, c));
+        }
+        m = sm_warp_max(m);
+        float sum = 0.f;
+        for (int i = 0; i < n; ++i) { reg[i] = __expf(reg[i] - m); sum += reg[i]; }
+        sum = sm_warp_sum(sum);
+        const float inv = 1.f / sum;
+        __half2* ro2 = (__half2*)ro;
+        for (int i = 0, j = lane; i < n; i += 2, j += 32)
+            ro2[j] = __halves2half2(__float2half(reg[i] * inv), __float2half(reg[i+1] * inv));
+        return;
+    }
+    for (int j = lane; j < cols; j += 32, ++n) {
+        reg[n] = __half2float(ri[j]);
+        m = fmaxf(m, reg[n]);
+    }
+    m = sm_warp_max(m);
+    float sum = 0.f;
+    for (int i = 0; i < n; ++i) { reg[i] = __expf(reg[i] - m); sum += reg[i]; }
+    sum = sm_warp_sum(sum);
+    const float inv = 1.f / sum;
+    for (int i = 0, j = lane; i < n; ++i, j += 32) ro[j] = __float2half(reg[i] * inv);
+}
+
 // ── Fused FC+GELU kernel (GEMM part handled by rocBLAS, GELU part here) ───────
 // Note: Full FC+GELU fusion (matmul inside kernel) is complex.
 // This kernel handles the GELU+bias part after rocBLAS GEMM.
@@ -207,6 +399,22 @@ bias_gelu_fused_kernel(
 }
 
 // ── Launch helpers ─────────────────────────────────────────────────────────────
+
+
+void launch_plain_softmax(
+        hipStream_t stream,
+        const void* input, void* output,
+        size_t total_rows, int cols) {
+    constexpr int warps_per_block = 4;
+    constexpr int block_sz = warps_per_block * 32;
+    size_t grid_sz = (total_rows + warps_per_block - 1) / warps_per_block;
+    hipLaunchKernelGGL(
+        plain_softmax_warp_kernel,
+        dim3(grid_sz), dim3(block_sz), 0, stream,
+        static_cast<const __half*>(input),
+        static_cast<__half*>(output),
+        total_rows, cols);
+}
 
 void launch_layernorm_fused(
         hipStream_t stream,
@@ -247,6 +455,39 @@ void launch_masked_softmax_fused(
         static_cast<const __half*>(mask),
         static_cast<__half*>(out),
         heads, sq, sk);
+}
+
+void launch_swin_scale_bias_softmax(
+        hipStream_t stream,
+        const void* scores, const void* bias, const void* mask, void* out,
+        int B, int heads, int sq, int sk, const void* temp) {
+    const long long total_rows = (long long)B * heads * sq;
+    // Warp-per-row (no shared mem / syncthreads) wins for small sk (swin sk=64). For large sk
+    // use the block-per-row reduction.
+    if (sk <= 256) {
+        const int block = 128;                 // 4 warps/block
+        const int grid = (int)((total_rows + (block/32) - 1) / (block/32));
+        hipLaunchKernelGGL(
+            swin_scale_bias_softmax_warp_kernel,
+            dim3(grid), dim3(block), 0, stream,
+            static_cast<const __half*>(scores), static_cast<const __half*>(bias),
+            static_cast<const __half*>(mask), static_cast<__half*>(out),
+            B, heads, sq, sk, static_cast<const __half*>(temp));
+        return;
+    }
+    int threads = 32;
+    while (threads < sk && threads < 256) threads += 32;
+    threads = (threads > 256) ? 256 : threads;
+    int smem_floats = (threads + 31) / 32;
+
+    hipLaunchKernelGGL(
+        swin_scale_bias_softmax_kernel,
+        dim3((unsigned)total_rows), dim3(threads), smem_floats * sizeof(float), stream,
+        static_cast<const __half*>(scores),
+        static_cast<const __half*>(bias),
+        static_cast<const __half*>(mask),
+        static_cast<__half*>(out),
+        B, heads, sq, sk, static_cast<const __half*>(temp));
 }
 
 void launch_bias_gelu_fused(

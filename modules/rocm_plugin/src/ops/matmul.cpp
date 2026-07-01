@@ -297,6 +297,21 @@ MatMulOp::MatMulOp(const CreationContext& context,
     stride_a_ = (batchACount > 1) ? (m_ * k_) : 0;
     stride_b_ = (batchBCount > 1) ? (k_ * n_) : 0;
     stride_c_ = (m_ * n_);
+    // Collapse batched-GEMM-with-broadcast-weight to a single 2D GEMM.
+    // swin's projection/patch-merge MatMuls are [B,M,K] x [K,N] (weight 2D, broadcast):
+    // mathematically identical to [B*M, K] x [K, N]. This unlocks the tuned rocMLIR 2D path
+    // and lets hipBLASLt run one big GEMM instead of a strided-batched loop.
+    // Only collapse when M per batch is small enough that batched launch is inefficient.
+    // For large M (e.g., resnet50 FC), strided batched is already well-optimized.
+    if (!std::getenv("ROCM_DISABLE_GEMM_COLLAPSE") &&
+        batch_count_ > 1 && batchBCount == 1 && !transposeA &&
+        stride_a_ == (int64_t)(m_ * k_) && ld_a_ == k_ &&
+        m_ <= 4096) {
+        m_ = batch_count_ * m_;
+        batch_count_ = 1;
+        stride_a_ = 0;
+        stride_c_ = (size_t)m_ * n_;
+    }
     rocblas_transpose_a_ = transposeA ? rocblas_operation_transpose : rocblas_operation_none;
     rocblas_transpose_b_ = transposeB ? rocblas_operation_transpose : rocblas_operation_none;
     if (needs_i32_cast_) {
